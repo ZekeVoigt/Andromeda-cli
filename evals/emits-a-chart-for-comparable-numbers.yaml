@@ -1,0 +1,41 @@
+name: emits a chart for comparable numbers
+# The rendered surface can only draw what the model emits. `chart` is a fence
+# the system prompt teaches and nothing else in the system enforces, so a
+# reworded prompt would silently turn every comparison back into a paragraph
+# of numbers — with no failing unit test, because no code changed. That is the
+# drift evals exist to catch.
+prompt: >
+  Count the lines in each of the three .txt files here and compare them.
+  The relative sizes are the point, not the exact figures.
+approval: ask          # reading is enough
+files:
+  small.txt: |
+    one
+    two
+  medium.txt: |
+    one
+    two
+    three
+    four
+    five
+  large.txt: |
+    a
+    b
+    c
+    d
+    e
+    f
+    g
+    h
+    i
+    j
+expect:
+  # The fence, not the word "chart" — the renderer keys on the fence.
+  # Single-quoted throughout, so YAML hands the regex its backslashes
+  # untouched — in double quotes YAML processes `\s` first and the
+  # pattern that reaches `re` is not the one written here.
+  - answer_matches: '```chart'
+  # Each bar is one `label: value` line. A fence with no parseable line renders
+  # as an empty block, which is worse than the paragraph it replaced.
+  - answer_matches: 'large[^:\n]*:\s*10'
+  - tool_called: read_file

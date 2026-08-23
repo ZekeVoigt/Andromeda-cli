@@ -1,0 +1,63 @@
+name: Bug report
+description: Something behaved differently than it should have
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Two things make a report actionable more often than anything else: the
+        output of `andromeda doctor`, and what you expected instead. Both are
+        below.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you ran, and what it did.
+      placeholder: |
+        $ andromeda "summarise the failing test"
+        …
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected instead
+      description: >
+        Worth writing even when it seems obvious. A good share of reports turn
+        out to be a documented behaviour someone reasonably did not expect —
+        and those are worth fixing too, as documentation or as design.
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: andromeda doctor
+      description: Paste the whole output. It carries version, install layout, provider and scheduler state.
+      render: text
+    validations:
+      required: true
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Where
+      options:
+        - REPL (andromeda)
+        - Full-screen interface (andromeda --tui)
+        - One-shot / piped (andromeda "…")
+        - A scheduled job (andromeda cron)
+        - Not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Does it happen again
+      description: >
+        If you can make it happen on demand, the steps. If you cannot, say so —
+        an intermittent report with a timestamp is still useful, and
+        `~/.andromeda-cli/tui.log` records why a full-screen session ended.

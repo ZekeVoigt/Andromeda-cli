@@ -1,0 +1,73 @@
+name: CI
+
+# The published repository's own suite. It is the same tests the monorepo runs,
+# with one difference stated out loud below rather than left to be discovered.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # The full range `pyproject.toml` claims to support. Claiming a version
+        # nothing runs is how a "supported" interpreter turns out to be broken
+        # on the day somebody uses it.
+        python: ["3.11", "3.12", "3.13"]
+        os: [ubuntu-latest]
+        # One macOS run, because that is what most people install this on and
+        # the process-group kills and pty handling differ there.
+        include:
+          - python: "3.13"
+            os: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Build the environment
+        run: |
+          uv venv --python ${{ matrix.python }} .venv
+          uv pip install --python .venv/bin/python -e ".[dev,browser]"
+
+      # Cached separately from the wheels: the browser is ~150MB and changes
+      # only when the pinned Playwright version does.
+      - name: Cache Chromium
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}
+
+      - name: Install Chromium
+        run: .venv/bin/python -m playwright install --with-deps chromium
+
+      - name: Test
+        run: .venv/bin/python -m pytest -q -rs
+
+      # ----------------------------------------------------------------------
+      # The one thing this suite cannot check
+      # ----------------------------------------------------------------------
+      # A drift guard compares these tools' names, schemas, risk tiers and
+      # categories against the TypeScript registry they share a contract with.
+      # That registry is not in this repository, so the guard skips here.
+      #
+      # This step exists so the skip is visible rather than silent. A suite that
+      # reports green while one of its guards quietly did nothing is worse than
+      # one that admits the gap: the guard runs upstream, before anything is
+      # published, and publishing is gated on it having actually executed.
+      - name: Note the guard that does not run here
+        if: always()
+        run: |
+          echo "::notice title=Drift guard::The cross-registry drift guard skips in this"\
+               "repository — the TypeScript registry it compares against lives upstream."\
+               "It runs there, and a release cannot be published unless it passed."

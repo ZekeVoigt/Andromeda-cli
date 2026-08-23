@@ -1,0 +1,65 @@
+[project]
+name = "andromeda-cli"
+version = "0.1.0"
+description = "Andromeda — a local-first agent harness for the terminal"
+readme = "README.md"
+# Upper bound is load-bearing. uv resolves the interpreter from this field, and
+# an inherited UV_PYTHON (or a host whose newest interpreter is 3.14 — this
+# machine ships 3.14.6) otherwise selects a version where Rust-backed
+# transitives have no cp314 wheel and fall back to a maturin source build that
+# fails. Capping makes uv refuse with a clear error instead. Raise it once
+# pydantic-core ships cp314.
+requires-python = ">=3.11,<3.14"
+license = "MIT"
+
+# Every direct dependency is exact-pinned (==X.Y.Z, no ranges).
+# Ranges let PyPI ship a fresh transitive at any hour without review on our
+# side; exact pins mean a new version reaches a user only via an intentional
+# bump here plus a regenerated uv.lock. Smaller `dependencies` = smaller blast
+# radius. Provider- and tool-specific packages belong in [project.optional-dependencies]
+# and are lazy-installed on first use.
+dependencies = [
+  "openai==2.24.0",
+  "httpx==0.28.1",
+  "prompt_toolkit==3.0.52",
+  "rich==14.3.3",
+  "pyyaml==6.0.3",
+  "platformdirs==4.5.0",
+  # Scheduled jobs are a built-in feature, not an extra: the daemon parses cron
+  # expressions on every tick.
+  "croniter==6.0.0",
+  # The full-screen interface. Core rather than an extra, unlike `browser`:
+  # Playwright is ~40MB of wheel plus a browser download, while this is pure
+  # Python on top of `rich`, which is already here. Lazy-installing a *screen*
+  # would also mean failing at the moment someone asks to look at something.
+  "textual==8.2.8",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==8.4.2", "pytest-asyncio==1.2.0", "respx==0.22.0"]
+# Lazy, not core. Playwright is ~40MB of wheel plus a browser download, and a
+# session that never opens a page should not pay for either. `andromeda browser
+# install` pulls it on demand; until then the browser_* tools are simply not
+# registered.
+browser = ["playwright==1.58.0"]
+
+[project.scripts]
+andromeda = "andromeda_cli.__main__:main"
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = [
+  "andromeda_cli",
+  "andromeda_cli.commands",
+  "andromeda_agent",
+  "andromeda_agent.providers",
+  "andromeda_tools",
+  "andromeda_tui",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

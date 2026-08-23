@@ -1,0 +1,26 @@
+name: Feature request
+description: Something it should be able to do
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do
+      description: >
+        The task, not the feature. The most useful requests describe a thing
+        someone was doing when they hit the wall — that often has a better
+        answer than the one being asked for.
+    validations:
+      required: true
+
+  - type: textarea
+    id: today
+    attributes:
+      label: How you work around it today
+      description: If you do. "I stop and do it by hand" is a real answer.
+
+  - type: textarea
+    id: shape
+    attributes:
+      label: What you had in mind
+      description: Optional. A command line or a sketch of the output is plenty.

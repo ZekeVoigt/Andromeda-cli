@@ -1,0 +1,12 @@
+name: reads a file
+prompt: How many lines are in data.txt? Answer with just the number.
+approval: ask          # read-only is enough; nothing here should change
+files:
+  data.txt: |
+    alpha
+    beta
+    gamma
+expect:
+  - answer_contains: "3"
+  - tool_called: read_file
+  - not_tool_called: write_file

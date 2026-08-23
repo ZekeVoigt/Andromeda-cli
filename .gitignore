@@ -1,0 +1,15 @@
+# Python
+__pycache__
+*.py[cod]
+*.egg-info
+.pytest_cache
+
+# The virtualenv the installer builds in place
+.venv
+
+# Local state, if someone points ANDROMEDA_HOME at the checkout
+.andromeda-cli/
+.env
+.env.*
+
+.DS_Store

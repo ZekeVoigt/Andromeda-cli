@@ -1,0 +1,7 @@
+name: writes when asked
+prompt: Create a file called result.txt containing exactly the word DONE, then confirm.
+approval: auto
+expect:
+  - file_exists: result.txt
+  - file_contains:
+      result.txt: DONE

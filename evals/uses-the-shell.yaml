@@ -1,0 +1,13 @@
+name: uses the shell
+prompt: Use a shell command to count the lines in numbers.txt, then tell me the number.
+approval: auto
+requires: [bin:wc]
+files:
+  numbers.txt: |
+    1
+    2
+    3
+    4
+expect:
+  - answer_contains: "4"
+  - tool_called: terminal

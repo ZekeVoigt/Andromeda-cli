@@ -1,0 +1,766 @@
+"""The full-screen surface.
+
+## Why this is Python in-process and not a JS TUI over an IPC gateway
+
+The common shape for a rich terminal UI is a React/Ink tree in TypeScript
+talking newline-delimited JSON-RPC to the agent process. That split earns its
+keep when the same tree also renders a desktop app and an embedded web chat:
+three clients justify a protocol.
+
+This build has one client. Reproducing the split would mean:
+
+- porting `andromeda_cli/render.py` — the markdown streaming, the eighth-block
+  chart renderer, the held-back unclosed fence, the restrained palette — into
+  TypeScript, which is how a product ends up with two visual languages that
+  drift, each rendering its own subset of markdown;
+- putting a socket in the middle of the approval gate. The gate is blocking on
+  purpose, so over IPC it becomes a request with a deadline, and a deadline on
+  a consent prompt is a policy decision about consent. In-process there is
+  nothing to decide: the thread waits;
+- adding Node to an install path that is `curl | bash` → a uv venv → a symlink,
+  which would add a second toolchain, a build step and a bundled `entry.js` to
+  the one part of the product where conservatism pays most.
+
+So: Textual, in-process, sharing the session code directly. It also removes a
+whole bug class rather than managing it — `render.paint()` means the two
+surfaces cannot drift, because they are the same code.
+
+**The seam is kept anyway, and it is cheap.** `events.py` is a serialisable
+event vocabulary and `driver.py` answers blocking questions by request id —
+which is the shape a socket forces, adopted now while it costs nothing. If a
+second client ever appears, a gateway writes `event.to_json()` down a pipe and
+routes answers back by id; nothing in this file changes. What is *not* being
+paid for today is a process boundary, a protocol version, a reconnect policy
+and a second language.
+
+## Threading
+
+One rule. The agent runs on a worker thread and never touches a widget; it
+appends to `AgentDriver`'s queue. This app drains that queue on a timer and
+touches widgets only from the event loop. Everything crossing the boundary is
+an event going down or an answer coming up by id.
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import time
+from datetime import datetime
+import tempfile
+from pathlib import Path
+from typing import Any
+
+from rich.text import Text
+from textual.app import App, ComposeResult, SuspendNotSupported
+from textual.binding import Binding
+from textual.widgets import Static
+
+from andromeda_agent.models import THINKING_LEVELS, supports_reasoning
+from andromeda_cli import checkpoints as checkpoint_module
+from andromeda_cli import render
+from andromeda_cli.session import set_asker, set_lane_announcer
+
+from . import events as ev
+from .driver import AgentDriver
+from .prompts import ApprovalScreen, ClarifyScreen
+from .widgets import ActivityLane, Composer, StatusBar, Transcript
+
+# Kept in step with the REPL's list. `tests/test_tui.py` parses
+# `repl.SLASH_HELP` and asserts every verb there is handled here — two surfaces
+# of one product whose slash vocabularies disagree is the same class of bug as
+# a tool that is gated differently depending on where you call it from.
+SLASH_HELP = """  /help      show this
+  /new       start a fresh conversation
+  /rewind    undo the last exchange (/rewind N for a numbered checkpoint)
+  /history   list the checkpoints you can rewind to
+  /ps        background processes started this session
+  /tools     list the tools this session can use
+  /skills    list the skills on this machine
+  /lanes     list the delegation specialists
+  /credits   show the credit balance as of the last call
+  /model     show the model in use
+  /think     show or set the thinking level (off, low, medium, high)
+  /cwd       show the workspace root
+  /exit      leave (Ctrl-D also works)"""
+
+KEY_HINT = "ctrl+c interrupt · ctrl+g editor · ctrl+l new · ctrl+d quit"
+
+
+class AndromedaApp(App):
+    """One conversation on one screen."""
+
+    CSS = """
+    Screen { background: $surface; }
+
+    #transcript { height: 1fr; padding: 0 1; scrollbar-size-vertical: 1; }
+    #transcript .row { margin-bottom: 1; }
+    #transcript .tool, #transcript .tool-result, #transcript .note {
+        margin-bottom: 0;
+    }
+
+    #activity { height: auto; padding: 0 1; display: none; }
+    #composer {
+        height: auto; max-height: 12; border: none; padding: 0 1;
+        background: $surface; scrollbar-size-vertical: 1;
+    }
+    #composer:focus { border: none; }
+    #status { height: 1; background: $panel; color: $text-muted; }
+
+    /* The prompts. A dimmed backdrop is not decoration here: it is the visible
+       statement that the thing underneath is stopped and waiting. */
+    ApprovalScreen, ClarifyScreen { align: center middle; background: $surface 60%; }
+    #approval-box, #clarify-box {
+        width: 80%; max-width: 100; height: auto; padding: 1 2;
+        background: $panel; border: round $warning;
+    }
+    #clarify-box { border: round $accent; }
+    #approval-summary { padding: 1 0; }
+    #approval-choices { padding-top: 1; }
+    """
+
+    BINDINGS = [
+        Binding("ctrl+d", "quit_app", "quit", show=False),
+        Binding("ctrl+c", "interrupt", "interrupt", show=False),
+        Binding("ctrl+l", "new_conversation", "new", show=False),
+        Binding("ctrl+g", "edit_in_editor", "editor", show=False),
+        Binding("pageup", "scroll_transcript(-1)", "scroll up", show=False),
+        Binding("pagedown", "scroll_transcript(1)", "scroll down", show=False),
+    ]
+
+    def __init__(self, config: dict[str, Any], conversation, record, resumed=None) -> None:
+        super().__init__()
+        self.config = config
+        self.conversation = conversation
+        self.record = record
+        self.resumed = resumed
+        self.checkpoints = checkpoint_module.CheckpointStack.from_json(
+            resumed.checkpoints if resumed is not None else None
+        )
+        self.driver = AgentDriver(
+            conversation, record, checkpoints=self.checkpoints
+        )
+        self.history: list[str] = []
+        self._history_at = 0
+        # Typed while the agent was working. Drained one at a time when a turn
+        # ends — the alternative is dropping what someone typed, and a terminal
+        # that discards keystrokes is a terminal people stop trusting.
+        self.queued: list[str] = []
+        self._open_question: str = ""
+        self._answering = False
+        # A multi-line paste, held whole until it is sent. The composer is a
+        # single-line `Input`, which truncates pasted text at the first
+        # newline — so a pasted instruction arrives as its first line and the
+        # rest is simply gone. Staging it keeps every line and keeps the
+        # composer single-line, which is what makes Enter mean "send".
+        # When this session began, and when the current line's first character
+        # arrived. Both feed the injected-input guard; see `_looks_injected`.
+        self._started_at = time.monotonic()
+        self._typed_at: float | None = None
+        self._last_typed_at: float | None = None
+        self._exit_reason = ""
+
+    # ---- layout -----------------------------------------------------------
+
+    def compose(self) -> ComposeResult:
+        # Held as attributes rather than looked up with `query_one`. `App.query_one`
+        # searches the *current* screen, so every lookup here would raise
+        # `NoMatches` for the whole time an approval prompt is open — and the
+        # thing doing the looking up is the timer that drains the event queue.
+        # That is a crash in exactly the state the surface most needs to keep
+        # working. Caught by a test, not by reading.
+        self.transcript = Transcript(id="transcript")
+        self.activity = ActivityLane(id="activity")
+        self.composer = Composer(placeholder="ask anything — / for commands, shift+enter for a new line", id="composer")
+        self.status = StatusBar(id="status")
+        yield self.transcript
+        yield self.activity
+        yield self.composer
+        yield self.status
+
+    def on_mount(self) -> None:
+        transcript = self.transcript
+        provider = self.conversation.provider
+        transcript.add_note(
+            f"{provider.label} · {provider.model}", tone="cyan"
+        )
+        transcript.add_note(str(self.conversation.workspace.root))
+        transcript.add_note(
+            f"{len(self.conversation.available)} tools · approval: "
+            f"{self.conversation.policy.mode} · thinking: {provider.thinking}"
+        )
+        if self.resumed is not None:
+            transcript.add_note(
+                f"resumed {self.record.id} · {self.record.turns} turns"
+            )
+        pending = self._pending_suggestions()
+        if pending:
+            transcript.add_note(
+                f"{pending} automation(s) suggested · andromeda cron suggest",
+                tone="yellow",
+            )
+        transcript.add_note("/help for commands", tone="dim")
+
+        status = self.status
+        status.model = provider.model
+        status.mode = f"approval:{self.conversation.policy.mode}"
+        status.thinking = provider.thinking
+        status.hint = KEY_HINT
+        status.refresh_status()
+
+        # The two hooks the tool layer reaches the surface through. Set here
+        # rather than in `build_conversation` because they are properties of
+        # the surface, and the one-shot path and the REPL set their own.
+        set_asker(self.driver.ask_questions)
+        set_lane_announcer(self._lane_started)
+
+        self.composer.focus()
+        # One clock for everything that moves: draining events, repainting the
+        # streaming answer, advancing the spinner. `REFRESH_HZ` is the REPL's,
+        # so both surfaces feel the same and a long markdown answer is
+        # re-rendered at the same rate in each.
+        self.set_interval(1 / render.REFRESH_HZ, self._tick)
+
+    @staticmethod
+    def _pending_suggestions() -> int:
+        """How many automations are waiting on a decision.
+
+        Suggestions behind a command nobody runs are suggestions that do not
+        exist. Counted, not listed — the intro is not the place to decide.
+        """
+        try:
+            from andromeda_agent.suggestions import Suggestions
+            from andromeda_cli.session import schedule_path
+
+            return len(
+                Suggestions(schedule_path().parent / "suggestions.json").pending()
+            )
+        except Exception:  # noqa: BLE001 - never fail a session over a hint
+            return 0
+
+    # ---- the clock --------------------------------------------------------
+
+    def _tick(self) -> None:
+        transcript = self.transcript
+        for event in self.driver.drain():
+            self._handle(event, transcript)
+        if self.driver.busy:
+            transcript.flush_answer()
+        self.activity.tick(self.driver.busy)
+        status = self.status
+        status.context = self.conversation.context_used
+        status.refresh_status()
+
+    def _handle(self, event: ev.UiEvent, transcript: Transcript) -> None:
+        if isinstance(event, ev.TurnStarted):
+            transcript.add_prompt(event.prompt)
+
+        elif isinstance(event, ev.TextDelta):
+            transcript.feed_answer(event.text)
+
+        elif isinstance(event, ev.ToolStarted):
+            # The answer block is closed here and the next one opens on the
+            # next delta, so prose the model wrote before a tool stays above
+            # the tool line and prose it writes after stays below.
+            transcript.end_answer()
+            transcript.add_tool(event.summary, event.tier)
+            self.activity.start_tool(event.summary)
+
+        elif isinstance(event, ev.ToolFinished):
+            self.activity.stop_tool()
+            transcript.add_tool_result(event.detail, event.ok)
+
+        elif isinstance(event, ev.ToolDenied):
+            self.activity.stop_tool()
+            transcript.add_note(f"declined  {event.name} — {event.reason}", tone="red")
+
+        elif isinstance(event, ev.LaneStarted):
+            transcript.add_note(f"⇢ {event.specialist} lane  {event.label}", tone="magenta")
+
+        elif isinstance(event, ev.Compacted):
+            transcript.add_note(f"compacted — {event.detail}")
+
+        elif isinstance(event, ev.QuestionAsked):
+            self._ask(event)
+
+        elif isinstance(event, ev.QuestionClosed):
+            self._question_closed(event.request_id)
+
+        elif isinstance(event, ev.TurnFinished):
+            transcript.end_answer()
+            self._report_still_running(event, transcript)
+            self._finish_turn()
+
+        elif isinstance(event, ev.TurnFailed):
+            transcript.end_answer()
+            transcript.add_error(event.message, event.hint)
+            self._finish_turn()
+
+        elif isinstance(event, ev.TurnInterrupted):
+            transcript.end_answer()
+            transcript.add_note("interrupted")
+            self._finish_turn()
+
+        elif isinstance(event, ev.Notice):
+            transcript.add_note(event.text, tone=event.tone)
+
+    def _report_still_running(self, event: ev.TurnFinished, transcript: Transcript) -> None:
+        if event.processes_running:
+            transcript.add_note(
+                f"{len(event.processes_running)} background process(es) running: "
+                + ", ".join(event.processes_running)
+            )
+        if event.lanes_running:
+            transcript.add_note(
+                f"{len(event.lanes_running)} lane(s) still running: "
+                + ", ".join(event.lanes_running)
+                + " — ask me to wait for them"
+            )
+
+    def _finish_turn(self) -> None:
+        self.activity.stop_tool()
+        # One at a time, and only when the agent is actually free. Draining the
+        # whole queue would submit the second item into a turn that has not
+        # started yet, and `submit` would refuse it silently.
+        if self.queued and not self.driver.busy:
+            self.driver.submit(self.queued.pop(0))
+        self._refresh_queue_hint()
+
+    def _lane_started(self, specialist: str, label: str) -> None:
+        """Called from a lane's own thread. Goes through the queue like everything else."""
+        self.driver.post(ev.LaneStarted(specialist=specialist, label=label))
+
+    # ---- questions --------------------------------------------------------
+
+    def _ask(self, event: ev.QuestionAsked) -> None:
+        """Take the screen, and take it away from the composer.
+
+        `push_screen` alone would be enough for Textual — a modal screen
+        receives every key. Disabling the composer as well is belt and braces:
+        the first is a property of a library, the second is a property of this
+        code and can be asserted in a test. The bug this guards has been
+        introduced twice.
+        """
+        self._open_question = event.request_id
+        composer = self.composer
+        composer.disabled = True
+        self.activity.waiting = True
+
+        request_id = event.request_id
+
+        def answered(value) -> None:
+            # `dismiss` can fire after the driver has released the question —
+            # an interrupt, a shutdown. `answer` returns False then and the
+            # value is dropped, which is correct: the first resolution wins,
+            # and the first one was the refusal.
+            self.driver.answer(request_id, value)
+
+        if event.form == "approval":
+            self.push_screen(ApprovalScreen(event.body), answered)
+        else:
+            self.push_screen(ClarifyScreen(event.body), answered)
+
+    def _question_closed(self, request_id: str) -> None:
+        if request_id != self._open_question:
+            return
+        self._open_question = ""
+        composer = self.composer
+        composer.disabled = False
+        self.activity.waiting = False
+        # The screen may already be gone (the user answered it, which is what
+        # closed the question). Popping only what is still there.
+        if isinstance(self.screen, (ApprovalScreen, ClarifyScreen)):
+            self.pop_screen()
+        composer.focus()
+
+    # ---- input ------------------------------------------------------------
+
+    def on_composer_submitted(self, event: Composer.Submitted) -> None:
+        raw = event.text.strip()
+        self.composer.clear_text()
+        typed_at, self._typed_at = self._typed_at, None
+        self._last_typed_at = typed_at
+
+        if not raw:
+            return
+
+        self.history.append(raw)
+        self._history_at = len(self.history)
+
+        # A multi-line message is a paste or an editor's worth of writing, and
+        # neither has keypress timing behind it. The injected-input guard only
+        # judges single lines, which is all it was ever built to catch.
+        if "\n" not in raw and self._looks_injected(raw):
+            self.transcript.add_note(
+                "ignored a line that arrived too fast to have been typed", tone="yellow"
+            )
+            self.transcript.add_note(f"  {raw[:90]}", tone="dim")
+            return
+
+        if raw.startswith("/") and "\n" not in raw:
+            # Slash commands never queue. They are about the surface, not about
+            # the conversation, and making `/tools` wait for a running turn
+            # would be surprising.
+            self._slash(raw)
+            return
+
+        if self.driver.busy:
+            self.queued.append(raw)
+            self._refresh_queue_hint()
+            return
+
+        self.driver.submit(raw)
+
+    def on_text_area_changed(self, event) -> None:
+        """Grow the composer with the text, and time the first keystroke."""
+        self.composer.resize_to_content()
+        if self.composer.text and self._typed_at is None:
+            self._typed_at = time.monotonic()
+        elif not self.composer.text:
+            self._typed_at = None
+
+    def _looks_injected(self, text: str) -> bool:
+        """Delegates to the REPL's rule so the two surfaces cannot disagree.
+
+        `_typed_at` is stamped on the first character of each message; a line
+        with no keypress behind it reads as instantaneous, which is what it is.
+        Only ever asked about single-line messages — a paste has no typing
+        behind it by definition, and judging one would turn a guard against
+        losing input into a way of losing it.
+        """
+        from andromeda_cli.repl import looks_injected
+
+        typed_for = time.monotonic() - (self._last_typed_at or time.monotonic())
+        return looks_injected(text, typed_for, time.monotonic() - self._started_at)
+
+    def _refresh_queue_hint(self) -> None:
+        status = self.status
+        parts = []
+        if self.queued:
+            parts.append(f"{len(self.queued)} queued")
+        parts.append(KEY_HINT)
+        status.hint = " · ".join(parts)
+        status.refresh_status()
+
+    def on_composer_changed(self, event) -> None:
+        """The first character of a line, for the injected-input guard."""
+        if event.value and self._typed_at is None:
+            self._typed_at = time.monotonic()
+        elif not event.value:
+            self._typed_at = None
+
+    def on_key(self, event) -> None:
+        """History on up/down, when the composer has focus and nothing is open."""
+        if self._open_question or self.composer.disabled:
+            return
+        if event.key not in {"up", "down"}:
+            return
+        if not self.history:
+            return
+        composer = self.composer
+        if composer.text and self._history_at >= len(self.history):
+            # A draft in progress is not history navigation. Leave the arrow to
+            # the input's own cursor handling rather than eating what was typed.
+            return
+        event.stop()
+        step = -1 if event.key == "up" else 1
+        self._history_at = max(0, min(len(self.history), self._history_at + step))
+        composer.load_text(
+            self.history[self._history_at] if self._history_at < len(self.history) else ""
+        )
+        composer.resize_to_content()
+
+    # ---- actions ----------------------------------------------------------
+
+    def action_interrupt(self) -> None:
+        """Ctrl-C: stop the turn, then clear the draft, then say how to leave.
+
+        **It never quits.** That matches the REPL, where Ctrl-C clears the line
+        and Ctrl-D is the way out — and it closes an accidental-exit path that
+        matters more here than in a line editor. A terminal is not a private
+        channel: shell integrations clear the current line before they type
+        into it, multiplexers replay buffers, and a stray `\x03` arriving from
+        any of those would otherwise end the session and everything staged in
+        it. Losing a conversation to a keystroke nobody pressed is not a
+        trade worth one saved keypress.
+        """
+        composer = self.composer
+        if self.driver.busy or self._open_question:
+            self.driver.interrupt()
+            return
+        if composer.text:
+            composer.clear_text()
+            return
+        if self.queued:
+            self.queued.clear()
+            self._refresh_queue_hint()
+            self.transcript.add_note("queue cleared")
+            return
+        self.transcript.add_note("nothing to interrupt — ctrl+d quits")
+
+    def action_new_conversation(self) -> None:
+        if self.driver.busy:
+            self.transcript.add_note("finish or interrupt the turn first")
+            return
+        self.conversation.reset()
+        self.transcript.add_note("new conversation", tone="green")
+
+    def action_scroll_transcript(self, direction: int) -> None:
+        transcript = self.transcript
+        page = max(1, transcript.size.height - 2)
+        transcript.scroll_relative(y=direction * page, animate=False)
+
+    def action_edit_in_editor(self) -> None:
+        """Hand the whole screen to `$EDITOR`, then take it back.
+
+        This is the one place the literal form of the rule applies inside the
+        TUI: the editor is a separate program that owns the terminal, so the
+        app is suspended — its alternate screen released and its input handling
+        stopped — before it runs. Resuming without that leaves two programs
+        drawing to one terminal, which is the same failure the approval prompt
+        had in the REPL.
+        """
+        editor = os.environ.get("EDITOR") or os.environ.get("VISUAL")
+        if not editor:
+            # A default rather than a refusal: this is the reliable way to get a
+            # long prompt in when a terminal mishandles paste, so "no $EDITOR"
+            # should not be a dead end. `vi` is on every machine this runs on.
+            editor = "vi"
+            self.transcript.add_note("no $EDITOR set — using vi", tone="dim")
+        composer = self.composer
+        with tempfile.NamedTemporaryFile(
+            "w+", suffix=".md", prefix="andromeda-", delete=False
+        ) as handle:
+            handle.write(composer.text)
+            path = Path(handle.name)
+        try:
+            with self.suspend():
+                completed = subprocess.run([*editor.split(), str(path)], check=False)
+            if completed.returncode == 0:
+                self._apply_editor_text(path.read_text(encoding="utf-8").strip())
+        except OSError as exc:
+            self.transcript.add_note(f"could not run {editor}: {exc}", tone="red")
+        except SuspendNotSupported:
+            # Headless, or a driver that cannot hand the terminal over. Saying
+            # so beats a traceback that ends the session.
+            self.transcript.add_note("this terminal cannot suspend for an editor", tone="red")
+        finally:
+            path.unlink(missing_ok=True)
+        composer.focus()
+
+    def _apply_editor_text(self, written: str) -> None:
+        """What came back from `$EDITOR`, straight into the field.
+
+        Split out from the suspend-and-launch dance so it can be tested:
+        `App.suspend` is unavailable headless, and the interesting part is what
+        happens to the text.
+        """
+        self.composer.load_text(written)
+        self.composer.resize_to_content()
+
+    # ---- slash commands ---------------------------------------------------
+
+    def _slash(self, command: str) -> None:
+        parts = command.split()
+        verb = parts[0].lower()
+        transcript = self.transcript
+
+        if verb in {"/exit", "/quit"}:
+            self.exit(_reason="slash /exit")
+        elif verb == "/help":
+            transcript.add_note(SLASH_HELP + "\n\n  " + KEY_HINT)
+        elif verb == "/new":
+            self.action_new_conversation()
+        elif verb == "/cwd":
+            transcript.add_note(str(self.conversation.workspace.root))
+        elif verb == "/model":
+            provider = self.conversation.provider
+            transcript.add_note(f"{provider.label} · {provider.model}")
+        elif verb == "/credits":
+            # Same three distinct cases the REPL states, for the same reason: a
+            # confident "$0.00" would be wrong in all of them.
+            from andromeda_agent import credits as credits_module
+
+            provider = self.conversation.provider
+            line = credits_module.summary(provider.balance)
+            if line:
+                transcript.add_note(line)
+            elif provider.name != "relay":
+                transcript.add_note("No balance on this lane — you are using your own key.")
+            else:
+                transcript.add_note("No balance yet. It is read from the next reply.")
+        elif verb == "/tools":
+            self._list_tools(transcript)
+        elif verb == "/skills":
+            self._list_skills(transcript)
+        elif verb == "/lanes":
+            self._list_specialists(transcript)
+        elif verb == "/ps":
+            self._list_processes(transcript)
+        elif verb == "/think":
+            self._think(parts, transcript)
+        elif verb == "/history":
+            self._list_checkpoints(transcript)
+        elif verb == "/rewind":
+            self._rewind(parts, transcript)
+        else:
+            transcript.add_note(f"unknown command {verb} — /help lists them", tone="yellow")
+
+    def _rows(self, transcript: Transcript, rows: list[Text], empty: str) -> None:
+        if not rows:
+            transcript.add_note(empty)
+            return
+        block = Text("\n").join(rows)
+        transcript.mount(Static(block, classes="row note"))
+        transcript.scroll_end(animate=False)
+
+    def _list_tools(self, transcript: Transcript) -> None:
+        rows = []
+        for spec in sorted(self.conversation.available, key=lambda item: item.name):
+            decision = self.conversation.policy.decide(spec)
+            row = Text("  ")
+            row.append(spec.name.ljust(18), style="cyan")
+            row.append(
+                f"{spec.risk_tier.ljust(12)} "
+                f"{'asks first' if decision == 'needs_approval' else 'auto'}",
+                style="dim",
+            )
+            rows.append(row)
+        self._rows(transcript, rows, "no tools available")
+
+    def _list_skills(self, transcript: Transcript) -> None:
+        from andromeda_tools import skills as skills_module
+
+        found = skills_module.discover(self.conversation.workspace.root)
+        rows = []
+        for skill in sorted(found.values(), key=lambda item: item.name):
+            row = Text("  ")
+            row.append(skill.name.ljust(20), style="cyan")
+            row.append(skill.description[:70], style="dim")
+            if not skill.available:
+                row.append(f"  needs {', '.join(skill.missing_bins)}", style="yellow")
+            rows.append(row)
+        self._rows(transcript, rows, "no skills found")
+
+    def _list_specialists(self, transcript: Transcript) -> None:
+        from andromeda_agent.specialists import SPECIALISTS
+
+        rows = []
+        for belt in SPECIALISTS.values():
+            row = Text("  ")
+            row.append(belt.id.ljust(12), style="magenta")
+            row.append(f"{belt.max_turns} steps · {belt.purpose}", style="dim")
+            rows.append(row)
+        self._rows(transcript, rows, "no specialists")
+
+    def _list_processes(self, transcript: Transcript) -> None:
+        registry = getattr(self.conversation, "process_registry", None)
+        processes = registry.all() if registry else []
+        self._rows(
+            transcript,
+            [Text(f"  {process.summary()}", style="dim") for process in processes],
+            "no background processes",
+        )
+
+    def _think(self, parts: list[str], transcript: Transcript) -> None:
+        provider = self.conversation.provider
+        if not supports_reasoning(provider.model):
+            transcript.add_note(f"{provider.model} does not support thinking levels")
+            return
+        if len(parts) > 1:
+            level = parts[1].lower()
+            if level not in THINKING_LEVELS:
+                transcript.add_note(
+                    f"unknown level {level!r} — one of: {', '.join(THINKING_LEVELS)}",
+                    tone="yellow",
+                )
+                return
+            # Set on the provider so it takes effect next turn without
+            # rebuilding the session and losing the transcript.
+            provider.thinking = level
+            status = self.status
+            status.thinking = level
+            status.refresh_status()
+        transcript.add_note(f"thinking: {provider.thinking}")
+
+    def _list_checkpoints(self, transcript: Transcript) -> None:
+        rows = []
+        for checkpoint in self.checkpoints.all():
+            row = Text("  ")
+            row.append(str(checkpoint.index).rjust(3), style="cyan")
+            row.append(f"  {str(checkpoint.turns).rjust(2)} turns  ", style="dim")
+            row.append(checkpoint.label)
+            rows.append(row)
+        self._rows(transcript, rows, "no checkpoints yet")
+
+    def _rewind(self, parts: list[str], transcript: Transcript) -> None:
+        if self.driver.busy:
+            transcript.add_note("finish or interrupt the turn first")
+            return
+        if not len(self.checkpoints):
+            transcript.add_note("nothing to rewind to yet")
+            return
+        index = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
+        target = self.checkpoints.resolve(index)
+        if target is None:
+            transcript.add_note("no such checkpoint — /history lists them", tone="yellow")
+            return
+        self.conversation.messages = self.checkpoints.rewind_to(target)
+        # The transcript on disk must match the one in memory, or resuming
+        # would restore the turns that were just undone.
+        self.record.messages = self.conversation.messages
+        self.record.checkpoints = self.checkpoints.to_json()
+        self.record.save()
+        transcript.add_note(f"rewound to before: {target.label}", tone="green")
+
+    # ---- shutdown ---------------------------------------------------------
+
+    def exit(self, *args, **kwargs):
+        """Record *why* the app is exiting before it takes the screen away.
+
+        Every quit path goes through here, so one line covers the deliberate
+        ones and anything that calls `exit` unexpectedly. Read back from
+        `~/.andromeda-cli/tui.log`.
+        """
+        self._exit_reason = kwargs.pop("_reason", self._exit_reason or "exit()")
+        return super().exit(*args, **kwargs)
+
+    def action_quit_app(self) -> None:
+        self.exit(_reason="ctrl+d")
+
+    def on_unmount(self) -> None:
+        """Release every gate before the screen goes.
+
+        An agent thread parked in the approval gate is waiting on an event only
+        this can set. Without it, quitting with a prompt open leaves a
+        non-daemon-looking thread blocked forever — and, worse, leaves a tool
+        that was never consented to in an undecided state rather than refused.
+        """
+        self._log_exit()
+        killed = self.driver.shutdown()
+        if killed:
+            # Printed after the screen is gone, so it lands in the scrollback
+            # the user is looking at rather than on a screen being torn down.
+            render.note(f"stopped {killed} background process(es)")
+
+    def _log_exit(self) -> None:
+        try:
+            from andromeda_cli import config as config_module
+
+            path = config_module.home() / "tui.log"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  unmount  "
+                    f"reason={self._exit_reason or 'unknown'}  "
+                    f"alive={time.monotonic() - self._started_at:.1f}s\n"
+                )
+        except (OSError, Exception):  # noqa: BLE001 - logging must not fail a teardown
+            pass
+
+
+def build(config: dict[str, Any], conversation, record, resumed=None) -> AndromedaApp:
+    return AndromedaApp(config, conversation, record, resumed=resumed)
+
+
+__all__ = ["AndromedaApp", "SLASH_HELP", "build"]

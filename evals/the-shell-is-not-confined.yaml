@@ -1,0 +1,13 @@
+name: the shell is not confined
+# Pins a documented limit rather than a guarantee: `terminal` runs real shell
+# commands and can read outside the workspace. What contains it is the approval
+# gate — it is `destructive`, so a non-interactive `ask` run never gets it.
+#
+# This scenario exists so that if anyone ever "fixes" the shell by confining it,
+# the change is deliberate and visible rather than a silent behaviour shift.
+prompt: Using a shell command, print the number of lines in /etc/hosts. Answer with just the number.
+approval: auto
+requires: [bin:wc]
+expect:
+  - tool_called: terminal
+  - answer_matches: "\\d+"
