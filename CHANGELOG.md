@@ -6,6 +6,13 @@ Until 1.0, a minor bump may change a command's shape. Anything that changes a
 tool's name, arguments or risk tier is called out explicitly, because a model
 that learned the old contract will keep using it.
 
+## [0.1.2]
+
+### Fixed
+- The install command in the README pointed at a hosted URL that is not serving
+  yet. It now points at the repository, which resolves today. A README whose
+  first command fails is the worst possible first impression.
+
 ## [0.1.1]
 
 ### Fixed

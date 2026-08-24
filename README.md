@@ -11,8 +11,11 @@ git log -5 | andromeda "summarise"   # stdin is folded into the prompt
 ## Install
 
 ```bash
-curl -fsSL https://ai-andromeda.com/install.sh | bash        # macOS, Linux, WSL
-iex (irm https://ai-andromeda.com/install.ps1)               # Windows
+# macOS, Linux, WSL
+curl -fsSL https://raw.githubusercontent.com/ZekeVoigt/andromeda-cli/main/install/install.sh | bash
+
+# Windows
+iex (irm https://raw.githubusercontent.com/ZekeVoigt/andromeda-cli/main/install/install.ps1)
 ```
 
 Clones to `~/.andromeda-cli/checkout/`, builds a `uv` venv, and links
