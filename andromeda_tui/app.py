@@ -58,7 +58,7 @@ from textual.widgets import Static
 
 from andromeda_agent.models import THINKING_LEVELS, supports_reasoning
 from andromeda_cli import checkpoints as checkpoint_module
-from andromeda_cli import render
+from andromeda_cli import art, render
 from andromeda_cli.session import set_asker, set_lane_announcer
 
 from . import events as ev
@@ -181,9 +181,26 @@ class AndromedaApp(App):
     def on_mount(self) -> None:
         transcript = self.transcript
         provider = self.conversation.provider
-        transcript.add_note(
-            f"{provider.label} · {provider.model}", tone="cyan"
-        )
+
+        # The study opens this surface as well as the REPL's.
+        #
+        # It was added to `output.banner()` first, which only the REPL calls —
+        # so anyone whose `interface` is `tui`, which is a configured default
+        # and not an unusual choice, never saw it at all. One surface getting
+        # the product's face and the other not is exactly the drift the shared
+        # renderer exists to prevent.
+        #
+        # Static here rather than animated: the scan drives a rich `Live`
+        # region, and this transcript is a Textual widget tree. Two things
+        # redrawing the same screen fight each other. The reveal belongs to the
+        # REPL; what the two surfaces share is the composition.
+        for line, style in art.study(max(self.size.width - 2, 40)):
+            transcript.add_note(line.rstrip(), tone=style or "muted")
+        transcript.add_note("")
+
+        transcript.add_note(render.eyebrow("the personal agent"), tone="eyebrow")
+        transcript.add_note("")
+        transcript.add_note(f"{provider.label} · {provider.model}", tone="accent")
         transcript.add_note(str(self.conversation.workspace.root))
         transcript.add_note(
             f"{len(self.conversation.available)} tools · approval: "

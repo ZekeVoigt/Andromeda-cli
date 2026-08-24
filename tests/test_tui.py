@@ -847,3 +847,51 @@ def _painted(app) -> str:
         blocks = [w for w in transcript.children if w.has_class("answer")]
         block = blocks[-1] if blocks else None
     return ANSI.sub("", str(block.visual) if block is not None else "")
+
+
+def _notes(app) -> str:
+    """Everything the transcript shows as a note row.
+
+    `_painted` reads the answer block, which is what most of this file cares
+    about. The opening screen is notes, so asserting on it needs its own
+    reader — and the absence of one is part of why nothing noticed that the
+    two surfaces opened differently.
+    """
+    transcript = app.query_one(Transcript)
+    rows = [w for w in transcript.children if w.has_class("note")]
+    return ANSI.sub("", "\n".join(str(getattr(w, "visual", "")) for w in rows))
+
+
+class TestBothSurfacesOpenTheSame:
+    """The study belongs to the product, not to one interface.
+
+    It went into `output.banner()` first, which only the REPL calls — so
+    anyone with `interface: tui` configured, which is a supported default and
+    not an unusual choice, never saw it. The two surfaces already share a
+    renderer precisely so they cannot drift on how things look; opening on
+    different faces is the same drift by another route, and nothing caught it
+    because every test asserted on what happens *after* you type.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_tui_opens_with_the_study(self, tmp_path):
+        app = _app(tmp_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            notes = _notes(app)
+
+        # The coordinates and the caption are text rather than braille, so they
+        # survive width clamping and are the honest thing to assert on.
+        assert "00h 42m 44s" in notes
+        assert "HUMAN / SYSTEM / ORBIT" in notes
+
+    @pytest.mark.asyncio
+    async def test_it_does_not_push_off_what_you_are_connected_to(self, tmp_path):
+        """The study must not cost the working details their place."""
+        app = _app(tmp_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            notes = _notes(app)
+
+        assert "approval:" in notes
+        assert "tools" in notes

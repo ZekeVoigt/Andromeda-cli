@@ -12,6 +12,15 @@ that learned the old contract will keep using it.
 - The install command is back to `https://ai-andromeda.com/install.sh`, which
   now serves. It pointed at the repository while that URL was returning 404.
 
+## [0.2.3]
+
+### Fixed
+- **The startup study now opens the full-screen interface too.** It was only in
+  the REPL's banner, so anyone with `interface: tui` configured never saw it —
+  the two surfaces share a renderer precisely so they cannot drift on how
+  things look, and opening on different faces was the same drift by another
+  route.
+
 ## [0.2.2]
 
 ### Fixed
