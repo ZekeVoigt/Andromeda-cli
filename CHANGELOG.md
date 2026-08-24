@@ -12,6 +12,16 @@ that learned the old contract will keep using it.
 - The install command is back to `https://ai-andromeda.com/install.sh`, which
   now serves. It pointed at the repository while that URL was returning 404.
 
+## [0.2.6]
+
+### Changed
+- **The figure is drawn now, and it has a head.** In the source plate the head
+  is about 35 pixels across, which at terminal size reduces to roughly a 7x9
+  patch of braille dots — mush at any threshold, which is why three rounds of
+  crop tuning produced a figure missing the one part everybody looks for. The
+  pose is constructed instead, to proportions measured off the landing page's
+  own render: head, both arm positions, both leg positions, torso with mass.
+
 ## [0.2.5]
 
 ### Changed
