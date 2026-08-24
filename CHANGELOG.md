@@ -6,6 +6,13 @@ Until 1.0, a minor bump may change a command's shape. Anything that changes a
 tool's name, arguments or risk tier is called out explicitly, because a model
 that learned the old contract will keep using it.
 
+## [0.1.1]
+
+### Fixed
+- The test suite no longer depends on terminal width. A wrapped rich line puts
+  a newline inside a phrase, so a substring assertion failed on CI, where paths
+  are longer, while passing on a wide local terminal.
+
 ## [0.1.0]
 
 First release.
