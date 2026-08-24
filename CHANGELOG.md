@@ -6,6 +6,14 @@ Until 1.0, a minor bump may change a command's shape. Anything that changes a
 tool's name, arguments or risk tier is called out explicitly, because a model
 that learned the old contract will keep using it.
 
+## [0.1.3]
+
+### Fixed
+- `--version` reports the released version. It was written in two places and
+  drifted immediately, so a freshly installed CLI named a release two behind —
+  and `doctor` prints it, so every bug report would have carried the wrong one.
+  The packaging metadata is the single source now.
+
 ## [0.1.2]
 
 ### Fixed

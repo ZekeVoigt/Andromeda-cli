@@ -209,3 +209,40 @@ def test_the_tools_listing_matches_a_real_session(tmp_path):
     )
 
     assert set(tools_cmd._registry()) == set(conversation.registry)
+
+
+class TestTheReportedVersion:
+    """What `--version` says must be the version that was released.
+
+    It drifted the moment there were two places to write it: `pyproject.toml`
+    reached 0.1.2 while the package literal still said 0.1.0, so a freshly
+    installed CLI reported a release that was two behind. `doctor` prints it
+    too, so every bug report would have named the wrong version — which is the
+    one field in a report you cannot afford to be quietly wrong.
+    """
+
+    def test_it_matches_the_packaging_metadata(self):
+        import re
+        from pathlib import Path
+
+        import andromeda_cli
+
+        pyproject = Path(andromeda_cli.__file__).resolve().parents[1] / "pyproject.toml"
+        if not pyproject.is_file():
+            pytest.skip("no pyproject beside the package")
+
+        declared = re.search(
+            r'^version\s*=\s*"([^"]+)"', pyproject.read_text(encoding="utf-8"), re.M
+        )
+        assert declared, "pyproject.toml has no version"
+        assert andromeda_cli.__version__ == declared.group(1)
+
+    def test_it_is_not_a_hardcoded_literal(self):
+        # The mechanism, not just the value: a literal would satisfy the check
+        # above on the day it was written and drift again on the next release.
+        from pathlib import Path
+
+        import andromeda_cli
+
+        source = Path(andromeda_cli.__file__).read_text(encoding="utf-8")
+        assert "importlib.metadata" in source
