@@ -1,6 +1,6 @@
 [project]
 name = "andromeda-cli"
-version = "0.1.4"
+version = "0.2.0"
 description = "Andromeda — a local-first agent harness for the terminal"
 readme = "README.md"
 # Upper bound is load-bearing. uv resolves the interpreter from this field, and
@@ -50,9 +50,13 @@ andromeda = "andromeda_cli.__main__:main"
 requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools.package-data]
+andromeda_cli = ["art/*.txt"]
+
 [tool.setuptools]
 packages = [
   "andromeda_cli",
+  "andromeda_cli.art",
   "andromeda_cli.commands",
   "andromeda_agent",
   "andromeda_agent.providers",

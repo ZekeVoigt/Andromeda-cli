@@ -15,18 +15,45 @@ from andromeda_agent.errors import AgentError
 # auto-coloured and the other half not.
 from .render import console, err_console  # noqa: E402
 
-BANNER = r"""
-   _              _                          _
-  /_\  _ _  _ _| |_ _ ___ _ __  ___ __| |__ _
- / _ \| ' \/ _` |  _| '_/ _ \ '  \/ -_) _` / _` |
-/_/ \_\_||_\__,_|\__|_| \___/_|_|_\___\__,_\__,_|
-"""
+def banner(*, model: str, lane: str, extra: str = "", animate: bool = True) -> None:
+    """The first thing anyone sees.
 
+    The study replaces the ASCII wordmark it used to print. A wordmark says the
+    name, which is already in the command they just typed; the study says what
+    the product is. It is the landing page's `ProportionStudy`, and carrying it
+    into the terminal is the cheapest way for the two surfaces to feel like one
+    product.
 
-def banner(*, model: str, lane: str) -> None:
-    console.print(Text(BANNER.strip("\n"), style="bold cyan"))
-    console.print(f"  [dim]{lane} · {model}[/dim]")
-    console.print("  [dim]/help for commands, /exit to leave[/dim]\n")
+    Degrades all the way down: animated on a capable tty, static where live
+    redraws are not available, and a single plain line where the terminal
+    cannot encode braille or the output is redirected. A banner must never be
+    the reason a session fails to start.
+    """
+    from . import art
+    from .render import eyebrow
+
+    drew = False
+    if art.supported():
+        console.print()
+        if animate:
+            art.scan(console, width=console.width)
+        else:
+            for text, style in art.study(console.width):
+                console.print(text, style=style or None)
+        drew = bool(art.figure())
+
+    if not drew:
+        console.print()
+        console.print(f"  [eyebrow]{eyebrow('Andromeda')}[/eyebrow]")
+
+    console.print()
+    console.print(f"  [eyebrow]{eyebrow('the personal agent')}[/eyebrow]")
+    console.print()
+    line = f"  [muted]{lane} · {model}[/muted]"
+    if extra:
+        line += f"  [muted]·[/muted]  [muted]{extra}[/muted]"
+    console.print(line)
+    console.print("  [muted]/help for commands, /exit to leave[/muted]\n")
 
 
 def agent_error(exc: AgentError) -> None:

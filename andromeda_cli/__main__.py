@@ -43,6 +43,7 @@ from .commands import (  # noqa: E402
 from . import sessions as sessions_store  # noqa: E402
 
 COMMANDS = (
+    "setup",
     "auth",
     "cron",
     "eval",
@@ -209,6 +210,7 @@ def build_command_parser() -> argparse.ArgumentParser:
         "--check", action="store_true", help="Report what is available, change nothing."
     )
     sub.add_parser("doctor", help="Show what is and is not working.")
+    sub.add_parser("setup", help="First-run setup. Four questions, all skippable.")
 
     backup_parser = sub.add_parser(
         "backup", help="Archive everything, including credentials."
@@ -485,6 +487,11 @@ def _run_command(argv: list[str]) -> int:
 
     if args.command == "doctor":
         return doctor.run()
+
+    if args.command == "setup":
+        from .commands import setup as setup_cmd
+
+        return setup_cmd.run()
 
     if args.command == "backup":
         return transfer.backup(args.path)

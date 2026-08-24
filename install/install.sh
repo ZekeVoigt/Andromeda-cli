@@ -106,8 +106,29 @@ esac
 
 say ""
 ok "Installed."
-say ""
-say "  Pair this machine:   andromeda auth login <code>"
-say "  Or bring your own:   export OPENROUTER_API_KEY=... && andromeda config set provider direct"
-say "  Then just:           andromeda"
-say ""
+
+# ---------------------------------------------------------------------------
+# Setup runs here, not on first launch
+# ---------------------------------------------------------------------------
+# Somebody who has just watched an install finish is already paying attention;
+# asking then costs nothing. Asking on first launch interrupts the moment they
+# finally have a prompt and something to type into it.
+#
+# `< /dev/tty` is the whole trick. This script is being read by bash *from a
+# pipe* — `curl … | bash` — so the script's stdin is its own source. A child
+# that reads stdin gets the remaining bytes of this file as the user's
+# answers. Redirecting from /dev/tty hands it the real terminal instead.
+#
+# Guarded, because there is not always a terminal: piping the installer inside
+# CI or a Dockerfile is legitimate and must not hang on a read that never
+# returns. The CLI checks again on its own side; this is belt and braces on the
+# one failure that would look like a frozen install.
+if [ -e /dev/tty ] && [ -r /dev/tty ]; then
+  say ""
+  "$CLI_DIR/.venv/bin/andromeda" setup < /dev/tty || true
+else
+  say ""
+  say "  No terminal available, so setup was skipped."
+  say "  Run it when you have one:   andromeda setup"
+  say ""
+fi

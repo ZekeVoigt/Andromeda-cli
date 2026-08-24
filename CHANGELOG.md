@@ -12,6 +12,25 @@ that learned the old contract will keep using it.
 - The install command is back to `https://ai-andromeda.com/install.sh`, which
   now serves. It pointed at the repository while that URL was returning 404.
 
+## [0.2.0]
+
+### Added
+- **Onboarding.** `andromeda setup` — four screens, one decision each, all
+  skippable, with a step counter and a capability summary that names the exact
+  command to close each gap. It runs automatically at the end of the installer,
+  reading from `/dev/tty` so it works inside `curl … | bash`.
+- **`SOUL.md`** — standing instructions in your own words, read every session
+  and never written to by the program. Ships fully commented out, so an
+  untouched file costs nothing.
+- **The startup study.** The landing page's Vitruvian figure, rendered in
+  braille, with Andromeda's real sky coordinates and a scan line that sweeps it
+  once on launch. Degrades to a wordmark on terminals that cannot draw it and
+  disappears entirely when output is redirected.
+
+### Changed
+- The palette is the website's — near-monochrome zinc with a single restrained
+  accent — instead of the default terminal cyan and magenta.
+
 ## [0.1.3]
 
 ### Fixed

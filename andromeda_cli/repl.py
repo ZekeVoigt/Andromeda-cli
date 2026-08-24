@@ -225,7 +225,16 @@ def run(
         session=resume,
     )
 
-    output.banner(model=provider.model, lane=provider.label)
+    # The credit balance is unknown until a call has been made, so it is absent
+    # on the very first line and present on every session after. Showing an
+    # unknown balance as "$0.00" would be a lie at exactly the wrong moment.
+    from andromeda_agent import credits as _credits
+
+    output.banner(
+        model=provider.model,
+        lane=provider.label,
+        extra=_credits.summary(getattr(provider, "balance", _credits.Balance())),
+    )
     output.info(f"  {conversation.workspace.root}")
     output.info(
         f"  {len(conversation.available)} tools · approval: {conversation.policy.mode}"

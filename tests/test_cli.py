@@ -235,7 +235,13 @@ class TestTheReportedVersion:
             r'^version\s*=\s*"([^"]+)"', pyproject.read_text(encoding="utf-8"), re.M
         )
         assert declared, "pyproject.toml has no version"
-        assert andromeda_cli.__version__ == declared.group(1)
+        assert andromeda_cli.__version__ == declared.group(1), (
+            f"the package reports {andromeda_cli.__version__} but pyproject.toml says "
+            f"{declared.group(1)}.\n"
+            "If you just bumped the version, the editable install's metadata is stale — "
+            "it is only refreshed on install:\n"
+            "    uv pip install --python .venv/bin/python -e ."
+        )
 
     def test_it_is_not_a_hardcoded_literal(self):
         # The mechanism, not just the value: a literal would satisfy the check

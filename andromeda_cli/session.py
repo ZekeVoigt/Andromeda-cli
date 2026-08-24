@@ -21,6 +21,7 @@ from andromeda_agent.delegation import (
 from andromeda_agent.lanes import LaneRegistry
 from andromeda_agent import auxiliary as auxiliary_module
 from andromeda_agent.models import context_window
+from andromeda_agent import soul
 from andromeda_agent.schedule import Schedule
 from andromeda_agent.specialists import SPECIALISTS
 from andromeda_tools import (
@@ -329,6 +330,14 @@ def _context_blocks(
         f"  sessions  {home / 'sessions'}\n"
         f"  memory    {home / 'memory'}"
     ]
+
+    # The user's own standing instructions go first among the context blocks,
+    # ahead of skills and memories: they are the only block a person wrote by
+    # hand, and when they conflict with something this program inferred, the
+    # person wins.
+    soul_block = soul.block(home)
+    if soul_block:
+        blocks.append(soul_block)
 
     manifest = skills_module.manifest(found_skills)
     if manifest:

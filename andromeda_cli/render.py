@@ -30,26 +30,66 @@ from rich.markdown import Markdown
 from rich.text import Text
 from rich.theme import Theme
 
+# The palette is the website's, not the terminal's defaults.
+#
+# ai-andromeda.com is near-monochrome — zinc greys (#d4d4d8 / #a1a1aa /
+# #71717a) over near-black, with one deep navy in the gradients and no
+# saturated colour anywhere. Hierarchy comes from typography and space rather
+# than from hue.
+#
+# This used to be `accent: cyan, lane: magenta` — the default 16-colour
+# terminal palette, which belongs to no product in particular. The difference
+# is the whole point: a loud terminal reads as complicated, and a calm one
+# reads as confident. It is also what a person meets before they have read a
+# word of documentation.
+#
+# `periwinkle` is that navy lifted until it survives on a light background as
+# well as a dark one, and it is spent sparingly: the selected item, the prompt
+# caret, and nothing else.
+ZINC_300 = "#d4d4d8"
+ZINC_400 = "#a1a1aa"
+ZINC_500 = "#71717a"
+PERIWINKLE = "#8f9bff"
+
 THEME = Theme(
     {
-        "accent": "cyan",
-        "lane": "magenta",
-        "muted": "dim",
-        "ok": "green",
-        "warn": "yellow",
-        "bad": "red",
+        "accent": PERIWINKLE,
+        "lane": ZINC_400,
+        "muted": ZINC_500,
+        # Semantic states keep their conventional hue, because a red that is
+        # not red is a failure nobody registers. They are desaturated to sit
+        # inside the greyscale rather than shout over it.
+        "ok": "#6ee7a8",
+        "warn": "#e8c468",
+        "bad": "#f2777a",
+        # An all-caps, wide-tracked label. The site's eyebrows —
+        # EXPRESSIVE INTELLIGENCE, HUMAN / SYSTEM / ORBIT — are the strongest
+        # single piece of its visual language and they cost nothing here.
+        "eyebrow": f"bold {ZINC_500}",
+        "figure": ZINC_400,
+        "rule": "#3f3f46",
         # Markdown elements. Restrained on purpose: rich's defaults colour
         # headings and code aggressively, which fights the prose.
         "markdown.h1": "bold",
         "markdown.h2": "bold",
         "markdown.h3": "bold",
-        "markdown.item.number": "cyan",
-        "markdown.item.bullet": "cyan",
-        "markdown.code": "cyan",
-        "markdown.link": "cyan underline",
-        "markdown.block_quote": "dim italic",
+        "markdown.item.number": ZINC_500,
+        "markdown.item.bullet": ZINC_500,
+        "markdown.code": ZINC_300,
+        "markdown.link": f"{PERIWINKLE} underline",
+        "markdown.block_quote": f"italic {ZINC_500}",
     }
 )
+
+
+def eyebrow(text: str) -> str:
+    """The site's section label: all caps, letter-spaced.
+
+    Tracking is faked with spaces because a terminal has no letter-spacing.
+    Only for short labels — it doubles the width, so a long one wraps and the
+    effect inverts into noise.
+    """
+    return " ".join(text.upper())
 
 # `highlight=False` on both, deliberately. Rich's automatic highlighter colours
 # anything that looks like a number, a path or a URL, so `/help` comes out
