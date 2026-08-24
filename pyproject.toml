@@ -1,8 +1,10 @@
 [project]
 name = "andromeda-cli"
-version = "0.2.6"
+version = "0.2.7"
 description = "Andromeda — a local-first agent harness for the terminal"
 readme = "README.md"
+authors = [{ name = "Zeke Voigt" }]
+keywords = ["ai", "agent", "automation", "cli", "local-first", "terminal"]
 # Upper bound is load-bearing. uv resolves the interpreter from this field, and
 # an inherited UV_PYTHON (or a host whose newest interpreter is 3.14 — this
 # machine ships 3.14.6) otherwise selects a version where Rust-backed
@@ -11,6 +13,20 @@ readme = "README.md"
 # pydantic-core ships cp314.
 requires-python = ">=3.11,<3.14"
 license = "MIT"
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development",
+  "Topic :: System :: Shells",
+]
 
 # Every direct dependency is exact-pinned (==X.Y.Z, no ranges).
 # Ranges let PyPI ship a fresh transitive at any hour without review on our
@@ -34,6 +50,13 @@ dependencies = [
   # would also mean failing at the moment someone asks to look at something.
   "textual==8.2.8",
 ]
+
+[project.urls]
+Homepage = "https://ai-andromeda.com"
+Repository = "https://github.com/ZekeVoigt/andromeda-cli"
+Issues = "https://github.com/ZekeVoigt/andromeda-cli/issues"
+Changelog = "https://github.com/ZekeVoigt/andromeda-cli/blob/main/CHANGELOG.md"
+Documentation = "https://github.com/ZekeVoigt/andromeda-cli#readme"
 
 [project.optional-dependencies]
 dev = ["pytest==8.4.2", "pytest-asyncio==1.2.0", "respx==0.22.0"]

@@ -97,7 +97,7 @@ class TestBackup:
         transfer.backup(str(tmp_path / "backup.tar.gz"))
         printed = capsys.readouterr().out
         assert "like a password" not in printed
-        assert "not paired" in printed
+        assert "not signed in" in printed
 
     def test_the_manifest_of_an_unpaired_backup_says_so(self, tmp_path):
         config_module.set_value("temperature", "0.5")

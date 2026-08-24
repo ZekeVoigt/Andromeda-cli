@@ -80,7 +80,7 @@ def _report(destination: Path, size: int, included: list[str], secrets: bool) ->
             "Treat it like a password.[/yellow]"
         )
     elif secrets:
-        output.info("  This install is not paired, so there was no token to include.")
+        output.info("  This install is not signed in, so there was no token to include.")
     else:
         output.info("  Credentials excluded — pair again on the other machine.")
 

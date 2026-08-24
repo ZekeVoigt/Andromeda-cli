@@ -84,7 +84,9 @@ def run() -> int:
     _line(
         credentials.paired,
         "account",
-        f"paired · {credentials.user_id}" if credentials.paired else "not paired",
+        f"signed in · {credentials.user_id}"
+        if credentials.paired
+        else "not signed in — `andromeda auth login`",
     )
 
     key_name = str(config["direct_api_key_env"])

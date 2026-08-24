@@ -69,7 +69,8 @@ examples:
   git log -5 | andromeda "summarise" read the pipe as part of the prompt
 
 commands:
-  andromeda auth login <code>        pair this machine with an account
+  andromeda auth login               sign in through your browser
+  andromeda auth login <code>        sign in with a code, for a machine with no browser
   andromeda auth status | logout
   andromeda config get [key]
   andromeda config set <key> <value>
@@ -179,11 +180,22 @@ def build_command_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="andromeda")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    auth_parser = sub.add_parser("auth", help="Pair or unpair this machine.")
+    auth_parser = sub.add_parser("auth", help="Sign this machine in or out.")
     auth_sub = auth_parser.add_subparsers(dest="auth_command", required=True)
-    login = auth_sub.add_parser("login", help="Pair using a code from the app.")
-    login.add_argument("code", help="The pairing code shown in the app.")
-    auth_sub.add_parser("status", help="Show whether this machine is paired.")
+    login = auth_sub.add_parser(
+        "login", help="Sign in through your browser, or with a code."
+    )
+    login.add_argument(
+        "code",
+        nargs="?",
+        help="A pairing code from your account page. Omit it to sign in through your browser.",
+    )
+    login.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="Print the sign-in URL instead of opening it. For ssh and remote shells.",
+    )
+    auth_sub.add_parser("status", help="Show whether this machine is signed in.")
     auth_sub.add_parser("logout", help="Delete the device token from this machine.")
 
     config_parser = sub.add_parser("config", help="Read or write settings.")
@@ -470,7 +482,11 @@ def _run_command(argv: list[str]) -> int:
 
     if args.command == "auth":
         if args.auth_command == "login":
-            return auth.login(args.code, base_url=str(config_module.load()["base_url"]))
+            return auth.login(
+                args.code,
+                base_url=str(config_module.load()["base_url"]),
+                open_browser=not args.no_browser,
+            )
         if args.auth_command == "status":
             return auth.status()
         return auth.logout()

@@ -12,7 +12,7 @@ def test_doctor_reports_without_failing(capsys):
 
 def test_doctor_reports_an_unpaired_account(capsys):
     doctor.run()
-    assert "not paired" in capsys.readouterr().out
+    assert "not signed in" in capsys.readouterr().out
 
 
 def test_doctor_reports_a_paired_account(capsys):

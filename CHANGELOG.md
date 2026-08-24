@@ -6,11 +6,21 @@ Until 1.0, a minor bump may change a command's shape. Anything that changes a
 tool's name, arguments or risk tier is called out explicitly, because a model
 that learned the old contract will keep using it.
 
-## [0.1.4]
+## [0.2.7]
+
+### Added
+- `andromeda auth login` now opens the Andromeda website and completes sign-in
+  through a state-verified loopback callback. A pairing code remains available
+  for SSH sessions and other machines without a local browser.
 
 ### Changed
-- The install command is back to `https://ai-andromeda.com/install.sh`, which
-  now serves. It pointed at the repository while that URL was returning 404.
+- Setup treats account sign-in as its first step and uses consistent
+  “signed in” language across status, diagnostics, backups, and errors.
+
+### Fixed
+- The one-shot callback explicitly closes its HTTP connection, so a browser
+  that keeps HTTP/1.1 connections alive cannot leave a successful login
+  waiting in the terminal.
 
 ## [0.2.6]
 
@@ -83,6 +93,12 @@ that learned the old contract will keep using it.
 ### Changed
 - The palette is the website's — near-monochrome zinc with a single restrained
   accent — instead of the default terminal cyan and magenta.
+
+## [0.1.4]
+
+### Changed
+- The install command is back to `https://ai-andromeda.com/install.sh`, which
+  now serves. It pointed at the repository while that URL was returning 404.
 
 ## [0.1.3]
 

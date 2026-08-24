@@ -60,7 +60,7 @@ def test_config_set_then_get_round_trips(capsys):
 
 def test_unpaired_relay_run_exits_nonzero(capsys):
     assert main(["hello"]) == 1
-    assert "not paired" in capsys.readouterr().err.lower()
+    assert "not signed in" in capsys.readouterr().err.lower()
 
 
 def test_tools_listing_succeeds(capsys):

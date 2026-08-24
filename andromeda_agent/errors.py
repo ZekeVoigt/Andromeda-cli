@@ -20,8 +20,8 @@ class AgentError(RuntimeError):
 class NotSignedIn(AgentError):
     def __init__(self) -> None:
         super().__init__(
-            "This device is not paired with an Andromeda account.",
-            hint="Run `andromeda auth login` and paste the code from the app.",
+            "This machine is not signed in to an Andromeda account.",
+            hint="Run `andromeda auth login` — it signs you in through your browser.",
         )
 
 
