@@ -25,7 +25,23 @@ import sys
 import time
 from pathlib import Path
 
-FIGURE_PATH = Path(__file__).with_name("vitruvian.txt")
+# Two renders of the same drawing, chosen by how much room there is.
+#
+# One size cannot serve both. At 58 columns the figure is legible but sparse —
+# it reads as a suggestion of a body. At 96 it reads as the drawing: the
+# square's sides, the spread legs, the outstretched arms. But 96 columns
+# overflows an 80-column terminal, and art that wraps is worse than art that
+# is small.
+#
+# So the wide one is used when it fits with room to spare, and the compact one
+# otherwise. The threshold is not the terminal's exact width: a figure pressed
+# against both edges looks cramped, and the caption line underneath needs to
+# sit inside the same measure.
+WIDE_PATH = Path(__file__).with_name("vitruvian-wide.txt")
+COMPACT_PATH = Path(__file__).with_name("vitruvian.txt")
+
+# Below this, the wide render has no room to breathe.
+WIDE_MIN_WIDTH = 104
 
 # Andromeda (M31). The same pair the landing page prints in its corners.
 RA = "RA 00h 42m 44s"
@@ -40,17 +56,23 @@ SCAN_SECONDS = 0.55
 SCAN_BAND = 3
 
 
-def figure() -> list[str]:
-    """The pre-rendered figure, or nothing if it is missing.
+def figure(width: int = 0) -> list[str]:
+    """The pre-rendered figure at the largest size that fits, or nothing.
 
     Missing art is not an error worth failing a launch over. Returning an empty
     list lets every caller degrade to a plain header instead of crashing on the
-    way to a prompt.
+    way to a prompt — and the compact render is the fallback for the wide one,
+    so a partial install still draws something.
     """
-    try:
-        return FIGURE_PATH.read_text(encoding="utf-8").rstrip("\n").split("\n")
-    except OSError:
-        return []
+    candidates = [COMPACT_PATH]
+    if width >= WIDE_MIN_WIDTH:
+        candidates.insert(0, WIDE_PATH)
+    for path in candidates:
+        try:
+            return path.read_text(encoding="utf-8").rstrip("\n").split("\n")
+        except OSError:
+            continue
+    return []
 
 
 def supported(stream=None) -> bool:
@@ -94,7 +116,7 @@ def study(width: int = 64) -> list[tuple[str, str]]:
     Returned as rows rather than printed so the same composition serves the
     static path, the animated path and the tests, and the three cannot drift.
     """
-    lines = figure()
+    lines = figure(width)
     if not lines:
         return []
 

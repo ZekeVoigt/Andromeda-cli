@@ -12,6 +12,15 @@ that learned the old contract will keep using it.
 - The install command is back to `https://ai-andromeda.com/install.sh`, which
   now serves. It pointed at the repository while that URL was returning 404.
 
+## [0.2.4]
+
+### Changed
+- **The study is legible now.** It ships at two sizes and picks by terminal
+  width: a detailed 96-column render where there is room, the compact one
+  otherwise. At 58 columns the figure read as a suggestion of a body; at 96 the
+  square's sides, the spread legs and the outstretched arms are all there. The
+  crop also no longer clips the feet.
+
 ## [0.2.3]
 
 ### Fixed

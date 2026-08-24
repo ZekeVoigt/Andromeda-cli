@@ -169,8 +169,9 @@ class TestTheStudy:
 
     def test_missing_art_degrades_rather_than_crashes(self, monkeypatch, tmp_path):
         """A decoration must never be why a session fails to start."""
-        monkeypatch.setattr(art, "FIGURE_PATH", tmp_path / "absent.txt")
-        assert art.figure() == []
+        monkeypatch.setattr(art, "WIDE_PATH", tmp_path / "absent.txt")
+        monkeypatch.setattr(art, "COMPACT_PATH", tmp_path / "also-absent.txt")
+        assert art.figure(200) == []
         assert art.study(72) == []
 
 
@@ -328,3 +329,33 @@ class TestTheWizardOnARealTerminal:
         assert "THIS LINE IS SHELL SOURCE" not in out.replace("\r", "")
         assert "1 of 4" in out
         assert soul.path(home).is_file()
+
+
+class TestTheTwoSizes:
+    """One render cannot serve every terminal.
+
+    At 58 columns the figure is legible but sparse; at 96 it reads as the
+    drawing. But 96 overflows an 80-column terminal, and art that wraps is
+    worse than art that is small — a wrapped braille grid is not a smaller
+    picture, it is noise.
+    """
+
+    def test_a_narrow_terminal_gets_the_compact_render(self):
+        lines = art.figure(80)
+        assert max(len(line) for line in lines) <= 80
+
+    def test_a_wide_terminal_gets_the_detailed_one(self):
+        narrow = art.figure(80)
+        wide = art.figure(140)
+        assert len(wide) > len(narrow), "a wide terminal should get more of the drawing"
+
+    def test_neither_render_can_overflow_the_terminal_it_is_chosen_for(self):
+        for width in (60, 80, 100, 104, 120, 200):
+            lines = art.figure(width)
+            drawn = max(len(line) for line in lines)
+            assert drawn <= width, f"{drawn} columns of art in a {width}-column terminal"
+
+    def test_the_compact_render_stands_in_if_the_wide_one_is_missing(self, monkeypatch, tmp_path):
+        """A partial install must still draw something."""
+        monkeypatch.setattr(art, "WIDE_PATH", tmp_path / "absent.txt")
+        assert art.figure(200), "no fallback when the wide render is unavailable"

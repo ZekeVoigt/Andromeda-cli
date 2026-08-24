@@ -40,7 +40,7 @@ def banner(*, model: str, lane: str, extra: str = "", animate: bool = True) -> N
         else:
             for text, style in art.study(console.width):
                 console.print(text, style=style or None)
-        drew = bool(art.figure())
+        drew = bool(art.figure(console.width))
 
     if not drew:
         console.print()
