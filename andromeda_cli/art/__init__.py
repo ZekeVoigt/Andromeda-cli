@@ -41,7 +41,7 @@ WIDE_PATH = Path(__file__).with_name("vitruvian-wide.txt")
 COMPACT_PATH = Path(__file__).with_name("vitruvian.txt")
 
 # Below this, the wide render has no room to breathe.
-WIDE_MIN_WIDTH = 104
+WIDE_MIN_WIDTH = 86
 
 # Andromeda (M31). The same pair the landing page prints in its corners.
 RA = "RA 00h 42m 44s"
@@ -102,11 +102,18 @@ def supported(stream=None) -> bool:
 
 
 def _pad(lines: list[str], width: int) -> list[str]:
-    """Left-pad the figure so it sits centred inside `width`."""
+    """Left-pad so the composition sits centred inside `width`.
+
+    Centred on the *canvas* the geometry was drawn in, not on the ragged extent
+    of the lit dots. The circle is centred in that canvas by construction, so
+    measuring the widest lit row and centring that instead shifts the whole
+    study sideways by however much the widest row happens to overhang — which
+    reads as a circle that is not quite in the middle.
+    """
     if not lines:
         return []
-    art_width = max(len(line) for line in lines)
-    left = max(0, (width - art_width) // 2)
+    canvas = max(len(line) for line in lines)
+    left = max(0, (width - canvas) // 2)
     return [(" " * left) + line for line in lines]
 
 

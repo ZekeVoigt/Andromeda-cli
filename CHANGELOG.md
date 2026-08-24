@@ -12,6 +12,17 @@ that learned the old contract will keep using it.
 - The install command is back to `https://ai-andromeda.com/install.sh`, which
   now serves. It pointed at the repository while that URL was returning 404.
 
+## [0.2.5]
+
+### Changed
+- **The study is the whole composition now** — circle, square and figure, not
+  just a fragment of the figure. The circle and square are *drawn* rather than
+  extracted: the source is a photograph of aged vellum, Leonardo's circle is a
+  faint line whose luminance overlaps the stained paper around it, and no
+  threshold separates the two. The landing page does the same thing, drawing
+  its circle and square as elements and using the photograph only for the
+  figure.
+
 ## [0.2.4]
 
 ### Changed
