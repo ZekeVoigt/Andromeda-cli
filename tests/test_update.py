@@ -9,6 +9,7 @@ ImportError before the CLI can print anything.
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -51,26 +52,31 @@ def repo(tmp_path, monkeypatch):
     return clone
 
 
-def stub_pip(monkeypatch, returncode: int):
+def stub_install(monkeypatch, returncode: int):
+    """Intercept the dependency install, whatever shape it takes.
+
+    Dispatches on "is this git?" rather than on the installer's argv. The
+    previous version matched `[sys.executable, "-m", "pip"]` exactly, so when
+    the install switched to `uv` these tests silently started running the real
+    installer against a fixture repo — and failed for a reason that had nothing
+    to do with what they assert. A stub that knows the shape of the thing it
+    stubs breaks every time that shape legitimately changes.
+    """
     calls = []
-
-    def fake_run(command, **kwargs):
-        calls.append(command)
-        return subprocess.CompletedProcess(command, returncode, stdout="", stderr="boom")
-
     real_run = subprocess.run
 
     def dispatch(command, **kwargs):
-        if command[:3] == [__import__("sys").executable, "-m", "pip"]:
-            return fake_run(command, **kwargs)
-        return real_run(command, **kwargs)
+        if command and command[0] == "git":
+            return real_run(command, **kwargs)
+        calls.append(command)
+        return subprocess.CompletedProcess(command, returncode, stdout="", stderr="boom")
 
     monkeypatch.setattr(update_cmd.subprocess, "run", dispatch)
     return calls
 
 
 def test_a_successful_update_moves_to_origin(repo, monkeypatch):
-    stub_pip(monkeypatch, 0)
+    stub_install(monkeypatch, 0)
     assert update_cmd.run() == 0
     assert (repo / "cli" / "marker.txt").read_text(encoding="utf-8") == "v2"
 
@@ -78,7 +84,7 @@ def test_a_successful_update_moves_to_origin(repo, monkeypatch):
 def test_a_failed_install_rolls_the_checkout_back(repo, monkeypatch, capsys):
     """The whole point. A failed update leaves the install working."""
     before = git(repo, "rev-parse", "HEAD")
-    stub_pip(monkeypatch, 1)
+    stub_install(monkeypatch, 1)
 
     assert update_cmd.run() == 1
 
@@ -88,14 +94,14 @@ def test_a_failed_install_rolls_the_checkout_back(repo, monkeypatch, capsys):
 
 
 def test_being_up_to_date_is_a_success(repo, monkeypatch):
-    stub_pip(monkeypatch, 0)
+    stub_install(monkeypatch, 0)
     update_cmd.run()
     assert update_cmd.run() == 0
 
 
 def test_check_reports_without_changing_anything(repo, monkeypatch, capsys):
     before = git(repo, "rev-parse", "HEAD")
-    stub_pip(monkeypatch, 0)
+    stub_install(monkeypatch, 0)
 
     assert update_cmd.run(check_only=True) == 0
     assert git(repo, "rev-parse", "HEAD") == before
@@ -105,7 +111,7 @@ def test_check_reports_without_changing_anything(repo, monkeypatch, capsys):
 def test_a_dirty_checkout_is_refused(repo, monkeypatch, capsys):
     """Resetting over someone's edits is not an update, it is data loss."""
     (repo / "cli" / "marker.txt").write_text("local work", encoding="utf-8")
-    stub_pip(monkeypatch, 0)
+    stub_install(monkeypatch, 0)
 
     assert update_cmd.run() == 1
     assert (repo / "cli" / "marker.txt").read_text(encoding="utf-8") == "local work"
@@ -153,3 +159,48 @@ class TestTheLayoutProbe:
         (tmp_path / "cli").mkdir()
         (tmp_path / "pyproject.toml").write_text("", encoding="utf-8")
         assert update_cmd.package_dir(tmp_path) == tmp_path
+
+
+class TestTheInstallCommand:
+    """Which installer `update` shells out to.
+
+    This is the check that would have caught a command that could never
+    succeed. The installer builds the venv with `uv venv`, which does not
+    include pip, so `python -m pip` fails with "No module named pip" on every
+    install this project produces. `update` used it anyway: it reset to the new
+    revision, failed to install, rolled back, and truthfully reported that the
+    install still worked — at the old version, permanently.
+
+    It survived because a development checkout has pip and a real install does
+    not, so it worked for everyone who could have noticed.
+    """
+
+    def test_it_prefers_uv(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(update_cmd.shutil, "which", lambda name: "/usr/bin/uv")
+        command = update_cmd._install_command(tmp_path)
+
+        assert command[0] == "/usr/bin/uv"
+        assert command[1:3] == ["pip", "install"]
+        assert "--python" in command, "uv must be told which interpreter to install into"
+
+    def test_it_targets_this_interpreter(self, tmp_path, monkeypatch):
+        """Not whatever `uv` would pick on its own.
+
+        Without `--python`, uv resolves an interpreter from the environment and
+        can install into a different one entirely — which updates a venv that
+        is not the one running.
+        """
+        monkeypatch.setattr(update_cmd.shutil, "which", lambda name: "/usr/bin/uv")
+        command = update_cmd._install_command(tmp_path)
+        assert command[command.index("--python") + 1] == sys.executable
+
+    def test_it_falls_back_to_pip_without_uv(self, tmp_path, monkeypatch):
+        """A venv built by hand does have pip, and must still update."""
+        monkeypatch.setattr(update_cmd.shutil, "which", lambda name: None)
+        command = update_cmd._install_command(tmp_path)
+
+        assert command[:4] == [sys.executable, "-m", "pip", "install"]
+
+    def test_it_installs_the_package_directory(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(update_cmd.shutil, "which", lambda name: "/usr/bin/uv")
+        assert str(tmp_path) in update_cmd._install_command(tmp_path)

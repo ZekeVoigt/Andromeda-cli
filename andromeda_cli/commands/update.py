@@ -13,6 +13,7 @@ was, working.
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -50,6 +51,32 @@ def package_dir(root: Path) -> Path:
     if (nested / "pyproject.toml").is_file():
         return nested
     return root
+
+
+def _install_command(cli_dir: Path) -> list[str]:
+    """How to reinstall this checkout into its own venv.
+
+    **`uv` first, and this is not a preference.** The installer builds the venv
+    with `uv venv`, which does not put pip in it — so `python -m pip` fails with
+    "No module named pip" on every install this project produces. `update` used
+    it anyway, which meant the command could never succeed: it reset to the new
+    revision, failed to install, rolled back, and reported that the install
+    still worked. It did — at the old version, forever.
+
+    Found by running `andromeda update` on a real install rather than on a
+    development checkout, where pip happens to be present.
+
+    Falls back to `python -m pip` for a venv that was built by hand and does
+    have it, so both shapes update.
+    """
+    uv = shutil.which("uv")
+    if uv:
+        return [
+            uv, "pip", "install",
+            "--python", sys.executable,
+            "--quiet", "-e", str(cli_dir),
+        ]
+    return [sys.executable, "-m", "pip", "install", "--quiet", "-e", str(cli_dir)]
 
 
 def _git(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -124,7 +151,7 @@ def run(check_only: bool = False) -> int:
 
     output.info("Installing dependencies…")
     installed = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "--quiet", "-e", str(cli_dir)],
+        _install_command(cli_dir),
         capture_output=True,
         text=True,
         timeout=INSTALL_TIMEOUT,
