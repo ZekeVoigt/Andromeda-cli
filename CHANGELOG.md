@@ -6,6 +6,13 @@ Until 1.0, a minor bump may change a command's shape. Anything that changes a
 tool's name, arguments or risk tier is called out explicitly, because a model
 that learned the old contract will keep using it.
 
+## [0.2.8]
+
+### Fixed
+- A terminal that disconnects during setup now counts as no answer on Linux as
+  well as macOS. Linux reports the closed pty as `termios.error(EIO)`; it is
+  normalized to the chooser's existing graceful disconnect path.
+
 ## [0.2.7]
 
 ### Added

@@ -105,18 +105,33 @@ def _unbuffered(reader):
     import termios
 
     fd = reader.fileno()
-    saved = termios.tcgetattr(fd)
-    altered = termios.tcgetattr(fd)
+    try:
+        saved = termios.tcgetattr(fd)
+        altered = termios.tcgetattr(fd)
+    except termios.error as exc:
+        # Linux reports a pty whose controlling end disappeared as
+        # termios.error(EIO), while macOS reports the same event as OSError.
+        # Normalize it so the chooser's existing "terminal went away" path
+        # returns no answer on both platforms.
+        raise OSError("terminal is no longer available") from exc
     altered[3] &= ~(termios.ICANON | termios.ECHO)  # lflag
     altered[6][termios.VMIN] = 1
     altered[6][termios.VTIME] = 0
     try:
-        termios.tcsetattr(fd, termios.TCSADRAIN, altered)
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, altered)
+        except termios.error as exc:
+            raise OSError("terminal is no longer available") from exc
         yield
     finally:
         # TCSADRAIN, not TCSANOW: anything already written must reach the
         # screen before the mode changes under it.
-        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        except termios.error:
+            # A dropped SSH session cannot have its terminal mode restored,
+            # and must not turn a graceful no-answer into a traceback.
+            pass
 
 
 #: What a key press means. Escape sequences are matched before single bytes.
