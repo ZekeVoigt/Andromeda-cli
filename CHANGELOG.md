@@ -6,6 +6,12 @@ Until 1.0, a minor bump may change a command's shape. Anything that changes a
 tool's name, arguments or risk tier is called out explicitly, because a model
 that learned the old contract will keep using it.
 
+## [0.1.4]
+
+### Changed
+- The install command is back to `https://ai-andromeda.com/install.sh`, which
+  now serves. It pointed at the repository while that URL was returning 404.
+
 ## [0.1.3]
 
 ### Fixed
