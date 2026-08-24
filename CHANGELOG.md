@@ -6,6 +6,19 @@ Until 1.0, a minor bump may change a command's shape. Anything that changes a
 tool's name, arguments or risk tier is called out explicitly, because a model
 that learned the old contract will keep using it.
 
+## [0.3.1]
+
+### Removed
+- Nine bundled skills that were not being used: `calendar`, `canvas`, `email`,
+  `github`, `shopify`, `slack`, `stripe`, `weather` and `browser/gmail`. The
+  remaining set is `browser`, `computer-control` and `skill-creator`.
+
+### Changed
+- Two tests stopped pinning the bundled skill set. One asserted a count and one
+  named `github` specifically, so curating the set broke tests that were not
+  about the set at all. They now assert what they were for: that whatever ships
+  parses in the repo's format, and that the bundled directory resolves.
+
 ## [0.3.0]
 
 ### Added
@@ -114,6 +127,32 @@ that learned the old contract will keep using it.
 ### Changed
 - The install command is back to `https://ai-andromeda.com/install.sh`, which
   now serves. It pointed at the repository while that URL was returning 404.
+
+## [0.2.7]
+
+### Changed
+- **The figure is Leonardo's again, and it has a head.** It had neither: the
+  crop that was supposed to hold "the figure" started at the shoulders, so the
+  head was never in the picture, and the fix after that replaced the drawing
+  with a constructed stick pose. Both were the wrong move. Leonardo's line work
+  now supplies the body; only the small head region is reconstructed after
+  reduction, with a centred silhouette and a few stable facial marks instead
+  of the dense sideways-looking block the photograph produced in braille.
+- The plate's square and circle are now measured rather than estimated: the
+  four ruled lines by local contrast, the circle by a least-squares fit over
+  arc points sampled outside the square. The drawn circle and square are
+  reproduced from those ratios and the photographed figure is blitted into the
+  drawn square at the scale it occupies on the plate. So the figure stands on
+  the square's base with its fingertips on its sides, and the arcs of
+  Leonardo's circle that cut the square's corners land on the drawn ring
+  instead of beside it — where they used to read as blobs.
+- An anatomical mask keeps the photographed ink around the torso, limbs,
+  hands and feet, so the plate's background rulings no longer turn into bars
+  across the empty quadrants. Solid masses are hollowed to outlines and lone
+  vellum specks are dropped. The four foot positions are extended to the exact
+  lower circle boundary, without stray registration dots or interior guide
+  arcs competing with the figure. The startup motion remains a single reveal,
+  and now runs in the full-screen TUI as well as the line-oriented interface.
 
 ## [0.2.6]
 
