@@ -166,3 +166,119 @@ def test_checkpoints_survive_a_saved_session(tmp_path):
     reloaded = store.load(session.id)
     restored = CheckpointStack.from_json(reloaded.checkpoints)
     assert [c.label for c in restored.all()] == ["first question"]
+
+
+class TestTheIndexKeepsUpWithTheConversation:
+    """Indexed on the same schedule the transcript is written, so a session is
+    searchable the moment it exists rather than after some later sweep."""
+
+    def test_a_finished_exchange_is_searchable_immediately(self, tmp_path):
+        from andromeda_cli import state
+
+        conversation, record = build(tmp_path, ["the retry budget is three"])
+        conversation.send("what about the retry budget")
+
+        assert [hit.session_id for hit in state.search("retry budget")] == [
+            record.id,
+            record.id,
+        ]
+
+    def test_a_second_turn_appends_rather_than_rebuilding(self, tmp_path):
+        from andromeda_cli.state import db as db_module
+        from andromeda_cli.state import index as index_module
+
+        conversation, record = build(tmp_path, ["one", "two"])
+        conversation.send("first")
+        conversation.send("second")
+
+        with db_module.connect() as conn:
+            assert index_module.write_session(conn, record) == "unchanged"
+
+    def test_a_failing_index_never_fails_the_turn(self, tmp_path, monkeypatch):
+        """Failing to index is a failure to search later. It must never
+        become a failure to answer now."""
+        import sqlite3
+
+        from andromeda_cli.state import db as db_module
+
+        def explode(*_args, **_kwargs):
+            raise sqlite3.OperationalError("disk I/O error")
+
+        monkeypatch.setattr(db_module, "connect", explode)
+        conversation, record = build(tmp_path, ["hello"])
+        assert conversation.send("hi") == "hello"
+        assert store.load(record.id) is not None
+
+    def test_the_agent_is_told_where_its_own_state_lives(self, tmp_path):
+        """Asked often enough — "where are my sessions", "what have you
+        remembered" — that a guess is worse than a fact."""
+        conversation, _record = build(tmp_path, ["hello"])
+        blocks = "\n".join(conversation.context_blocks)
+        assert "sessions" in blocks and "index" in blocks
+
+    def test_the_configured_memory_backend_is_the_one_that_gets_used(self, tmp_path):
+        conversation, _record = build(tmp_path, ["hello"], memory_backend="sqlite")
+        blocks = "\n".join(conversation.context_blocks)
+        assert "state.db" in blocks
+
+
+class TestCompactionKeepsTheDiscardedTurns:
+    """The end-to-end version of the archive hook: a real session, a real
+    compaction, and the folded-away turns still findable afterwards."""
+
+    def compact(self, tmp_path):
+        conversation, record = build(
+            tmp_path,
+            ["a summary of earlier work", "done"],
+            context_window=2_000,
+        )
+        # Prose-heavy, so pruning tool results cannot get under the line.
+        conversation.messages = [
+            {"role": "system", "content": "the system message"},
+            *[
+                {
+                    "role": "user" if n % 2 == 0 else "assistant",
+                    "content": f"turn {n} about the retry budget " + "x" * 1_500,
+                }
+                for n in range(6)
+            ],
+        ]
+        conversation.send("carry on")
+        return conversation, record
+
+    def test_the_folded_away_turns_are_still_searchable(self, tmp_path):
+        from andromeda_cli import state
+
+        _conversation, record = self.compact(tmp_path)
+
+        hits = state.search("retry budget", limit=20)
+        assert hits, "compaction discarded the turns from the index as well"
+        assert any(hit.archived for hit in hits)
+        assert all(hit.session_id == record.id for hit in hits)
+
+    def test_the_summary_names_the_session_they_are_in(self, tmp_path):
+        from andromeda_agent import compaction as compaction_module
+
+        conversation, record = self.compact(tmp_path)
+        summary = next(
+            m for m in conversation.messages if compaction_module.is_summary(m)
+        )
+        assert record.id in summary["content"]
+
+    def test_the_anchor_in_that_summary_actually_resolves(self, tmp_path):
+        """The promise is only worth making if the lookup works."""
+        from andromeda_cli import state
+
+        _conversation, record = self.compact(tmp_path)
+        archived = [hit for hit in state.search("retry budget") if hit.archived]
+        assert archived
+        view = state.anchored(record.id, archived[0].anchor)
+        assert view["window"]
+
+    def test_the_live_transcript_is_shorter_than_what_is_indexed(self, tmp_path):
+        from andromeda_cli import state
+
+        conversation, record = self.compact(tmp_path)
+        indexed = state.transcript(record.id)
+        assert len(indexed) > len(conversation.messages)
+        assert state.archived_count(record.id) > 0

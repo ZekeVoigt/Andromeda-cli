@@ -114,6 +114,46 @@ def run() -> int:
     sessions = sessions_store.recent(limit=1000)
     _line(True, "sessions", f"{len(sessions)} saved")
 
+    # The index and the memory backend, because both fail quietly: a search
+    # that finds nothing and a recall that returns nothing look exactly like
+    # "there was nothing there".
+    from .. import profiles
+    from .. import state
+
+    capability = state.capabilities()
+    if capability["error"]:
+        _line(False, "index", f"unreadable — {capability['error']}")
+    else:
+        counted = state.counts()
+        stale = state.stale_count()
+        search_route = "fts5" if capability["fts5"] else "substring scan"
+        if capability["trigram"]:
+            search_route += " + trigram"
+        _line(
+            stale == 0,
+            "index",
+            f"{counted['sessions']} sessions · {counted['messages']} messages · "
+            + (search_route if stale == 0 else f"{stale} stale — `andromeda sessions reindex`"),
+        )
+
+    from andromeda_tools import MemoryStore
+
+    memory = MemoryStore(config_module.home() / "memory", config["memory_backend"])
+    _line(
+        not memory.backend_note,
+        "memory",
+        f"{len(memory.load())} stored · {memory.backend.name}"
+        + (f" · {memory.backend_note}" if memory.backend_note else ""),
+    )
+
+    named = [item for item in profiles.listing() if not item.is_default]
+    if named:
+        _line(
+            True,
+            "profiles",
+            f"{profiles.selected()} · {len(named)} other(s) on this machine",
+        )
+
     for binary in ("git", "rg"):
         _line(bool(shutil.which(binary)), binary, shutil.which(binary) or "not installed")
 

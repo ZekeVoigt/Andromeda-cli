@@ -104,3 +104,46 @@ def test_no_module_shadows_a_name_it_imported(parsed):
 
 def test_every_source_file_parses(parsed):
     assert all(tree is not None for _, tree in parsed)
+
+
+def test_no_method_has_lost_its_decorator(parsed):
+    """A decorator separated from its function by an inserted method.
+
+    The one that shipped: a new method was inserted directly above
+    `@staticmethod def _pending_suggestions()`, so the decorator attached to
+    the *new* method — which then took `self` as an ordinary argument and
+    failed on every call — while the original lost its decorator and its
+    signature no longer matched how it was called.
+
+    Both halves are detectable from the signature alone: a static/class method
+    whose first parameter is `self`, and a plain method that declares none.
+    """
+    offences = []
+    for path, tree in parsed:
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            for child in node.body:
+                if not isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                decorators = {
+                    d.id for d in child.decorator_list if isinstance(d, ast.Name)
+                }
+                arguments = [a.arg for a in child.args.args]
+                first = arguments[0] if arguments else ""
+                if "staticmethod" in decorators and first == "self":
+                    offences.append(
+                        f"{path.name}: {node.name}.{child.name} is a staticmethod "
+                        "taking self"
+                    )
+                if (
+                    not decorators & {"staticmethod", "classmethod", "property"}
+                    and not child.args.kwonlyargs
+                    and first not in {"self", "cls"}
+                    and not child.name.startswith("__")
+                ):
+                    offences.append(
+                        f"{path.name}: {node.name}.{child.name} is a method with "
+                        "no self"
+                    )
+    assert offences == [], "\n".join(offences)

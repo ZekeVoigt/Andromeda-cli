@@ -13,6 +13,7 @@ from typing import Any, Iterable
 from . import browser as browser_module, clarify as clarify_module, files
 from . import mcp as mcp_module
 from . import scheduling
+from . import session_search as session_search_module
 from . import processes as processes_module
 from . import vision as vision_module
 from . import skills as skills_module, terminal, web
@@ -37,6 +38,7 @@ DEFAULT_ENABLED = (
     "memory_search",
     "memory_store",
     "memory_forget",
+    "session_search",
     "web_fetch",
     "web_search",
     "vision_analyze",
@@ -305,6 +307,22 @@ def build_registry(
 
     if memory is not None:
         specs.extend(_memory_specs(memory))
+
+    # Unconditional: it binds to no session state, only to the index for
+    # whichever profile this process is using. Read and `safe_local`, so a
+    # read-only lane can check whether something was already discussed —
+    # which is the case it exists for.
+    specs.append(
+        ToolSpec(
+            name="session_search",
+            description=session_search_module.DESCRIPTION,
+            parameters=session_search_module.SCHEMA,
+            risk_tier="safe_local",
+            category="read",
+            run=session_search_module.run,
+            summarize=session_search_module.summarize,
+        )
+    )
 
     if processes is not None:
         specs.append(

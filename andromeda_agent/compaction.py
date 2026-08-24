@@ -17,6 +17,12 @@ nothing.
 `tool_calls` and the `tool` messages answering them are one unit. Splitting
 between them produces a request the API rejects outright — every `tool_call_id`
 must have an answer. Every operation here moves whole units or nothing.
+
+**Nothing compacted is actually lost.** Both stages leave the full text in the
+session index, so a pruned tool result and a summarised-away turn are both
+still readable through `session_search`. The placeholder and the summary say
+so, because a model that believes the detail is gone either re-does the work or
+answers from the summary when it should have looked.
 """
 
 from __future__ import annotations
@@ -27,7 +33,10 @@ from typing import Any
 # Tuned so a long session degrades gradually rather than hitting a cliff.
 PRUNE_MIN_CHARS = 200
 KEEP_RECENT_TOOLS = 2
-PRUNED_PLACEHOLDER = "[Old tool output cleared to save context space]"
+PRUNED_PLACEHOLDER = (
+    "[Old tool output cleared to save context. The full result is still in this "
+    "session's history — search it with session_search if you need it again.]"
+)
 SUMMARY_RATIO = 0.20
 MIN_SUMMARY_TOKENS = 2000
 SUMMARY_TOKENS_CEILING = 10_000
@@ -41,6 +50,18 @@ COMPACT_AT = 0.75
 KEEP_RECENT_FRACTION = 0.30
 
 SUMMARY_PREFIX = "[CONTEXT SUMMARY — earlier turns, compacted]"
+
+# Appended to the rendered summary, never to the instruction above. The
+# distinction is deliberate: the instruction is what the model writes *from*,
+# and telling it there is a safety net while it writes produces a lazier
+# summary. The note is what a later turn reads, and by then knowing the
+# originals are reachable is the difference between looking and guessing.
+RECALL_TEMPLATE = (
+    "The {count} turn(s) this replaced are not lost — they are still in this "
+    "session's searchable history. `session_search(query=\"…\")` finds them, and "
+    "`session_search(session_id=\"{session}\", anchor=N)` reads any of them in "
+    "context. Use it rather than guessing at a detail this summary left out."
+)
 
 SUMMARY_INSTRUCTION = """Summarise the conversation above for your own future reference.
 
@@ -181,14 +202,29 @@ def plan_summarisation(
     return system, body[:keep_from], body[keep_from:]
 
 
-def render_summary(text: str) -> dict[str, Any]:
+def recall_note(session_id: str, count: int) -> str:
+    """How a later turn is told the compacted turns are still reachable.
+
+    Empty when there is no session to search — a one-shot run, a lane, or an
+    install whose index could not be written. Promising a lookup that will
+    fail is worse than not offering one.
+    """
+    if not session_id or count <= 0:
+        return ""
+    return RECALL_TEMPLATE.format(count=count, session=session_id)
+
+
+def render_summary(text: str, recall: str = "") -> dict[str, Any]:
     """The summary as it re-enters the transcript.
 
     A `user` message rather than `assistant`: an assistant message the model
     did not actually say in that position confuses turn-taking, and several
     providers reject two assistant messages in a row.
     """
-    return {"role": "user", "content": f"{SUMMARY_PREFIX}\n\n{text.strip()}"}
+    body = text.strip()
+    if recall:
+        body = f"{body}\n\n{recall}"
+    return {"role": "user", "content": f"{SUMMARY_PREFIX}\n\n{body}"}
 
 
 def is_summary(message: dict[str, Any]) -> bool:

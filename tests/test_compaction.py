@@ -255,3 +255,110 @@ class TestInTheLoop:
         conversation, _ = self.build(tmp_path, ["done"], window=10_000)
         conversation.messages = transcript(pairs=2, tool_chars=4_000)
         assert 0 < conversation.context_used < 1
+
+
+class TestRecallAfterCompaction:
+    """Compaction is not deletion. Both stages leave the full text in the
+    session index, and both say so — a model that believes the detail is gone
+    either re-does the work or answers from a summary when it should look."""
+
+    def test_the_prune_placeholder_points_at_the_search(self):
+        pruned, count = compaction.micro_compact(transcript(pairs=4), keep_recent=1)
+        assert count
+        blanked = next(
+            m for m in pruned if m.get("content") == compaction.PRUNED_PLACEHOLDER
+        )
+        assert "session_search" in blanked["content"]
+
+    def test_a_summary_carries_the_recall_note(self):
+        note = compaction.recall_note("abc123", 12)
+        rendered = compaction.render_summary("the summary", note)["content"]
+        assert "abc123" in rendered and "session_search" in rendered
+        assert rendered.startswith(compaction.SUMMARY_PREFIX)
+
+    def test_no_session_means_no_promise(self):
+        """Promising a lookup that will fail is worse than not offering one."""
+        assert compaction.recall_note("", 12) == ""
+        assert compaction.recall_note("abc123", 0) == ""
+        assert compaction.render_summary("just the summary")["content"].endswith(
+            "just the summary"
+        )
+
+    def test_the_instruction_itself_stays_strict(self):
+        """The note is what a later turn reads. Telling the model there is a
+        safety net while it is *writing* produces a lazier summary."""
+        assert "session_search" not in compaction.SUMMARY_INSTRUCTION
+        assert "anything you leave out is gone" in compaction.SUMMARY_INSTRUCTION
+
+
+class TestTheArchiveHook:
+    def build(self, tmp_path, script, window, on_archive=None):
+        workspace = Workspace(tmp_path)
+        todos = TodoList()
+        provider = ScriptedProvider(script=list(script))
+        conversation = Conversation(
+            provider=provider,
+            policy=Policy(mode="auto", enabled=ALL),
+            workspace=workspace,
+            context_window=window,
+            todos=todos,
+            registry=build_registry(workspace, todos),
+            on_archive=on_archive,
+        )
+        return conversation, provider
+
+    def _compact(self, tmp_path, on_archive):
+        from andromeda_agent import Callbacks
+
+        conversation, _ = self.build(
+            tmp_path, ["a summary of earlier work", "done"], 2_000, on_archive
+        )
+        conversation.messages = transcript(pairs=6, tool_chars=300, text_chars=2_000)
+        conversation.send("continue", Callbacks())
+        return conversation
+
+    def test_it_is_called_with_the_range_about_to_be_folded_away(self, tmp_path):
+        calls = []
+
+        def on_archive(messages, first, last):
+            calls.append((len(messages), first, last))
+            return "kept"
+
+        self._compact(tmp_path, on_archive)
+        assert calls
+        seen, first, last = calls[0]
+        # The system message never moves, so the range starts after it.
+        assert first == 1 and last < seen
+
+    def test_it_sees_the_transcript_before_it_is_replaced(self, tmp_path):
+        """Otherwise there would be nothing left to archive."""
+        snapshots = []
+
+        def on_archive(messages, _first, _last):
+            snapshots.append(list(messages))
+            return ""
+
+        conversation = self._compact(tmp_path, on_archive)
+        assert len(snapshots[0]) > len(conversation.messages)
+
+    def test_what_it_returns_lands_in_the_summary(self, tmp_path):
+        conversation = self._compact(
+            tmp_path, lambda _m, _f, _l: "SEARCHABLE-MARKER"
+        )
+        summary = next(m for m in conversation.messages if compaction.is_summary(m))
+        assert "SEARCHABLE-MARKER" in summary["content"]
+
+    def test_a_failing_archive_never_breaks_the_compaction(self, tmp_path):
+        """Nor does it leave the summary claiming something it cannot back."""
+
+        def explode(_messages, _first, _last):
+            raise RuntimeError("the index is unwritable")
+
+        conversation = self._compact(tmp_path, explode)
+        summary = next(m for m in conversation.messages if compaction.is_summary(m))
+        assert "session_search" not in summary["content"]
+
+    def test_no_hook_means_no_note(self, tmp_path):
+        conversation = self._compact(tmp_path, None)
+        summary = next(m for m in conversation.messages if compaction.is_summary(m))
+        assert "session_search" not in summary["content"]

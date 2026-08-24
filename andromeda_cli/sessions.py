@@ -118,6 +118,31 @@ class Session:
         return self.path
 
 
+@dataclass
+class Binding:
+    """Which transcript a running conversation writes to.
+
+    A level of indirection with one job: letting a surface switch sessions
+    mid-run. The registry, the policy, the provider and the browser belong to
+    the *terminal* and must survive the switch; only the transcript changes.
+
+    Every switch saves what is on screen first. A session left half-written
+    because somebody moved to another one is the transcript most likely to be
+    the one they come back for.
+    """
+
+    record: Session
+
+    def switch(self, target: Session, messages: list[dict[str, Any]]) -> Session:
+        """Point at `target`, having saved `messages` into the current record."""
+        if target.id == self.record.id:
+            return self.record
+        self.record.messages = messages
+        self.record.save()
+        self.record = target
+        return target
+
+
 def load(session_id: str) -> Session | None:
     path = sessions_dir() / f"{session_id}.json"
     if not path.exists():

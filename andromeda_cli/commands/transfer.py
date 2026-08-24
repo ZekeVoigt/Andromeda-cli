@@ -24,16 +24,43 @@ from .. import config as config_module
 from .. import output
 
 # Relative to ANDROMEDA_HOME. Anything not listed is not portable state:
-# `history` is per-machine noise, `checkout/` is code, and a venv is not a thing
-# you move.
+# `history` is per-machine noise, `checkout/` is code, `profiles/` are separate
+# installs that back themselves up, and a venv is not a thing you move.
+#
+# `state.db` is deliberately absent. It is a derived index over `sessions/`,
+# so carrying it would add the largest file in the home to every archive to
+# save one reindex on the other machine — and a half-restored index is worse
+# than none. `restore` rebuilds it.
 PORTABLE = ("config.yaml", "mcp.json", "approvals.json", "memory", "sessions", "skills")
 SECRETS = ("credentials.json",)
 MANIFEST = "andromeda-manifest.json"
+# Where a portable snapshot of the memories goes inside the archive, whichever
+# backend they actually live in. See `_memory_snapshot`.
+MEMORY_SNAPSHOT = "memory/memories.json"
 
 
 def _members(home: Path, include_secrets: bool) -> list[Path]:
     names = [*PORTABLE, *(SECRETS if include_secrets else ())]
     return [home / name for name in names if (home / name).exists()]
+
+
+def _memory_snapshot(home: Path) -> str:
+    """Every memory, as the portable JSON shape, whatever backend holds them.
+
+    The sqlite backend keeps memories in `state.db`, which is not portable —
+    so without this an export from a sqlite-backend install would silently
+    carry no memories at all, and the person would find that out on the other
+    machine. Read through the store rather than the file, so the archive says
+    the same thing on both backends.
+    """
+    from andromeda_tools import MemoryStore
+
+    try:
+        config = config_module.load()
+    except config_module.ConfigError:
+        config = {}
+    store = MemoryStore(home / "memory", config.get("memory_backend"))
+    return json.dumps([memory.to_json() for memory in store.load()], indent=2)
 
 
 def _write(destination: Path, home: Path, include_secrets: bool) -> tuple[int, list[str]]:
@@ -42,9 +69,23 @@ def _write(destination: Path, home: Path, include_secrets: bool) -> tuple[int, l
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     with tarfile.open(destination, "w:gz") as archive:
+        carried_memory = False
         for path in members:
             archive.add(path, arcname=path.name)
             included.append(path.name)
+            carried_memory = carried_memory or path.name == "memory"
+
+        snapshot = _memory_snapshot(home)
+        if snapshot != "[]" and not carried_memory:
+            # Only when the memory directory did not already go in: the json
+            # backend's own file is the snapshot, and adding a second copy
+            # under the same name would depend on tar member ordering to
+            # decide which one a restore sees.
+            staged = destination.parent / "memories.json"
+            staged.write_text(snapshot, encoding="utf-8")
+            archive.add(staged, arcname=MEMORY_SNAPSHOT)
+            staged.unlink()
+            included.append("memory")
 
         manifest = destination.parent / MANIFEST
         manifest.write_text(
@@ -155,6 +196,53 @@ def restore(path: str, force: bool = False) -> int:
 
     output.ok(f"Restored into {home}")
     output.info(f"  {', '.join(sorted({m.name.split('/')[0] for m in members}))}")
+
+    # The index is derived and was not in the archive, so it now describes a
+    # different set of transcripts than the ones on disk. Rebuilt here rather
+    # than left for the first search to notice, because a restore that ends
+    # with "nothing found" reads as a restore that lost the sessions.
+    from .. import state
+
+    counts = state.rebuild_index()
+    output.info(f"  indexed {counts['scanned']} transcript(s)")
+
+    _import_memories(home)
+
     if not manifest.get("includesCredentials", False):
         output.info("  No credentials in this archive — run `andromeda auth login`.")
     return 0
+
+
+def _import_memories(home: Path) -> None:
+    """Load the archive's memory snapshot into whichever backend is configured.
+
+    A no-op on the json backend, whose file *is* the snapshot. On sqlite it is
+    the whole point: the rows live in a database the archive never carried.
+    """
+    from andromeda_tools import MemoryStore
+    from andromeda_tools.memory import Memory
+
+    try:
+        config = config_module.load()
+    except config_module.ConfigError:
+        return
+    if (config.get("memory_backend") or "json") == "json":
+        return
+
+    snapshot = home / MEMORY_SNAPSHOT
+    if not snapshot.exists():
+        return
+    try:
+        raw = json.loads(snapshot.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        output.info("  The archive's memories could not be read; left as-is.")
+        return
+    if not isinstance(raw, list):
+        return
+
+    parsed = [Memory.from_json(item) for item in raw if isinstance(item, dict)]
+    memories = [memory for memory in parsed if memory is not None]
+    if not memories:
+        return
+    MemoryStore(home / "memory", config["memory_backend"]).save(memories)
+    output.info(f"  imported {len(memories)} memor{'y' if len(memories) == 1 else 'ies'}")

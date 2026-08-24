@@ -3,8 +3,6 @@
 Thanks for looking. A few things are worth knowing before you spend time on a
 change.
 
-By participating, you agree to follow the [code of conduct](CODE_OF_CONDUCT.md).
-
 ## This repository is published, not developed in
 
 Andromeda's CLI is developed in a private monorepo alongside the rest of the

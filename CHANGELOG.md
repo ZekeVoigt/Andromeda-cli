@@ -6,28 +6,114 @@ Until 1.0, a minor bump may change a command's shape. Anything that changes a
 tool's name, arguments or risk tier is called out explicitly, because a model
 that learned the old contract will keep using it.
 
-## [0.2.8]
-
-### Fixed
-- A terminal that disconnects during setup now counts as no answer on Linux as
-  well as macOS. Linux reports the closed pty as `termios.error(EIO)`; it is
-  normalized to the chooser's existing graceful disconnect path.
-
-## [0.2.7]
+## [0.3.0]
 
 ### Added
-- `andromeda auth login` now opens the Andromeda website and completes sign-in
-  through a state-verified loopback callback. A pairing code remains available
-  for SSH sessions and other machines without a local browser.
+- **Full-text search across every past session**, at no model cost. A derived
+  SQLite index at `~/.andromeda-cli/state.db` backs `andromeda sessions
+  search`, the `/sessions` slash command, and a new `session_search` tool the
+  agent can call — so "what did we decide about X" and "the thing I asked you
+  last week" are questions it answers rather than guesses at. Three routes,
+  chosen by the query: FTS5 by default, a trigram index for CJK (the default
+  tokenizer splits CJK into single characters, so phrase matching against it
+  does not work at all), and a substring scan where neither applies. A query
+  that raises always falls back — reporting zero results for a grammar the
+  sanitizer did not anticipate is indistinguishable from "there is nothing
+  there".
+- **The transcripts remain the source of truth.** The index is derived and can
+  be deleted at any moment without losing a message, which is why
+  `andromeda sessions recover --rebuild-index` is the blunt repair and it is
+  always safe.
+- `andromeda sessions recap [id]` — what happened in a session, computed from
+  the transcript. No model call: a recap you wait for and pay for is a recap
+  nobody runs, and it would invalidate the prompt cache the next real turn is
+  about to use.
+- `andromeda sessions export <id> --format html|markdown|jsonl|text`.
+  Everything is escaped, including in Markdown — a transcript holds whatever
+  anybody pasted into it, and an export opened in a browser is a local file
+  with the privileges of any other. `--format jsonl` can export prompts alone,
+  one per line, for piping into review tooling.
+- `andromeda sessions doctor`, `reindex`, `recover` and `rm`. `recover`
+  salvages a transcript a machine truncated mid-write: JSON is all-or-nothing
+  to a parser, so one missing brace loses a conversation that is almost
+  entirely intact on disk. It walks the message array keeping every complete
+  object, and **deletes nothing** — the original moves to
+  `sessions/quarantine/` and the salvage is written in its place. It is a dry
+  run until `--apply`.
+- Filters on every listing and search: `--since`, `--until`, `--workspace`,
+  `--model`, `--provider`, `--role`. `--since` takes `7d`, `2h`, `yesterday`
+  or `2026-08-01`; a value it cannot read is an error, never "no filter".
+- `andromeda sessions active`, and a warning when you open a session another
+  live terminal already holds. Two terminals on one transcript interleave
+  their turns and the last save wins. A claim is released only when its owner
+  is **proved** gone, by pid *and* process start time — pids get reused, and
+  reaping on the pid alone hands a live session to a second terminal.
+- **`/resume` switches sessions without restarting the terminal.** Only the
+  transcript moves: the tools, the approval policy, the workspace and any
+  running background processes stay exactly as they are. `/resume` alone lists
+  the candidates, numbered as well as addressable by id. On both surfaces.
+- **Profiles** — several independent installs, one program.
+  `andromeda profile create|use|delete|list`, and `-p <name>` for a single
+  command. The default profile is your home directory itself, so an existing
+  install is already the default and there is nothing to migrate.
+  `ANDROMEDA_HOME` still wins outright: it is how a container or a scheduled
+  job is certain which state it is touching.
+- **Compaction stops throwing work away.** When the context window fills and
+  older turns are replaced by a summary, those turns are kept in the index and
+  the summary says so — it names the session and the anchor to read them back
+  with, so a detail the summary left out is a lookup rather than a guess. The
+  pruned-tool-output placeholder says the same. The instruction the model
+  *writes* the summary from deliberately does not mention it: telling it there
+  is a safety net while it summarises produces a lazier summary.
+  Compacted turns leave the transcript file too, so for those the index is the
+  only remaining copy — rebuilding it never deletes them, `sessions show`
+  prints them above the live transcript, and `sessions doctor` counts them
+  separately.
+- **The index is checked on startup, once a day.** A stale index is the one
+  failure here nobody notices: search answers "nothing found", which reads
+  exactly like the truth. A small backlog is caught up silently; a large one is
+  reported in a line rather than blocking the first prompt. Deliberately not
+  the whole of `sessions doctor` — parsing every transcript and running an
+  integrity check are both O(everything).
+- **`andromeda memory`** — `list`, `search`, `remember`, `forget`, `export`,
+  `stats`. Standing memories are a premise the agent argues from, not a note,
+  and until now the only way to remove a wrong one was to ask the agent to,
+  which requires already knowing it is there. `forget` prints what it matched
+  before doing anything, because matching is generous by design. `export` is
+  the only way to read a sqlite-backed store as text.
+- **A pluggable memory backend**, `memory_backend: json | sqlite`. Storage and
+  candidate retrieval are the backend's; **scoring is not**. `minScore` means
+  "this fraction of the query's meaningful terms appear in the memory" on both,
+  because a backend that swapped in its own ranking would keep the parameter
+  name while silently retuning every threshold set against it.
 
 ### Changed
-- Setup treats account sign-in as its first step and uses consistent
-  “signed in” language across status, diagnostics, backups, and errors.
+- `andromeda doctor` reports the index, the memory backend and the profile in
+  use. All three fail quietly otherwise — a search that finds nothing and a
+  recall that returns nothing look exactly like "there was nothing there".
+- `restore` rebuilds the search index from the restored transcripts. A restore
+  that ends with "nothing found" reads as a restore that lost the sessions.
+- `backup` and `export` carry memories on every backend. On `sqlite` they live
+  in the index, which is deliberately not portable, so an export that quietly
+  carried none is a thing you would discover on the other machine.
 
-### Fixed
-- The one-shot callback explicitly closes its HTTP connection, so a browser
-  that keeps HTTP/1.1 connections alive cannot leave a successful login
-  waiting in the terminal.
+### Note for anyone reading the source
+- The index's migrations are keyed **by name, never by number**. A numbered
+  ledger breaks the day two branches both add a fourth migration, or somebody
+  renumbers a shipped one — every existing install then either re-runs a
+  migration or skips one.
+- `session_search` anchors on a **row id, not a transcript offset**.
+  Compaction restarts a session's offsets, so an offset handed out before one
+  would silently address a different message afterwards.
+- A new source-hygiene check catches a decorator separated from its function by
+  an inserted method — a `@staticmethod` taking `self`, or a plain method
+  taking none. It shipped that way once, and Python accepts it silently.
+
+## [0.1.4]
+
+### Changed
+- The install command is back to `https://ai-andromeda.com/install.sh`, which
+  now serves. It pointed at the repository while that URL was returning 404.
 
 ## [0.2.6]
 
@@ -100,12 +186,6 @@ that learned the old contract will keep using it.
 ### Changed
 - The palette is the website's — near-monochrome zinc with a single restrained
   accent — instead of the default terminal cyan and magenta.
-
-## [0.1.4]
-
-### Changed
-- The install command is back to `https://ai-andromeda.com/install.sh`, which
-  now serves. It pointed at the repository while that URL was returning 404.
 
 ## [0.1.3]
 

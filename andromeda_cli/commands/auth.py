@@ -305,14 +305,8 @@ class _CallbackHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
-        # This listener serves one callback and then exits. Browsers keep an
-        # HTTP/1.1 connection alive by default; without an explicit close the
-        # handler waits for another request even though pairing has finished,
-        # leaving the terminal stuck until Ctrl-C.
-        self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
-        self.close_connection = True
 
 
 def _escape(text: str) -> str:

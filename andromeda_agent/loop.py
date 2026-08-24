@@ -100,6 +100,14 @@ class Conversation:
     # Called after every exchange with the full transcript. The surface uses it
     # to persist; the loop does not know or care where.
     on_persist: Callable[[list[dict[str, Any]]], None] | None = None
+    # Called immediately before a summary replaces older turns, with the
+    # pre-compaction transcript and the position range about to be folded away.
+    # Whatever it returns is appended to the summary, which is how the surface
+    # tells the model those turns are still searchable. Injected rather than
+    # imported: the loop must not know about the session index.
+    on_archive: (
+        Callable[[list[dict[str, Any]], int, int], str] | None
+    ) = None
     # Rebuilds the registry for a fresh todo list, with this session's skills
     # and memory still bound. Supplied by the surface; see `reset`.
     rebuild_registry: Callable[[TodoList], dict[str, ToolSpec]] | None = None
@@ -243,7 +251,18 @@ class Conversation:
         if not summary.strip():
             return None
 
-        self.messages = [*system, compaction.render_summary(summary), *recent]
+        # Archived *after* the summary succeeded and before the transcript is
+        # replaced. Either order of the two failures matters: archiving first
+        # and then failing to summarise would mark turns as folded away while
+        # they were still in the conversation, and replacing first would leave
+        # nothing to point the archive at.
+        recall = self._archive(system, older)
+
+        self.messages = [
+            *system,
+            compaction.render_summary(summary, recall),
+            *recent,
+        ]
         return compaction.CompactionResult(
             happened=True,
             stage="summarise",
@@ -252,6 +271,23 @@ class Conversation:
             pruned_results=pruned,
             summarised_messages=len(older),
         )
+
+    def _archive(
+        self, system: list[dict[str, Any]], older: list[dict[str, Any]]
+    ) -> str:
+        """Hand the turns about to be discarded to the surface, for keeping.
+
+        Returns the note to append to the summary, or "" when there is no
+        surface, no index, or the archive failed — in which case the summary
+        makes no promise it cannot keep.
+        """
+        if self.on_archive is None or not older:
+            return ""
+        first = len(system)
+        try:
+            return self.on_archive(self.messages, first, first + len(older) - 1) or ""
+        except Exception:  # noqa: BLE001 - compaction must not fail over an index
+            return ""
 
     def _report_compaction(
         self, callbacks: Callbacks, result: compaction.CompactionResult

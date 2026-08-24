@@ -24,6 +24,8 @@ import yaml
 
 from andromeda_tools import DEFAULT_ENABLED
 
+from . import profiles
+
 ENV_HOME = "ANDROMEDA_HOME"
 
 DEFAULTS: dict[str, Any] = {
@@ -64,6 +66,12 @@ DEFAULTS: dict[str, Any] = {
     # daemon`. An unrecognised name falls back to it rather than refusing to
     # start — a typo here must not silently stop every scheduled job.
     "cron_provider": "built-in",
+    # Where memories are kept. `json` is one readable file; `sqlite` puts them
+    # in the state index and finds recall candidates through FTS, which only
+    # starts to matter past a few thousand of them. An unrecognised name falls
+    # back to `json` for the same reason `cron_provider` does — a typo in a
+    # setting must not take away the agent's memory.
+    "memory_backend": "json",
     # Off by default. The URL a fetch or a navigation uses comes from the
     # model, and this machine sits inside the user's own network — a metadata
     # endpoint, a router page, a service bound to localhost. Turning it on is
@@ -84,9 +92,13 @@ def home() -> Path:
 
     Everything the CLI owns lives under one root of its own — config,
     credentials, sessions, memory, and the installer's checkout.
+
+    Which root, when there is more than one, is `profiles`' answer: an
+    explicit `ANDROMEDA_HOME` first, then a named profile, then the default —
+    which is this directory itself, so an install that has never heard of
+    profiles resolves exactly where it always did.
     """
-    override = os.environ.get(ENV_HOME, "").strip()
-    return Path(override).expanduser() if override else Path.home() / ".andromeda-cli"
+    return profiles.home()
 
 
 def config_path() -> Path:
@@ -167,6 +179,7 @@ VALID_VALUES: dict[str, tuple[str, ...]] = {
     "thinking": ("off", "low", "medium", "high"),
     "approval_mode": ("auto", "ask", "deny"),
     "max_tier": ("safe_local", "outbound", "destructive", "irreversible"),
+    "memory_backend": ("json", "sqlite"),
 }
 
 

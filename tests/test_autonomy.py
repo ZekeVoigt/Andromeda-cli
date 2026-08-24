@@ -820,7 +820,7 @@ class TestTheLedger:
         assert ledger.recover() == 0
 
     def test_an_attempt_from_a_dead_process_becomes_unknown(self, tmp_path, monkeypatch):
-        from andromeda_agent import executions
+        from andromeda_agent import executions, liveness
 
         ledger = self._ledger(tmp_path)
         # Written as if by a previous scheduler, then that scheduler is gone.
@@ -830,7 +830,7 @@ class TestTheLedger:
         monkeypatch.setattr(executions, "_PROCESS_ID", "a-previous-scheduler")
         ledger.claim("job_1")
         monkeypatch.undo()
-        monkeypatch.setattr(executions, "_pid_exists", lambda _pid: False)
+        monkeypatch.setattr(liveness, "pid_exists", lambda _pid: False)
 
         assert ledger.recover() == 1
         assert ledger.recent()[0]["status"] == "unknown"
@@ -838,36 +838,34 @@ class TestTheLedger:
     def test_a_sweep_never_reaps_its_own_rows(self, tmp_path, monkeypatch):
         """Even when the pid check would say the owner is gone. The id is the
         first gate for exactly this reason."""
-        from andromeda_agent import executions
+        from andromeda_agent import executions, liveness
 
         ledger = self._ledger(tmp_path)
         ledger.claim("job_1")
-        monkeypatch.setattr(executions, "_pid_exists", lambda _pid: False)
+        monkeypatch.setattr(liveness, "pid_exists", lambda _pid: False)
         assert ledger.recover() == 0
 
     def test_a_live_owner_is_left_alone(self, tmp_path, monkeypatch):
         """Pids are reused. Marking a live attempt abandoned is how you get
         two copies of the side effect."""
-        from andromeda_agent import executions
+        from andromeda_agent import executions, liveness
 
         ledger = self._ledger(tmp_path)
         monkeypatch.setattr(executions, "_PROCESS_ID", "someone-else")
         ledger.claim("job_1")
-        monkeypatch.setattr(executions, "_pid_exists", lambda _pid: True)
-        monkeypatch.setattr(
-            executions, "_process_start_time", lambda _pid: None
-        )
+        monkeypatch.setattr(liveness, "pid_exists", lambda _pid: True)
+        monkeypatch.setattr(liveness, "process_start_time", lambda _pid: None)
         assert ledger.recover() == 0
 
     def test_unknown_is_not_a_retry_queue(self, tmp_path, monkeypatch):
         """It records that side effects may have run. Nothing re-runs."""
-        from andromeda_agent import executions
+        from andromeda_agent import executions, liveness
 
         ledger = self._ledger(tmp_path)
         monkeypatch.setattr(executions, "_PROCESS_ID", "gone")
         attempt = ledger.claim("job_1")
         monkeypatch.undo()
-        monkeypatch.setattr(executions, "_pid_exists", lambda _pid: False)
+        monkeypatch.setattr(liveness, "pid_exists", lambda _pid: False)
         assert ledger.recover() == 1
         # Terminal, so nothing can rewrite it into a fresh attempt.
         assert not ledger.finish(attempt, ok=True)

@@ -26,6 +26,7 @@ from . import config as config_module
 from . import output
 from . import render
 from . import sessions as sessions_store
+from .state import live as live_module
 from .session import build_conversation, set_asker, set_lane_announcer
 
 PROMPT_STYLE = Style.from_dict({"prompt": "bold cyan", "meter": "#666666"})
@@ -121,6 +122,24 @@ def _prompt_fragments(conversation):
     ]
 
 
+def _mention_state_health() -> None:
+    """Say something only when the session index needs attention.
+
+    A stale index makes `session_search` answer "nothing found", which reads as
+    the truth — so this is checked automatically where the rest of `sessions
+    doctor` is not. Once a day, and silent when there is nothing to say.
+    """
+    try:
+        from . import __version__
+        from . import state
+
+        findings = state.startup_check(__version__)
+    except Exception:  # noqa: BLE001 - never fail a session over a health check
+        return
+    for line in findings.lines:
+        output.info(f"  {line}")
+
+
 def _mention_suggestions() -> None:
     """One line, only when there is something waiting.
 
@@ -144,6 +163,9 @@ def _mention_suggestions() -> None:
 
 def _cleanup(conversation) -> None:
     """Do not leave a dev server holding a port after the session ends."""
+    binding = getattr(conversation, "binding", None)
+    if binding is not None:
+        live_module.release(binding.record.id)
     registry = getattr(conversation, "process_registry", None)
     killed = registry.shutdown_all() if registry else 0
     if killed:
@@ -182,6 +204,9 @@ SLASH_HELP = """
   /rewind    undo the last exchange (/rewind N for a numbered checkpoint)
   /history   list the checkpoints you can rewind to
   /ps        background processes started this session
+  /recap     what has happened so far, without asking the model
+  /sessions  search past sessions (/sessions <text>)
+  /resume    switch to another session (/resume lists them)
   /tools     list the tools this session can use
   /skills    list the skills on this machine
   /lanes     list the delegation specialists
@@ -242,8 +267,15 @@ def run(
     )
     if resume is not None:
         output.info(f"  resumed {record.id} · {record.turns} turns")
+    from .commands import sessions as sessions_cmd
+
+    sessions_cmd.announce_holder(record.id)
+    live_module.claim(
+        record.id, surface="repl", workspace=str(conversation.workspace.root)
+    )
     if drained == 1:
         output.info("  (ignored input that arrived before the prompt)")
+    _mention_state_health()
     _mention_suggestions()
     output.console.print()
 
@@ -297,9 +329,26 @@ def run(
             if outcome == "rewound":
                 # The transcript on disk must match the one in memory, or
                 # resuming would restore the turns that were just undone.
+                record = conversation.binding.record
                 record.messages = conversation.messages
                 record.checkpoints = checkpoints.to_json()
                 record.save()
+            if outcome == "switched":
+                record = conversation.binding.record
+                # The checkpoint stack belongs to the transcript, not to the
+                # terminal: rewinding after a switch must undo turns from the
+                # session now on screen, never from the one just left.
+                checkpoints = checkpoint_module.CheckpointStack.from_json(
+                    record.checkpoints
+                )
+                live_module.claim(
+                    record.id,
+                    surface="repl",
+                    workspace=str(conversation.workspace.root),
+                )
+                render.note(
+                    f"now in {record.id} · {record.turns} turns · {record.title}"
+                )
             continue
 
         # Taken before the turn, so rewinding lands where you were when you
@@ -307,7 +356,9 @@ def run(
         checkpoints.take(conversation.messages, prompt)
         # Persisted alongside the transcript on the same schedule, so a crash
         # cannot leave a session whose checkpoints describe a different run.
-        record.checkpoints = checkpoints.to_json()
+        # Read through the binding rather than the local, which /resume moves.
+        conversation.binding.record.checkpoints = checkpoints.to_json()
+        live_module.beat(conversation.binding.record.id)
 
         try:
             render.console.print()
@@ -467,6 +518,64 @@ def _approve(request: ApprovalRequest) -> Answer:
             render.console.print("  [muted]y, a, !, or n[/muted]")
 
 
+def _resume(conversation, arguments: list[str]) -> str:
+    """Switch this terminal to another transcript, or list the candidates.
+
+    Only the transcript moves. The registry, the policy, the provider, the
+    browser and any running lanes belong to this terminal and stay exactly as
+    they are — which is what makes this safe to do mid-run, and what stops it
+    from being a second, subtly different way of starting a session.
+
+    The list is numbered as well as addressable by id, because a twelve-hex-
+    digit id is not something anyone retypes correctly the first time.
+    """
+    from . import sessions as store
+
+    binding = getattr(conversation, "binding", None)
+    if binding is None:
+        output.fail("This surface cannot switch sessions.")
+        return "continue"
+
+    recent = [
+        session
+        for session in store.recent(limit=10)
+        if session.id != binding.record.id
+    ]
+
+    if not arguments:
+        if not recent:
+            output.info("No other sessions to switch to.")
+            return "continue"
+        for number, session in enumerate(recent, start=1):
+            render.console.print(
+                f"  [accent]{str(number).rjust(2)}[/accent]  "
+                f"[muted]{session.id}  {str(session.turns).rjust(3)} turns[/muted]  "
+                f"{session.title}"
+            )
+        render.console.print("  [muted]/resume <number or id>[/muted]")
+        return "continue"
+
+    choice = arguments[0].strip()
+    target = None
+    if choice.isdigit() and 1 <= int(choice) <= len(recent):
+        target = recent[int(choice) - 1]
+    else:
+        target = store.resolve(choice)
+    if target is None:
+        output.fail(f"No session matching {choice!r}.", "/resume lists them.")
+        return "continue"
+    if target.id == binding.record.id:
+        output.info("Already in that session.")
+        return "continue"
+
+    binding.switch(target, conversation.messages)
+    # The transcript replaces the whole message list, its original system
+    # message included. Rewriting that would silently change the rules the
+    # earlier turns were produced under — the same reason `--resume` does not.
+    conversation.messages = list(target.messages)
+    return "switched"
+
+
 def _slash(command: str, conversation, checkpoints=None) -> str:
     parts = command.split()
     verb = parts[0].lower()
@@ -536,6 +645,38 @@ def _slash(command: str, conversation, checkpoints=None) -> str:
             output.info("No background processes.")
         for process in processes:
             render.console.print(f"  [muted]{process.summary()}[/muted]")
+    elif verb == "/recap":
+        from . import state
+
+        summary = state.build_recap(
+            conversation.messages, getattr(conversation, "todos", None)
+        )
+        for line in summary.lines():
+            render.console.print(f"  [muted]{line}[/muted]")
+    elif verb == "/sessions":
+        from . import state
+
+        query = " ".join(parts[1:]).strip()
+        if not query:
+            output.fail("/sessions <text>", "Searches every past session.")
+            return "continue"
+        hits = state.search(query, limit=8)
+        if not hits:
+            output.info(f"Nothing found for {query!r}.")
+            return "continue"
+        for hit in hits:
+            marked = (
+                " ".join(hit.snippet.split())
+                .replace("»", "[bold yellow]")
+                .replace("«", "[/bold yellow]")
+            )
+            render.console.print(
+                f"  [accent]{hit.session_id}[/accent][muted]@{hit.position}"
+                f"  {hit.role.ljust(9)}[/muted] {marked}"
+            )
+        render.console.print("  [muted]/resume <id> to switch to one[/muted]")
+    elif verb == "/resume":
+        return _resume(conversation, parts[1:])
     elif verb == "/skills":
         from andromeda_tools import skills as skills_module
 

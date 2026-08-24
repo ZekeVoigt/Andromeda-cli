@@ -20,6 +20,7 @@ from andromeda_agent.delegation import (
 )
 from andromeda_agent.lanes import LaneRegistry
 from andromeda_agent import auxiliary as auxiliary_module
+from andromeda_agent import compaction as compaction_module
 from andromeda_agent.models import context_window
 from andromeda_agent import soul
 from andromeda_agent.schedule import Schedule
@@ -37,6 +38,7 @@ from andromeda_tools.todo import TodoList
 
 from . import config as config_module
 from . import sessions as sessions_module
+from . import state
 
 
 def _window(config: dict[str, Any], provider) -> int:
@@ -101,7 +103,9 @@ def build_conversation(
     todos = TodoList()
 
     found_skills = skills_module.discover(workspace.root)
-    memory = MemoryStore(config_module.home() / "memory")
+    memory = MemoryStore(
+        config_module.home() / "memory", config.get("memory_backend")
+    )
     # One browser for the session, shared with every lane. It is not started
     # until something navigates, so a session that never browses pays nothing.
     browser = BrowserSession()
@@ -256,9 +260,45 @@ def build_conversation(
     record.model = provider.model
     record.workspace = str(workspace.root)
 
+    # The transcript this conversation writes to, held indirectly so a surface
+    # can point it somewhere else mid-run without rebuilding the registry, the
+    # policy or the provider. Those are properties of *this terminal*; the
+    # transcript is not, and conflating them is why switching sessions used to
+    # mean starting a new process.
+    binding = sessions_module.Binding(record)
+
     def persist(messages: list[dict[str, Any]]) -> None:
+        binding.record.messages = messages
+        binding.record.save()
+        # Indexed on the same schedule the transcript is written, so a session
+        # is searchable the moment it exists rather than after some later
+        # sweep. Best-effort by contract: `index_session` swallows its own
+        # storage errors, because failing to index is a failure to search
+        # later and must never become a failure to answer now.
+        state.index_session(binding.record)
+
+    def archive(messages: list[dict[str, Any]], first: int, last: int) -> str:
+        """Keep the turns compaction is about to discard, and say where.
+
+        Order matters and is the whole correctness argument: the transcript is
+        saved and indexed *first*, so the rows exist to be marked; only then
+        are they archived. Doing it the other way round would archive rows that
+        were never written, and the summary would promise a lookup that finds
+        nothing.
+
+        An archived row is the only remaining copy — the turns leave the
+        transcript on disk too — which is why `write_session` never deletes
+        one on a rebuild.
+        """
+        record = binding.record
         record.messages = messages
         record.save()
+        state.index_session(record)
+        archived = state.archive_range(record.id, first, last)
+        # Keyed on what was actually archived, not on what was asked for. A
+        # note promising searchable turns when nothing was stored is the one
+        # failure mode worth guarding here.
+        return compaction_module.recall_note(record.id, archived)
 
     conversation = Conversation(
         provider=provider,
@@ -271,6 +311,7 @@ def build_conversation(
         registry=rebuild(todos),
         context_blocks=_context_blocks(found_skills, memory),
         on_persist=persist,
+        on_archive=archive,
         rebuild_registry=rebuild,
     )
 
@@ -279,6 +320,7 @@ def build_conversation(
     conversation.lane_registry = lanes
     conversation.process_registry = processes
     conversation.mcp_servers = mcp_servers
+    conversation.binding = binding
 
     # A resumed session replaces the transcript wholesale, including its
     # original system message — rewriting it would silently change the rules
@@ -328,7 +370,8 @@ def _context_blocks(
         "Your own state on this machine:\n"
         f"  config    {config_module.config_path()}\n"
         f"  sessions  {home / 'sessions'}\n"
-        f"  memory    {home / 'memory'}"
+        f"  memory    {memory.file}\n"
+        f"  index     {state.db_path()}"
     ]
 
     # The user's own standing instructions go first among the context blocks,

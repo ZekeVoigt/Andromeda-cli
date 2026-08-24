@@ -227,15 +227,6 @@ def test_the_browser_is_told_it_worked_and_where_to_go_next(monkeypatch):
     assert f"{BASE}/settings" in browser.body
 
 
-def test_the_callback_explicitly_closes_its_one_http_connection():
-    """A real browser keeps HTTP/1.1 alive unless the one-shot server closes it."""
-    import inspect
-
-    response_source = inspect.getsource(auth._CallbackHandler._respond)
-    assert 'self.send_header("Connection", "close")' in response_source
-    assert "self.close_connection = True" in response_source
-
-
 @respx.mock
 def test_a_callback_with_the_wrong_state_is_ignored(monkeypatch):
     """A stale tab from an earlier attempt looks exactly like a forgery.

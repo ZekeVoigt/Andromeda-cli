@@ -195,3 +195,89 @@ class TestPathTraversal:
         transfer.restore(str(malicious))
 
         assert not (fresh / "config.yaml").is_symlink()
+
+
+class TestMemoryTravelsOnEveryBackend:
+    """The sqlite backend keeps memories in `state.db`, which is not portable.
+
+    Without a snapshot, an export from such an install carries no memories at
+    all — and the person finds that out on the other machine.
+    """
+
+    def test_a_sqlite_backed_export_carries_the_memories(self, tmp_path, monkeypatch):
+        import tarfile
+
+        from andromeda_cli import config as config_module
+        from andromeda_cli.commands import transfer
+        from andromeda_tools import MemoryStore
+
+        config_module.set_value("memory_backend", "sqlite")
+        home = config_module.home()
+        MemoryStore(home / "memory", "sqlite").store("Zeke prefers clickable links")
+
+        archive_path = tmp_path / "out.tar.gz"
+        assert transfer.export(str(archive_path)) == 0
+        with tarfile.open(archive_path) as archive:
+            names = archive.getnames()
+        assert transfer.MEMORY_SNAPSHOT in names
+
+    def test_restoring_it_puts_them_back_into_the_backend(self, tmp_path, monkeypatch):
+        from andromeda_cli import config as config_module
+        from andromeda_cli.commands import transfer
+        from andromeda_tools import MemoryStore
+
+        config_module.set_value("memory_backend", "sqlite")
+        home = config_module.home()
+        MemoryStore(home / "memory", "sqlite").store("Zeke prefers clickable links")
+
+        archive_path = tmp_path / "out.tar.gz"
+        transfer.export(str(archive_path))
+
+        # A fresh install, same setting.
+        fresh = tmp_path / "fresh"
+        monkeypatch.setenv("ANDROMEDA_HOME", str(fresh))
+        config_module.set_value("memory_backend", "sqlite")
+        assert transfer.restore(str(archive_path), force=True) == 0
+
+        recalled = MemoryStore(fresh / "memory", "sqlite").search("clickable links")
+        assert "clickable links" in recalled.content
+
+    def test_a_json_backed_export_does_not_carry_two_copies(self, tmp_path):
+        """Adding a second member under the same name would leave tar member
+        ordering deciding which one a restore sees."""
+        import tarfile
+
+        from andromeda_cli import config as config_module
+        from andromeda_cli.commands import transfer
+        from andromeda_tools import MemoryStore
+
+        home = config_module.home()
+        MemoryStore(home / "memory", "json").store("a fact")
+
+        archive_path = tmp_path / "out.tar.gz"
+        transfer.export(str(archive_path))
+        with tarfile.open(archive_path) as archive:
+            names = archive.getnames()
+        assert names.count(transfer.MEMORY_SNAPSHOT) == 1
+
+
+class TestRestoreLeavesTheIndexCorrect:
+    def test_the_index_is_rebuilt_from_the_restored_transcripts(self, tmp_path, monkeypatch):
+        """A restore that ends with "nothing found" reads as a restore that
+        lost the sessions."""
+        from andromeda_cli import config as config_module
+        from andromeda_cli import sessions as store
+        from andromeda_cli import state
+        from andromeda_cli.commands import transfer
+
+        session = store.Session()
+        session.messages = [{"role": "user", "content": "the retry budget"}]
+        session.save()
+
+        archive_path = tmp_path / "out.tar.gz"
+        transfer.export(str(archive_path))
+
+        fresh = tmp_path / "fresh"
+        monkeypatch.setenv("ANDROMEDA_HOME", str(fresh))
+        assert transfer.restore(str(archive_path), force=True) == 0
+        assert [hit.session_id for hit in state.search("retry budget")] == [session.id]

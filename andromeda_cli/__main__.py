@@ -12,6 +12,7 @@ default and the verbs explicit.
 
 from __future__ import annotations
 
+import os
 import sys
 
 from . import bootstrap
@@ -36,6 +37,8 @@ from .commands import (  # noqa: E402
     mcp_cmd,
     service,
     transfer,
+    memory_cmd,
+    profile as profile_cmd,
     sessions as sessions_cmd,
     tools,
     update as update_cmd,
@@ -56,6 +59,8 @@ COMMANDS = (
     "tools",
     "model",
     "sessions",
+    "memory",
+    "profile",
     "browser",
     "update",
     "doctor",
@@ -81,9 +86,24 @@ commands:
   --thinking off|low|medium|high     how hard the model thinks
   andromeda sessions                 recent sessions
   andromeda sessions show <id>
-  andromeda sessions search <text>
+  andromeda sessions search <text>   full-text search across every session
+  andromeda sessions recap [id]      what happened, computed not generated
+  andromeda sessions export <id> --format html|markdown|jsonl|text
+  andromeda sessions active          sessions open in other terminals
+  andromeda sessions reindex | doctor | recover
+  andromeda sessions rm <id> --force
+  --since 7d --until 2026-08-01 --workspace ~/x --model … --role user
   andromeda --resume <id>            pick a session back up
   andromeda --continue               pick the most recent one back up
+  andromeda memory                   what it remembers (★ = every prompt)
+  andromeda memory search <text>     what it would recall for that
+  andromeda memory remember <text> --standing
+  andromeda memory forget <text> --force
+  andromeda memory export [file.json] | stats
+  andromeda profile                  independent installs, one program
+  andromeda profile create <name> [--clone|--clone-all]
+  andromeda profile use <name> | delete <name> --force
+  andromeda -p <name> <anything>     use a profile for one command
   andromeda browser install          add the browser tools
   andromeda browser status
   andromeda cron add "every 1h" "..."   schedule a job
@@ -452,10 +472,141 @@ def build_command_parser() -> argparse.ArgumentParser:
 
     sessions_parser = sub.add_parser("sessions", help="Past sessions.")
     sessions_sub = sessions_parser.add_subparsers(dest="sessions_command")
+
+    def _add_filters(target: argparse.ArgumentParser) -> None:
+        """The same narrowing on list and on search.
+
+        Defined once rather than declared twice: two copies of a filter set is
+        how `--since` ends up meaning one thing in a listing and another in a
+        search.
+        """
+        target.add_argument("--since", default="", help="7d, yesterday, 2026-08-01.")
+        target.add_argument("--until", default="", help="The other end of the range.")
+        target.add_argument("--workspace", default="", help="Match the workspace path.")
+        target.add_argument("--model", default="", help="Match the model.")
+        target.add_argument(
+            "--provider", default="", help="Match the provider lane exactly."
+        )
+        target.add_argument(
+            "--limit", type=int, default=sessions_store.LIST_LIMIT, help="How many."
+        )
+
+    listing = sessions_sub.add_parser("list", help="Recent sessions.")
+    _add_filters(listing)
+
     show = sessions_sub.add_parser("show", help="Print one session's transcript.")
     show.add_argument("id")
+    show.add_argument(
+        "--live-only",
+        dest="live_only",
+        action="store_true",
+        help="Only what is still in the conversation, not the turns it compacted out.",
+    )
+
     find = sessions_sub.add_parser("search", help="Find sessions containing text.")
     find.add_argument("query")
+    find.add_argument(
+        "--role", default="", help="Only these roles: user, assistant, tool."
+    )
+    _add_filters(find)
+
+    recap_cmd = sessions_sub.add_parser(
+        "recap", help="What happened in a session, without asking the model."
+    )
+    recap_cmd.add_argument("id", nargs="?", default="")
+
+    export_cmd = sessions_sub.add_parser("export", help="Write a session out.")
+    export_cmd.add_argument("id")
+    export_cmd.add_argument(
+        "--format",
+        dest="fmt",
+        default="markdown",
+        choices=["markdown", "md", "html", "jsonl", "text", "txt"],
+    )
+    export_cmd.add_argument(
+        "-o", "--out", dest="out", default="", help="File or directory. Default: stdout."
+    )
+
+    remove_cmd = sessions_sub.add_parser("rm", help="Delete a session for good.")
+    remove_cmd.add_argument("id")
+    remove_cmd.add_argument("--force", action="store_true")
+
+    reindex_cmd = sessions_sub.add_parser("reindex", help="Catch the index up.")
+    reindex_cmd.add_argument(
+        "--force", action="store_true", help="Rebuild every session, not just stale ones."
+    )
+
+    sessions_sub.add_parser("doctor", help="Whether everything is readable and indexed.")
+
+    recover_cmd = sessions_sub.add_parser("recover", help="Salvage damaged transcripts.")
+    recover_cmd.add_argument(
+        "--apply", action="store_true", help="Actually write the salvage back."
+    )
+    recover_cmd.add_argument(
+        "--rebuild-index",
+        dest="rebuild_index",
+        action="store_true",
+        help="Throw the index away and build it again from the transcripts.",
+    )
+
+    sessions_sub.add_parser("active", help="Sessions open in other terminals now.")
+
+    memory_parser = sub.add_parser("memory", help="What the agent remembers.")
+    memory_sub = memory_parser.add_subparsers(dest="memory_command")
+    memory_list = memory_sub.add_parser("list", help="Everything it remembers.")
+    memory_list.add_argument(
+        "--scope", default="", choices=["standing", "episode"], help="Only this tier."
+    )
+    memory_find = memory_sub.add_parser(
+        "search", help="What it would recall for a query."
+    )
+    memory_find.add_argument("query")
+    memory_find.add_argument("--limit", type=int, default=10)
+    memory_add = memory_sub.add_parser(
+        "remember", help="Teach it something without spending a turn."
+    )
+    memory_add.add_argument("content")
+    memory_add.add_argument(
+        "--standing",
+        dest="scope",
+        action="store_const",
+        const="standing",
+        default="episode",
+        help="Load it into every prompt. Keep these few.",
+    )
+    memory_add.add_argument("--tags", default="", help="Comma separated.")
+    memory_drop = memory_sub.add_parser("forget", help="Take something back.")
+    memory_drop.add_argument("query")
+    memory_drop.add_argument(
+        "--scope", default="any", choices=["standing", "episode", "any"]
+    )
+    memory_drop.add_argument("--force", action="store_true")
+    memory_export = memory_sub.add_parser(
+        "export", help="Every memory as JSON, on any backend."
+    )
+    memory_export.add_argument("path", nargs="?", default="")
+    memory_sub.add_parser("stats", help="How much is stored, and where.")
+
+    profile_parser = sub.add_parser("profile", help="Independent installs.")
+    profile_sub = profile_parser.add_subparsers(dest="profile_command")
+    profile_create = profile_sub.add_parser("create", help="Make a new profile.")
+    profile_create.add_argument("name")
+    profile_create.add_argument(
+        "--clone", action="store_true", help="Copy settings, SOUL.md and skills."
+    )
+    profile_create.add_argument(
+        "--clone-all",
+        dest="clone_all",
+        action="store_true",
+        help="Copy everything except credentials and runtime state.",
+    )
+    profile_use = profile_sub.add_parser("use", help="Make a profile the default.")
+    profile_use.add_argument("name")
+    profile_delete = profile_sub.add_parser("delete", help="Remove a profile entirely.")
+    profile_delete.add_argument("name")
+    profile_delete.add_argument("--force", action="store_true")
+    profile_sub.add_parser("list", help="Every profile on this machine.")
+    profile_sub.add_parser("current", help="Which profile this command is using.")
 
     return parser
 
@@ -604,10 +755,72 @@ def _run_command(argv: list[str]) -> int:
 
     if args.command == "sessions":
         if args.sessions_command == "show":
-            return sessions_cmd.show(args.id)
+            return sessions_cmd.show(args.id, live_only=args.live_only)
         if args.sessions_command == "search":
-            return sessions_cmd.find(args.query)
+            return sessions_cmd.find(
+                args.query,
+                limit=args.limit,
+                role=args.role,
+                since=args.since,
+                until=args.until,
+                workspace=args.workspace,
+                model=args.model,
+                provider=args.provider,
+            )
+        if args.sessions_command == "recap":
+            return sessions_cmd.recap(args.id)
+        if args.sessions_command == "export":
+            return sessions_cmd.export(args.id, args.fmt, args.out)
+        if args.sessions_command == "rm":
+            return sessions_cmd.remove(args.id, force=args.force)
+        if args.sessions_command == "reindex":
+            return sessions_cmd.reindex(force=args.force)
+        if args.sessions_command == "doctor":
+            return sessions_cmd.doctor()
+        if args.sessions_command == "recover":
+            return sessions_cmd.recover(
+                apply=args.apply, rebuild=args.rebuild_index
+            )
+        if args.sessions_command == "active":
+            return sessions_cmd.active()
+        if args.sessions_command == "list":
+            return sessions_cmd.show_list(
+                limit=args.limit,
+                since=args.since,
+                until=args.until,
+                workspace=args.workspace,
+                model=args.model,
+                provider=args.provider,
+            )
         return sessions_cmd.show_list()
+
+    if args.command == "memory":
+        if args.memory_command == "search":
+            return memory_cmd.find(args.query, limit=args.limit)
+        if args.memory_command == "remember":
+            return memory_cmd.remember(args.content, args.scope, args.tags)
+        if args.memory_command == "forget":
+            return memory_cmd.forget(args.query, args.scope, force=args.force)
+        if args.memory_command == "export":
+            return memory_cmd.export(args.path)
+        if args.memory_command == "stats":
+            return memory_cmd.stats()
+        if args.memory_command == "list":
+            return memory_cmd.show_list(args.scope)
+        return memory_cmd.show_list()
+
+    if args.command == "profile":
+        if args.profile_command == "create":
+            return profile_cmd.create(
+                args.name, clone=args.clone, clone_all=args.clone_all
+            )
+        if args.profile_command == "use":
+            return profile_cmd.use(args.name)
+        if args.profile_command == "delete":
+            return profile_cmd.delete(args.name, force=args.force)
+        if args.profile_command == "current":
+            return profile_cmd.current()
+        return profile_cmd.show_list()
 
     if args.command == "model":
         if args.id:
@@ -642,8 +855,65 @@ def _read_pipe(prompt: str | None) -> str | None:
     return f"{prompt}\n\n{piped}" if prompt else piped
 
 
+def _take_profile(argv: list[str]) -> tuple[list[str], str]:
+    """Pull `-p NAME` / `--profile NAME` out of argv before anything reads it.
+
+    Handled here rather than as an argparse argument because it decides
+    *which home directory this process has*, and both the verb dispatch and
+    `config.load()` below have already resolved that by the time a parser
+    runs. Accepted anywhere in the line, so `andromeda sessions -p work
+    search x` works the way people type it.
+
+    Returns the remaining argv and the profile name, so a bad name can be
+    reported by the caller rather than by a crash in a directory lookup.
+    """
+    remaining: list[str] = []
+    name = ""
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token in {"-p", "--profile"}:
+            if index + 1 >= len(argv):
+                # Left in place, so argparse produces the error rather than
+                # this silently dropping a flag somebody typed.
+                remaining.append(token)
+                index += 1
+                continue
+            name = argv[index + 1]
+            index += 2
+            continue
+        if token.startswith("--profile="):
+            name = token.split("=", 1)[1]
+            index += 1
+            continue
+        remaining.append(token)
+        index += 1
+    return remaining, name
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+
+    argv, profile_name = _take_profile(argv)
+    if profile_name:
+        from . import profiles
+
+        try:
+            resolved = profiles.validate(profile_name)
+        except profiles.ProfileError as exc:
+            output.fail(str(exc))
+            return 2
+        if resolved != profiles.DEFAULT and not profiles.exists(resolved):
+            output.fail(
+                f"No profile {resolved!r}.",
+                f"andromeda profile create {resolved}",
+            )
+            return 2
+        # Set in the environment rather than passed down, because everything
+        # that resolves a path — config, sessions, the index, the scheduler —
+        # asks `config.home()`, and threading a profile through every one of
+        # them is a change that would be forgotten in exactly one place.
+        os.environ[profiles.ENV_PROFILE] = resolved
 
     if argv and argv[0] in COMMANDS:
         try:

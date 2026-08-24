@@ -91,6 +91,18 @@ class TurnInterrupted(BaseException):
     """
 
 
+def _binding_for(record):
+    """A binding around a bare record, for a conversation built without one.
+
+    Only the test doubles and anything constructing a `Conversation` directly
+    take this path; every real surface goes through `session.build_conversation`,
+    which binds it.
+    """
+    from andromeda_cli import sessions as sessions_store
+
+    return sessions_store.Binding(record)
+
+
 class AgentDriver:
     """One conversation, one worker thread, one event queue."""
 
@@ -103,7 +115,10 @@ class AgentDriver:
         on_event: Callable[[ev.UiEvent], None] | None = None,
     ) -> None:
         self.conversation = conversation
-        self.record = record
+        # Held through the binding, not directly: `/resume` moves which
+        # transcript this terminal writes to, and a driver holding its own
+        # reference would keep appending turns to the session you just left.
+        self.binding = getattr(conversation, "binding", None) or _binding_for(record)
         self.checkpoints = checkpoints
         self._queue: "queue.Queue[ev.UiEvent]" = queue.Queue()
         self._pending: dict[str, Pending] = {}
@@ -247,7 +262,7 @@ class AgentDriver:
         # the REPL, and for the same reason.
         if self.checkpoints is not None:
             self.checkpoints.take(self.conversation.messages, prompt)
-            self.record.checkpoints = self.checkpoints.to_json()
+            self.binding.record.checkpoints = self.checkpoints.to_json()
 
         self.post(ev.TurnStarted(prompt=prompt))
         self._worker = threading.Thread(

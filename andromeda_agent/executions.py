@@ -30,13 +30,14 @@ from __future__ import annotations
 
 import os
 import sqlite3
-import subprocess
 import threading
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
+
+from . import liveness
 
 # Kept bounded. The interesting rows are the recent ones and the ones that
 # never reached a terminal state; a year of successful ticks is noise.
@@ -60,57 +61,13 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _pid_exists(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        # Alive and owned by somebody else. Alive is what the caller asked.
-        return True
-    except OSError:
-        return True
-    return True
-
-
-def _process_start_time(pid: int) -> int | None:
-    """A stamp that changes when a pid is reused, or None if unknowable.
-
-    Pids wrap. Without this, a recovery sweep that sees "pid 4213 is gone"
-    against a machine that has since handed 4213 to a text editor would call a
-    live attempt abandoned — or, worse, call a dead one live and never recover
-    it.
-    """
-    proc = Path("/proc") / str(pid) / "stat"
-    if proc.exists():  # Linux
-        try:
-            fields = proc.read_text(encoding="utf-8").rsplit(") ", 1)[-1].split()
-            return int(fields[19])  # starttime, in clock ticks since boot
-        except (OSError, IndexError, ValueError):
-            return None
-    try:  # macOS and the BSDs
-        completed = subprocess.run(
-            ["ps", "-o", "lstart=", "-p", str(pid)],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    stamp = (completed.stdout or "").strip()
-    return hash(stamp) if stamp else None
-
-
-def _owner_is_live(pid: int, started_at: int | None) -> bool:
-    if not _pid_exists(pid):
-        return False
-    if started_at is None:
-        # We cannot prove it is a different process. Being unable to prove
-        # death must never rewrite state — the failure direction here is
-        # "leave it alone", not "assume it died".
-        return pid != os.getpid() or True
-    current = _process_start_time(pid)
-    return current is not None and current == started_at
+# Liveness lives in one module, imported here rather than defined twice. The
+# ledger and the live-session registry must agree on what "that process is
+# gone" means, and two copies of a pid-plus-start-time check is exactly the
+# pair that drifts.
+_pid_exists = liveness.pid_exists
+_process_start_time = liveness.process_start_time
+_owner_is_live = liveness.owner_is_live
 
 
 class Ledger:

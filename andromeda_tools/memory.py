@@ -11,20 +11,22 @@ semantically. This scores it *lexically* — term overlap, normalized to 0..1. S
 side would recall may score zero here. That is the honest cost of not shipping
 an embedding model with a terminal client, and it is why the default threshold
 is low and why `memory_forget` matches generously.
+
+Storage is pluggable — see `memory_backends`. The scoring above is *not*, on
+purpose: a backend that changed what `minScore` means would keep the parameter
+name while silently retuning every threshold set against it.
 """
 
 from __future__ import annotations
 
-import json
-import os
 import re
-import stat
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
+from . import memory_backends
 from .spec import ToolResult, failure
 
 SCOPES = ("standing", "episode")
@@ -98,39 +100,38 @@ class Memory:
 
 
 class MemoryStore:
-    def __init__(self, root: Path) -> None:
+    """The operations. Where the memories physically live is the backend's.
+
+    Supersession, consolidation and the standing-memory budget are policy and
+    stay here, identical on every backend — a store that consolidated on one
+    backend and accumulated near-duplicates on another would make the tool
+    description true only sometimes.
+    """
+
+    def __init__(
+        self, root: Path, backend: "str | memory_backends.MemoryBackend | None" = None
+    ) -> None:
         self.root = Path(root)
-        self.file = self.root / "memories.json"
+        if isinstance(backend, memory_backends.MemoryBackend):
+            self.backend = backend
+            self.backend_note = ""
+        else:
+            self.backend, self.backend_note = memory_backends.build(
+                backend or memory_backends.DEFAULT_BACKEND, self.root
+            )
+
+    @property
+    def file(self) -> Path:
+        """Where this store's memories are, whichever backend is in use."""
+        return self.backend.file
 
     # ---- persistence -----------------------------------------------------
 
     def load(self) -> list[Memory]:
-        if not self.file.exists():
-            return []
-        try:
-            raw = json.loads(self.file.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            # A corrupt store reads as empty rather than crashing every turn.
-            # The file is left on disk so it can be recovered by hand.
-            return []
-        if not isinstance(raw, list):
-            return []
-        parsed = [Memory.from_json(item) for item in raw if isinstance(item, dict)]
-        return [memory for memory in parsed if memory is not None]
+        return self.backend.load()
 
     def save(self, memories: Iterable[Memory]) -> None:
-        self.root.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps([memory.to_json() for memory in memories], indent=2)
-
-        # Write-then-rename, so an interrupted save cannot truncate the store.
-        temporary = self.file.with_suffix(".json.tmp")
-        descriptor = os.open(
-            temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, stat.S_IRUSR | stat.S_IWUSR
-        )
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write(payload)
-            handle.write("\n")
-        temporary.replace(self.file)
+        self.backend.replace(memories)
 
     # ---- operations ------------------------------------------------------
 
@@ -209,8 +210,11 @@ class MemoryStore:
         limit = max(1, int(limit or DEFAULT_LIMIT))
         threshold = max(0.0, min(float(min_score), 1.0))
 
+        # Candidates from the backend rather than the whole store: an index
+        # narrows this, and a backend without one returns everything, which is
+        # the same set in a different order.
         ranked = sorted(
-            ((score(query, m.content), m) for m in self.load()),
+            ((score(query, m.content), m) for m in self.backend.candidates(query)),
             key=lambda pair: (pair[0], pair[1].created_at),
             reverse=True,
         )

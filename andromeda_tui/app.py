@@ -75,6 +75,9 @@ SLASH_HELP = """  /help      show this
   /rewind    undo the last exchange (/rewind N for a numbered checkpoint)
   /history   list the checkpoints you can rewind to
   /ps        background processes started this session
+  /recap     what has happened so far, without asking the model
+  /sessions  search past sessions (/sessions <text>)
+  /resume    switch to another session (/resume lists them)
   /tools     list the tools this session can use
   /skills    list the skills on this machine
   /lanes     list the delegation specialists
@@ -132,7 +135,6 @@ class AndromedaApp(App):
         super().__init__()
         self.config = config
         self.conversation = conversation
-        self.record = record
         self.resumed = resumed
         self.checkpoints = checkpoint_module.CheckpointStack.from_json(
             resumed.checkpoints if resumed is not None else None
@@ -210,6 +212,8 @@ class AndromedaApp(App):
             transcript.add_note(
                 f"resumed {self.record.id} · {self.record.turns} turns"
             )
+        for line in self._state_health():
+            transcript.add_note(line, tone="yellow")
         pending = self._pending_suggestions()
         if pending:
             transcript.add_note(
@@ -237,6 +241,20 @@ class AndromedaApp(App):
         # so both surfaces feel the same and a long markdown answer is
         # re-rendered at the same rate in each.
         self.set_interval(1 / render.REFRESH_HZ, self._tick)
+
+    def _state_health(self) -> list[str]:
+        """Anything the session index needs said, or nothing.
+
+        Same check the REPL runs and the same reason: a stale index makes
+        search answer "nothing found", which reads as the truth. Once a day,
+        silent when healthy.
+        """
+        try:
+            from andromeda_cli import __version__, state
+
+            return list(state.startup_check(__version__).lines)
+        except Exception:  # noqa: BLE001 - never fail a session over a check
+            return []
 
     @staticmethod
     def _pending_suggestions() -> int:
@@ -575,6 +593,16 @@ class AndromedaApp(App):
         self.composer.load_text(written)
         self.composer.resize_to_content()
 
+    @property
+    def record(self) -> Any:
+        """The transcript this screen is writing to.
+
+        Read through the driver's binding rather than stored, so `/resume`
+        has one place to change and cannot leave the screen and the worker
+        thread disagreeing about which session they are in.
+        """
+        return self.driver.binding.record
+
     # ---- slash commands ---------------------------------------------------
 
     def _slash(self, command: str) -> None:
@@ -620,8 +648,125 @@ class AndromedaApp(App):
             self._list_checkpoints(transcript)
         elif verb == "/rewind":
             self._rewind(parts, transcript)
+        elif verb == "/recap":
+            self._recap(transcript)
+        elif verb == "/sessions":
+            self._search_sessions(parts, transcript)
+        elif verb == "/resume":
+            self._resume(parts, transcript)
         else:
             transcript.add_note(f"unknown command {verb} — /help lists them", tone="yellow")
+
+    def _recap(self, transcript: Transcript) -> None:
+        from andromeda_cli import state
+
+        summary = state.build_recap(
+            self.conversation.messages, getattr(self.conversation, "todos", None)
+        )
+        transcript.add_note("\n".join(f"  {line}" for line in summary.lines()))
+
+    def _search_sessions(self, parts: list[str], transcript: Transcript) -> None:
+        from andromeda_cli import state
+
+        query = " ".join(parts[1:]).strip()
+        if not query:
+            transcript.add_note("/sessions <text> — searches every past session")
+            return
+        hits = state.search(query, limit=8)
+        if not hits:
+            transcript.add_note(f"nothing found for {query!r}")
+            return
+        rows = []
+        for hit in hits:
+            row = Text("  ")
+            row.append(f"{hit.session_id}@{hit.position}  ", style="cyan")
+            row.append(hit.role.ljust(9) + " ", style="dim")
+            row.append(" ".join(hit.snippet.replace("»", "").replace("«", "").split())[:90])
+            rows.append(row)
+        rows.append(Text("  /resume <id> to switch to one", style="dim"))
+        self._rows(transcript, rows, "nothing found")
+
+    def _resume(self, parts: list[str], transcript: Transcript) -> None:
+        """Switch this screen to another transcript.
+
+        Refused mid-turn for the same reason `/rewind` is: the worker thread is
+        appending to the message list this would replace, and the two orders
+        the race can finish in produce different transcripts.
+        """
+        from andromeda_cli import sessions as store
+
+        if self.driver.busy:
+            transcript.add_note("finish or interrupt the turn first")
+            return
+
+        binding = self.driver.binding
+        recent = [
+            session
+            for session in store.recent(limit=10)
+            if session.id != binding.record.id
+        ]
+
+        if len(parts) < 2:
+            if not recent:
+                transcript.add_note("no other sessions to switch to")
+                return
+            rows = []
+            for number, session in enumerate(recent, start=1):
+                row = Text("  ")
+                row.append(f"{str(number).rjust(2)}  ", style="cyan")
+                row.append(f"{session.id}  {str(session.turns).rjust(3)} turns  ", style="dim")
+                row.append(session.title)
+                rows.append(row)
+            rows.append(Text("  /resume <number or id>", style="dim"))
+            self._rows(transcript, rows, "no other sessions")
+            return
+
+        choice = parts[1].strip()
+        if choice.isdigit() and 1 <= int(choice) <= len(recent):
+            target = recent[int(choice) - 1]
+        else:
+            target = store.resolve(choice)
+        if target is None:
+            transcript.add_note(f"no session matching {choice!r}", tone="yellow")
+            return
+        if target.id == binding.record.id:
+            transcript.add_note("already in that session")
+            return
+
+        binding.switch(target, self.conversation.messages)
+        self.conversation.messages = list(target.messages)
+        # The checkpoint stack belongs to the transcript, not to the screen.
+        self.checkpoints = checkpoint_module.CheckpointStack.from_json(
+            target.checkpoints
+        )
+        self.driver.checkpoints = self.checkpoints
+        transcript.remove_children()
+        self._replay(target)
+        transcript.add_note(
+            f"now in {target.id} · {target.turns} turns · {target.title}",
+            tone="green",
+        )
+
+    def _replay(self, session) -> None:
+        """Redraw a switched-to session's conversation on the screen.
+
+        Only what was said. Tool calls and their results are not replayed —
+        they are a record of work, and re-rendering hundreds of them to
+        reconstruct a scrollback nobody scrolled is how a switch takes four
+        seconds instead of none.
+        """
+        for message in session.messages:
+            if not isinstance(message, dict):
+                continue
+            role = message.get("role")
+            content = message.get("content")
+            if not isinstance(content, str) or not content.strip():
+                continue
+            if role == "user":
+                self.transcript.add_prompt(content.strip())
+            elif role == "assistant":
+                self.transcript.feed_answer(content.strip())
+                self.transcript.end_answer()
 
     def _rows(self, transcript: Transcript, rows: list[Text], empty: str) -> None:
         if not rows:
