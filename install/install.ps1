@@ -68,7 +68,9 @@ $CliDir = if (Test-Path (Join-Path $Root 'cli\pyproject.toml')) { Join-Path $Roo
 # here leaves new code against old dependencies. Fail loudly.
 Step 'Building the environment'
 $VenvPath = Join-Path $CliDir '.venv'
-uv venv --python 3.13 $VenvPath | Out-Null
+# --clear: uv venv refuses when the directory exists, so without it the
+# installer works exactly once and every re-run dies here.
+uv venv --clear --python 3.13 $VenvPath | Out-Null
 $VenvPython = Join-Path $VenvPath 'Scripts\python.exe'
 uv pip install --python $VenvPython -e $CliDir | Out-Null
 if ($LASTEXITCODE -ne 0) {

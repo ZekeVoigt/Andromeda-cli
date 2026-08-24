@@ -89,7 +89,14 @@ fi
 # already moved to the new revision, so a failure here means new code against
 # old dependencies. Fail loudly rather than leaving an unbootable `andromeda`.
 step "Building the environment"
-uv venv --python 3.13 "$CLI_DIR/.venv" >/dev/null 2>&1 || die "Could not create the venv."
+# `--clear` is required, not tidiness. `uv venv` refuses outright when the
+# directory already exists, so without it the installer works exactly once: a
+# re-run dies at "Could not create the venv" — and re-running the installer is
+# what this script's own dependency-failure message tells people to do. It also
+# guarantees the venv matches the interpreter this run selected, rather than
+# inheriting whatever an older install built.
+uv venv --clear --python 3.13 "$CLI_DIR/.venv" >/dev/null 2>&1 \
+  || die "Could not create the venv at $CLI_DIR/.venv."
 uv pip install --python "$CLI_DIR/.venv/bin/python" -e "$CLI_DIR" >/dev/null 2>&1 \
   || die "Dependency install failed. The checkout is updated but not runnable — re-run this installer."
 ok "Environment ready"

@@ -87,3 +87,21 @@ def test_the_installer_accepts_both_layouts():
     text = (ROOT / "cli" / "install" / "install.sh").read_text(encoding="utf-8")
     assert 'if [ -f "$INSTALL_ROOT/cli/pyproject.toml" ]' in text
     assert 'elif [ -f "$INSTALL_ROOT/pyproject.toml" ]' in text
+
+
+@pytest.mark.parametrize("name,pattern", [
+    ("install.sh", "uv venv --clear"),
+    ("install.ps1", "uv venv --clear"),
+])
+def test_the_installer_can_be_re_run(name, pattern):
+    """`uv venv` refuses an existing directory, so this must pass `--clear`.
+
+    Without it the installer works exactly once: every re-run dies at "Could
+    not create the venv". That is not a rare path — re-running the installer is
+    what this script's own dependency-failure message tells people to do, and
+    it is how anyone recovers a broken install or moves to a build whose
+    `update` is broken.
+    """
+    assert ROOT is not None
+    text = (ROOT / "cli" / "install" / name).read_text(encoding="utf-8")
+    assert pattern in text, f"{name} cannot be run twice"

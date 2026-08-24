@@ -12,9 +12,13 @@ that learned the old contract will keep using it.
 - The install command is back to `https://ai-andromeda.com/install.sh`, which
   now serves. It pointed at the repository while that URL was returning 404.
 
-## [0.2.1]
+## [0.2.2]
 
 ### Fixed
+- **The installer could only be run once.** `uv venv` refuses an existing
+  directory and the installer did not pass `--clear`, so every re-run died at
+  "Could not create the venv" — including the re-run its own failure message
+  tells you to do.
 - **`andromeda update` could never succeed.** The installer builds the venv with
   `uv venv`, which does not include pip, but `update` shelled out to
   `python -m pip` — so every update reset to the new revision, failed to
