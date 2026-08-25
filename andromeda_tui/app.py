@@ -147,9 +147,14 @@ class AndromedaApp(App):
         background: #000000;
     }
     #transcript .row { margin-bottom: 1; }
-    #transcript .prompt, #transcript .answer {
+    #transcript .prompt {
         height: auto; margin: 0 0 1 0; padding: 0;
         border: none; background: #000000;
+    }
+    #transcript .answer {
+        width: 1fr; height: auto; margin: 1 0 2 0; padding: 0;
+        border: none;
+        background: #000000; color: #e4e4e7;
     }
     #transcript .error { height: auto; margin: 0 0 1 0; padding: 0; }
     #transcript .tool, #transcript .tool-result, #transcript .note {

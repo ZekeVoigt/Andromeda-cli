@@ -23,7 +23,6 @@ import time
 import re
 from pathlib import Path
 
-from rich.console import Group
 from rich.text import Text
 from textual.containers import VerticalGroup, VerticalScroll
 from textual.message import Message
@@ -126,16 +125,43 @@ class Painted(Static):
     one would repaint the wrong thing on resize.
     """
 
-    def __init__(self, source, **kwargs) -> None:
+    def __init__(
+        self,
+        source,
+        *,
+        content_style: str = "",
+        response_frame: bool = False,
+        **kwargs,
+    ) -> None:
         super().__init__("", **kwargs)
         self.source = source
+        self.content_style = content_style
+        self.response_frame = response_frame
 
     def repaint(self) -> None:
         width = self.content_size.width or self.size.width
         if width <= 0:
             # Not laid out yet. The resize that gives it a width will call back.
             return
-        self.update(render.paint(self.source(), width))
+        painted = render.paint(self.source(), width)
+        if self.content_style:
+            # Appending one foreground span preserves markdown's weight,
+            # emphasis and underline while giving the whole response a stable
+            # shade distinct from the brighter user prompt.
+            painted.stylize(self.content_style)
+        if self.response_frame:
+            # Literal brackets are part of the requested grammar, not a label.
+            # Build them from the measured content width so both rules keep
+            # spanning the row after any terminal resize.
+            rule_text = "[" + "─" * max(0, width - 2) + "]"
+            painted = Text.assemble(
+                Text(rule_text, style=screen_style("rule")),
+                "\n",
+                painted,
+                "\n",
+                Text(rule_text, style=screen_style("rule")),
+            )
+        self.update(painted)
 
     def on_resize(self) -> None:
         self.repaint()
@@ -234,13 +260,12 @@ class Transcript(VerticalGroup):
         """
         if self._answer is None:
             self._answer = Painted(
-                lambda: Group(
-                    Text(
-                        f"[ {render.eyebrow('andromeda')} ]",
-                        style=screen_style("eyebrow"),
-                    ),
-                    render.expand_charts(self._answer_text, streaming=True),
+                lambda: render.expand_charts(
+                    self._answer_text,
+                    streaming=True,
                 ),
+                content_style=render.ZINC_200,
+                response_frame=True,
                 classes="row answer",
             )
             self._answer_text = ""
@@ -258,13 +283,7 @@ class Transcript(VerticalGroup):
             # Bind the completed segment. Pointing every finished block back
             # at `self._answer_text` made an old response repaint with a later
             # response whenever the shared hero/chat flow resized.
-            self._answer.source = lambda text=answer_text: Group(
-                Text(
-                    f"[ {render.eyebrow('andromeda')} ]",
-                    style=screen_style("eyebrow"),
-                ),
-                render.expand_charts(text),
-            )
+            self._answer.source = lambda text=answer_text: render.expand_charts(text)
         self._answer.repaint()
         self.scroll_end(animate=False)
 

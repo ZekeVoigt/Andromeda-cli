@@ -25,7 +25,7 @@ import pytest
 
 from andromeda_agent import ApprovalRequest, Callbacks
 from andromeda_agent.loop import Conversation
-from andromeda_cli import render, repl, sessions as sessions_store
+from andromeda_cli import art, render, repl, sessions as sessions_store
 from andromeda_tools import ToolResult, ToolSpec
 from andromeda_tools.clarify import Question as ClarifyQuestion
 
@@ -414,18 +414,40 @@ class TestTheScreen:
         assert not hasattr(render, "PERIWINKLE")
 
     @pytest.mark.asyncio
-    async def test_user_prompts_are_unlabelled_and_answers_are_bracketed(self, tmp_path):
+    async def test_user_prompts_are_unlabelled_and_answers_use_full_width_rules(self, tmp_path):
         app = _app(tmp_path, script=["Hello back"])
         async with app.run_test() as pilot:
             app.driver.submit("Hello there")
             await _settle(pilot, app, lambda: not app.driver.busy)
             prompt = app.query_one(Transcript).query_one(".prompt")
+            answer = app.query_one(Transcript).query_one(".answer")
+            painted = _painted(app)
 
             assert str(prompt.visual) == "Hello there"
-            assert "[ A N D R O M E D A ]" in _painted(app)
+            lines = painted.splitlines()
+            assert lines[0].startswith("[") and lines[0].endswith("]")
+            assert lines[-1].startswith("[") and lines[-1].endswith("]")
+            assert set(lines[0][1:-1]) == {"─"}
+            assert lines[0] == lines[-1]
+            assert len(lines[0]) == answer.content_region.width
+            assert lines[1] == "Hello back"
+            assert "ANDROMEDA" not in painted
+            assert answer.content_style == render.ZINC_200
+            assert answer.response_frame is True
+            assert answer.region.width == app.transcript.content_region.width
             assert "INPUT" not in str(prompt.visual)
-            assert "OUTPUT" not in _painted(app)
+            assert "OUTPUT" not in painted
             assert "YOUR MESSAGE" not in AndromedaApp.CSS.upper()
+
+    def test_the_study_uses_the_detailed_landing_page_leonardo(self):
+        compact = "\n".join(art.figure(64))
+        wide = "\n".join(art.figure(120))
+
+        # These are the face/torso strokes retained by the corrected render of
+        # the landing page's source plate. The simplified placeholder had a
+        # circle for a head and no internal anatomy at all.
+        assert "⣞⣶⣳⣞" in compact
+        assert "⡽⡪⡉" in wide
 
     @pytest.mark.asyncio
     async def test_the_landing_page_chrome_frames_the_surface(self, tmp_path):

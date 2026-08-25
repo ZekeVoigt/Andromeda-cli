@@ -6,6 +6,14 @@ Until 1.0, a minor bump may change a command's shape. Anything that changes a
 tool's name, arguments or risk tier is called out explicitly, because a model
 that learned the old contract will keep using it.
 
+## [0.3.3]
+
+### Changed
+- Replaced the simplified terminal figure with the detailed Leonardo render
+  generated from the landing page's source plate.
+- Andromeda responses are now one zinc shade darker than user prompts and are
+  separated by full-width rules above and below, without an output label.
+
 ## [0.3.2]
 
 ### Changed
