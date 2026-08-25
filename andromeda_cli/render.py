@@ -11,9 +11,9 @@ is redirected, everything falls back to plain text with no escape codes,
 because `andromeda "..." > out.md` should produce markdown, not a screenshot of
 markdown.
 
-The palette is deliberately small: one accent for structure, one for lanes,
-dim for everything secondary, and the terminal's own foreground for prose. Colour
-that carries no meaning is noise, and a terminal is already busy.
+The palette is deliberately monochrome: zinc-50 through zinc-200 over black.
+Hierarchy comes from weight, spacing and rules, not hue. Colour that carries no
+meaning is noise, and a terminal is already busy.
 """
 
 from __future__ import annotations
@@ -30,54 +30,37 @@ from rich.markdown import Markdown
 from rich.text import Text
 from rich.theme import Theme
 
-# The palette is the website's, not the terminal's defaults.
-#
-# ai-andromeda.com is near-monochrome — zinc greys (#d4d4d8 / #a1a1aa /
-# #71717a) over near-black, with one deep navy in the gradients and no
-# saturated colour anywhere. Hierarchy comes from typography and space rather
-# than from hue.
-#
-# This used to be `accent: cyan, lane: magenta` — the default 16-colour
-# terminal palette, which belongs to no product in particular. The difference
-# is the whole point: a loud terminal reads as complicated, and a calm one
-# reads as confident. It is also what a person meets before they have read a
-# word of documentation.
-#
-# `periwinkle` is that navy lifted until it survives on a light background as
-# well as a dark one, and it is spent sparingly: the selected item, the prompt
-# caret, and nothing else.
-ZINC_300 = "#d4d4d8"
-ZINC_400 = "#a1a1aa"
-ZINC_500 = "#71717a"
-PERIWINKLE = "#8f9bff"
+# These are the exact light zinc steps used by the marketing surface. The
+# terminal gets no private accent colour: if a state needs emphasis it earns
+# it through bold text, a glyph, or a rule.
+ZINC_50 = "#fafafa"
+ZINC_100 = "#f4f4f5"
+ZINC_200 = "#e4e4e7"
 
 THEME = Theme(
     {
-        "accent": PERIWINKLE,
-        "lane": ZINC_400,
-        "muted": ZINC_500,
-        # Semantic states keep their conventional hue, because a red that is
-        # not red is a failure nobody registers. They are desaturated to sit
-        # inside the greyscale rather than shout over it.
-        "ok": "#6ee7a8",
-        "warn": "#e8c468",
-        "bad": "#f2777a",
+        "accent": ZINC_50,
+        "lane": ZINC_100,
+        "muted": f"dim {ZINC_200}",
+        "ok": ZINC_50,
+        "warn": f"bold {ZINC_50}",
+        "bad": f"bold {ZINC_50}",
         # An all-caps, wide-tracked label. The site's eyebrows —
         # EXPRESSIVE INTELLIGENCE, HUMAN / SYSTEM / ORBIT — are the strongest
         # single piece of its visual language and they cost nothing here.
-        "eyebrow": f"bold {ZINC_500}",
-        "figure": ZINC_400,
-        "rule": "#3f3f46",
+        "eyebrow": f"bold {ZINC_200}",
+        "figure": f"dim {ZINC_200}",
+        "rule": f"dim {ZINC_200}",
         # Markdown elements. Restrained on purpose: rich's defaults colour
         # headings and code aggressively, which fights the prose.
         "markdown.h1": "bold",
         "markdown.h2": "bold",
         "markdown.h3": "bold",
-        "markdown.item.number": ZINC_500,
-        "markdown.item.bullet": ZINC_500,
-        "markdown.code": ZINC_300,
-        "markdown.link": f"{PERIWINKLE} underline",
-        "markdown.block_quote": f"italic {ZINC_500}",
+        "markdown.item.number": ZINC_200,
+        "markdown.item.bullet": ZINC_200,
+        "markdown.code": ZINC_100,
+        "markdown.link": f"{ZINC_50} underline",
+        "markdown.block_quote": f"italic dim {ZINC_200}",
     }
 )
 

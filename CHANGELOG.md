@@ -6,6 +6,20 @@ Until 1.0, a minor bump may change a command's shape. Anything that changes a
 tool's name, arguments or risk tier is called out explicitly, because a model
 that learned the old contract will keep using it.
 
+## [0.3.2]
+
+### Changed
+- Restored the full-screen, landing-page-aligned terminal interface in the
+  public installer: monochrome zinc styling, Leonardo at left, and actual CLI
+  release changes at right.
+- Conversation rows are deliberately unlabeled for the user and every agent
+  response is enclosed by an `[ ANDROMEDA ]` bracket.
+- The masthead and transcript now share one scroll region, so a growing
+  conversation naturally pushes Leonardo and the release panel above the
+  viewport while the composer remains visible.
+- Composer spacing is consistent and its helper text no longer crowds or
+  disappears behind the input field.
+
 ## [0.3.1]
 
 ### Removed

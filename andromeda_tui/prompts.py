@@ -32,6 +32,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Input, Static
 
 from andromeda_agent.approval import Answer
+from andromeda_cli import render
 
 # The answers, in the order they are offered, each with the single key that
 # picks it outright. `never` has no key on purpose: it writes a standing
@@ -72,19 +73,40 @@ class ApprovalScreen(ModalScreen[Answer]):
             # path would otherwise be parsed as styling and shown wrong. A
             # prompt that misrenders what it is asking about is not consent.
             yield Static(self._summary(), id="approval-summary")
+            if self.body.get("reason"):
+                yield Static(self._reason(), id="approval-reason")
             if self.body.get("approvals"):
                 yield Static(self._suggestion(), id="approval-suggestion")
             yield Static(self._choices(), id="approval-choices")
 
     def _header(self) -> Text:
         line = Text()
-        line.append("⚠ ", style="yellow")
-        line.append(str(self.body.get("tool", "")), style="bold yellow")
-        line.append(f"  {self.body.get('tier', '')}", style="dim")
+        line.append(render.eyebrow("approval"), style=f"bold {render.ZINC_200}")
+        line.append("  /  ", style=f"dim {render.ZINC_200}")
+        line.append(str(self.body.get("tool", "")).upper(), style=render.ZINC_50)
+        line.append(
+            f"  /  {str(self.body.get('tier', '')).upper()}",
+            style=f"dim {render.ZINC_200}",
+        )
         return line
 
     def _summary(self) -> Text:
-        return Text(str(self.body.get("summary", "")), no_wrap=False)
+        return Text(
+            str(self.body.get("summary", "")),
+            style=render.ZINC_50,
+            no_wrap=False,
+        )
+
+    def _reason(self) -> Text:
+        """Why a call the policy allowed is being asked about anyway.
+
+        Only set when a hook escalated it. Without the line the prompt looks
+        arbitrary, and an arbitrary prompt is one people clear rather than read.
+        """
+        return Text(
+            f"HOOK / {self.body.get('reason', '')}",
+            style=f"dim {render.ZINC_200}",
+        )
 
     def _suggestion(self) -> Text:
         count = int(self.body.get("approvals") or 0)
@@ -92,7 +114,7 @@ class ApprovalScreen(ModalScreen[Answer]):
         # explicit `!` answer — learned trust never promotes itself.
         return Text(
             f"you have approved this {count} times — ! stops the asking",
-            style="dim",
+            style=f"dim {render.ZINC_200}",
         )
 
     def _choices(self) -> Text:
@@ -106,13 +128,30 @@ class ApprovalScreen(ModalScreen[Answer]):
         for position, (key, _answer, label) in enumerate(APPROVAL_CHOICES):
             selected = position == self.index
             block.append("  ")
-            block.append("❯ " if selected else "  ", style="cyan")
-            block.append(f"{key or ' '}  ", style="bold cyan" if key else "dim")
-            block.append(label, style="bold" if selected else "dim")
+            block.append(
+                "❯ " if selected else "  ",
+                style=render.ZINC_50,
+            )
+            block.append(
+                f"{key or ' '}  ",
+                style=(
+                    f"bold {render.ZINC_50}"
+                    if key
+                    else f"dim {render.ZINC_200}"
+                ),
+            )
+            block.append(
+                label,
+                style=(
+                    f"bold {render.ZINC_50}"
+                    if selected
+                    else f"dim {render.ZINC_200}"
+                ),
+            )
             if not key:
-                block.append("  (enter only)", style="dim")
+                block.append("  (enter only)", style=f"dim {render.ZINC_200}")
             block.append("\n")
-        block.append("  esc declines", style="dim")
+        block.append("  ESC DECLINES", style=f"dim {render.ZINC_200}")
         return block
 
     def _refresh_choices(self) -> None:
@@ -190,20 +229,30 @@ class ClarifyScreen(ModalScreen[list]):
     def _question(self) -> Text:
         line = Text()
         if len(self.questions) > 1:
-            line.append(f"{self.index + 1}/{len(self.questions)} ", style="dim")
-        line.append(str(self.current.get("text", "")), style="cyan")
+            line.append(
+                f"{self.index + 1}/{len(self.questions)}  ",
+                style=f"dim {render.ZINC_200}",
+            )
+        line.append(
+            render.eyebrow("question") + "  /  ",
+            style=f"bold {render.ZINC_200}",
+        )
+        line.append(str(self.current.get("text", "")), style=render.ZINC_50)
         return line
 
     def _choices(self) -> Text:
         choices = self.current.get("choices") or []
         line = Text()
         for position, choice in enumerate(choices, start=1):
-            line.append(f"  {position}", style="cyan")
-            line.append(f"  {choice}")
+            line.append(f"  {position}", style=render.ZINC_50)
+            line.append(f"  {choice}", style=render.ZINC_100)
             # First is the recommendation, and an empty answer takes it — which
             # is why the tool's schema insists the recommended option goes
             # first rather than being labelled.
-            line.append(" (recommended)\n" if position == 1 else "\n", style="dim")
+            line.append(
+                " (recommended)\n" if position == 1 else "\n",
+                style=f"dim {render.ZINC_200}",
+            )
         return line
 
     def on_input_submitted(self, event: Input.Submitted) -> None:

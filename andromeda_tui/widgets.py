@@ -20,9 +20,12 @@ Two consequences worth knowing before editing:
 from __future__ import annotations
 
 import time
+import re
+from pathlib import Path
 
+from rich.console import Group
 from rich.text import Text
-from textual.containers import VerticalScroll
+from textual.containers import VerticalGroup, VerticalScroll
 from textual.message import Message
 from textual.widgets import Static, TextArea
 
@@ -31,6 +34,87 @@ from andromeda_cli import render
 # The spinner. Braille rather than a bar, because it occupies one cell at every
 # frame — a spinner that changes width makes the whole activity line jitter.
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+SCREEN_TONES = {
+    "accent": render.ZINC_50,
+    "lane": render.ZINC_100,
+    "muted": f"dim {render.ZINC_200}",
+    "dim": f"dim {render.ZINC_200}",
+    "eyebrow": f"bold {render.ZINC_200}",
+    "figure": f"dim {render.ZINC_200}",
+    "rule": f"dim {render.ZINC_200}",
+    "ok": render.ZINC_50,
+    "warn": f"bold {render.ZINC_50}",
+    "bad": f"bold {render.ZINC_50}",
+    # Legacy tone names still arrive from slash commands and tool events. They
+    # are deliberately aliases, not an escape hatch back to terminal colours.
+    "red": f"bold {render.ZINC_50}",
+    "yellow": render.ZINC_100,
+    "green": render.ZINC_50,
+    "magenta": render.ZINC_100,
+    "cyan": render.ZINC_50,
+}
+
+
+def screen_style(tone: str) -> str:
+    """Resolve product theme aliases before Textual sees Rich text."""
+    return SCREEN_TONES.get(tone, tone)
+
+
+def latest_cli_changes(limit: int = 3) -> list[tuple[str, str]]:
+    """Read the newest product changes from the CLI's own changelog.
+
+    The installed macOS command is an editable checkout, so the changelog sits
+    beside the packages. Keeping the rail sourced from that file prevents a
+    conversation event from masquerading as a product update.
+    """
+    changelog = Path(__file__).resolve().parents[1] / "CHANGELOG.md"
+    try:
+        lines = changelog.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+
+    release = ""
+    category = ""
+    raw_changes: list[tuple[str, str]] = []
+    pending: tuple[str, str] | None = None
+
+    def flush() -> None:
+        nonlocal pending
+        if pending is not None:
+            raw_changes.append(pending)
+            pending = None
+
+    for line in lines:
+        if line.startswith("## ["):
+            flush()
+            release = line.removeprefix("## [").split("]", 1)[0].upper()
+            continue
+        if line.startswith("### "):
+            flush()
+            category = line.removeprefix("### ").strip().upper()
+            continue
+        if release and line.startswith("- "):
+            flush()
+            pending = (f"{release} / {category}", line[2:].strip())
+            continue
+        if pending is not None and (line.startswith("  ") or line.startswith("\t")):
+            label, detail = pending
+            pending = (label, f"{detail} {line.strip()}")
+            continue
+        flush()
+    flush()
+
+    changes: list[tuple[str, str]] = []
+    for label, raw_detail in raw_changes[:limit]:
+        detail = re.sub(r"\*\*([^*]+)\*\*", r"\1", raw_detail)
+        detail = re.sub(r"`([^`]+)`", r"\1", detail)
+        detail = " ".join(detail.split())
+        if len(detail) > 112:
+            detail = detail[:109].rstrip() + "…"
+        changes.append((label, detail))
+    return changes
 
 
 class Painted(Static):
@@ -57,7 +141,7 @@ class Painted(Static):
         self.repaint()
 
 
-class Transcript(VerticalScroll):
+class Transcript(VerticalGroup):
     """What has already happened, oldest first.
 
     Widgets rather than one growing text blob: a tool line and an answer have
@@ -72,26 +156,44 @@ class Transcript(VerticalScroll):
 
     # ---- rows -------------------------------------------------------------
 
+    def scroll_end(self, animate: bool = False) -> None:
+        """Keep the shared hero/conversation flow pinned to its newest row."""
+
+        def scroll_flow() -> None:
+            flow = getattr(self.app, "conversation_scroll", None)
+            if flow is not None:
+                flow.scroll_end(animate=animate)
+
+        # A mounted row does not affect the parent's virtual height until the
+        # next layout. Scrolling synchronously lands at yesterday's bottom and
+        # leaves the newest line below the composer.
+        self.call_after_refresh(scroll_flow)
+
     def _append(self, widget: Static) -> None:
         self.mount(widget)
-        # `animate=False`: an animated scroll while text is streaming never
-        # arrives, because the target moves on every tick.
+        # `animate=False`: a moving target while text streams should stay
+        # attached to the bottom, not chase it with overlapping animations.
         self.scroll_end(animate=False)
 
     def add_prompt(self, text: str) -> None:
-        self._append(Static(Text(f"› {text}", style="bold"), classes="row prompt"))
+        self._append(
+            Static(Text(text, style=render.ZINC_50), classes="row prompt")
+        )
 
-    def add_note(self, text: str, tone: str = "muted") -> None:
-        self._append(Static(Text(f"  {text}", style=tone), classes="row note"))
+    def add_note(self, text: str, tone: str = "muted") -> Static:
+        """Append a note and return it so one-shot reveals can repaint it."""
+        note = Static(Text(f"  {text}", style=screen_style(tone)), classes="row note")
+        self._append(note)
+        return note
 
     def add_tool(self, summary: str, tier: str) -> None:
         # Filled circle for anything that changes the machine, hollow for a
         # read. One glyph, and it means the same thing as the mark the REPL
         # prints — see `render.tool_call`.
         mark = "○" if tier == "safe_local" else "●"
-        line = Text("  ")
-        line.append(mark, style="cyan")
-        line.append(f" {summary}")
+        line = Text()
+        line.append(f"{mark}  TOOL / ", style=screen_style("muted"))
+        line.append(summary, style=render.ZINC_100)
         self._append(Static(line, classes="row tool"))
 
     def add_tool_result(self, detail: str, ok: bool) -> None:
@@ -99,17 +201,23 @@ class Transcript(VerticalScroll):
             return
         self._append(
             Static(
-                Text(f"    {detail}", style="dim" if ok else "yellow"),
+                Text(
+                    f"   {detail}",
+                    style=screen_style("muted" if ok else "warn"),
+                ),
                 classes="row tool-result",
             )
         )
 
     def add_error(self, message: str, hint: str = "") -> None:
         block = Text()
-        block.append("✗ ", style="bold red")
-        block.append(message)
+        block.append(
+            f"{render.eyebrow('system')}  /  ERROR\n",
+            style=screen_style("eyebrow"),
+        )
+        block.append(message, style=render.ZINC_50)
         if hint:
-            block.append(f"\n  {hint}", style="dim")
+            block.append(f"\n{hint}", style=screen_style("muted"))
         self._append(Static(block, classes="row error"))
 
     # ---- the streaming answer ---------------------------------------------
@@ -126,7 +234,13 @@ class Transcript(VerticalScroll):
         """
         if self._answer is None:
             self._answer = Painted(
-                lambda: render.expand_charts(self._answer_text, streaming=True),
+                lambda: Group(
+                    Text(
+                        f"[ {render.eyebrow('andromeda')} ]",
+                        style=screen_style("eyebrow"),
+                    ),
+                    render.expand_charts(self._answer_text, streaming=True),
+                ),
                 classes="row answer",
             )
             self._answer_text = ""
@@ -140,7 +254,17 @@ class Transcript(VerticalScroll):
             # The last pass renders a still-open fence as the code block it
             # actually is: at the end of the turn it is content, not a chart
             # halfway through arriving.
-            self._answer.source = lambda: render.expand_charts(self._answer_text)
+            answer_text = self._answer_text
+            # Bind the completed segment. Pointing every finished block back
+            # at `self._answer_text` made an old response repaint with a later
+            # response whenever the shared hero/chat flow resized.
+            self._answer.source = lambda text=answer_text: Group(
+                Text(
+                    f"[ {render.eyebrow('andromeda')} ]",
+                    style=screen_style("eyebrow"),
+                ),
+                render.expand_charts(text),
+            )
         self._answer.repaint()
         self.scroll_end(animate=False)
 
@@ -152,6 +276,85 @@ class Transcript(VerticalScroll):
     @property
     def answer_text(self) -> str:
         return self._answer_text
+
+
+class StudyPanel(VerticalScroll):
+    """Leonardo's study, isolated from the conversation scrollback."""
+
+    def add_row(self, text: str, tone: str = "muted") -> Static:
+        row = Static(Text(text, style=screen_style(tone)), classes="study-row")
+        self.mount(row)
+        return row
+
+
+class RecentUpdates(Static):
+    """Actual CLI release changes plus the current runtime, never chat events."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__("", **kwargs)
+        self.provider = ""
+        self.model = ""
+        self.workspace = ""
+        self.tools = 0
+        self.approval = ""
+        self.thinking = ""
+        self.changes = latest_cli_changes()
+
+    def configure(
+        self,
+        *,
+        provider: str,
+        model: str,
+        workspace: str,
+        tools: int,
+        approval: str,
+        thinking: str,
+    ) -> None:
+        self.provider = provider
+        self.model = model
+        self.workspace = workspace
+        self.tools = tools
+        self.approval = approval
+        self.thinking = thinking
+        self._refresh()
+
+    def set_sessions(self, sessions: list[tuple[str, str, str]]) -> None:
+        """Compatibility no-op: session history belongs behind `/sessions`."""
+
+    def push(self, label: str, detail: str, tone: str = "muted") -> None:
+        """Compatibility no-op: conversation activity is not a CLI update."""
+
+    def _refresh(self) -> None:
+        out = Text()
+        out.append("SYS. 001", style=screen_style("muted"))
+        out.append("  " + "─" * 14 + "  ", style=screen_style("rule"))
+        out.append("RECENT CLI CHANGES", style=screen_style("muted"))
+
+        if self.changes:
+            for index, (label, detail) in enumerate(self.changes, start=1):
+                out.append(f"\n\n{index:02d} / {label}", style=screen_style("eyebrow"))
+                out.append(f"\n{detail}", style=render.ZINC_100)
+        else:
+            out.append("\n\n00 / CHANGELOG", style=screen_style("eyebrow"))
+            out.append("\nNO RELEASE NOTES FOUND", style=render.ZINC_100)
+
+        if self.provider:
+            provider = self.provider.split(" (", 1)[0].upper()
+            model = self.model.rsplit("/", 1)[-1].upper()
+            out.append("\n\n" + "─" * 36, style=screen_style("rule"))
+            out.append("\nRUNTIME", style=screen_style("eyebrow"))
+            out.append(f"\n{provider} / {model}", style=render.ZINC_100)
+            out.append(
+                f"\nTOOLS / {self.tools}   APPROVAL / {self.approval.upper()}",
+                style=screen_style("muted"),
+            )
+            if self.thinking and self.thinking != "off":
+                out.append(
+                    f"   THINKING / {self.thinking.upper()}",
+                    style=screen_style("muted"),
+                )
+
+        self.update(out)
 
 
 class ActivityLane(Static):
@@ -188,23 +391,26 @@ class ActivityLane(Static):
             # A spinner while a prompt is open says the machine is working. It
             # is not: it is stopped, waiting for the person, and saying so is
             # the difference between "be patient" and "you are the hold-up".
-            self.update(Text("  ⏸ waiting for your answer", style="yellow"))
+            self.update(
+                Text("PAUSED / WAITING FOR YOUR ANSWER", style=screen_style("warn"))
+            )
             return
 
-        line = Text("  ")
-        line.append(SPINNER[self._frame] if busy else "·", style="cyan")
+        line = Text()
+        line.append(SPINNER[self._frame] if busy else "·", style=render.ZINC_50)
         if self.tool:
             elapsed = time.monotonic() - self.started
-            line.append(f" {self.tool[:90]}")
+            line.append("  WORKING / ", style=screen_style("muted"))
+            line.append(self.tool[:90], style=render.ZINC_100)
             # Only once it is long enough to wonder about. A timer that starts
             # at 0.0s on every read makes every call look slow.
             if elapsed >= 2:
-                line.append(f"  {elapsed:.0f}s", style="dim")
+                line.append(f"  {elapsed:.0f}s", style=screen_style("muted"))
         elif busy:
-            line.append(" thinking", style="dim")
+            line.append("  THINKING", style=screen_style("muted"))
         if self.lanes:
-            line.append(f"   {len(self.lanes)} lane(s): ", style="dim")
-            line.append(", ".join(self.lanes), style="magenta")
+            line.append(f"   LANES / {len(self.lanes)}  ", style=screen_style("muted"))
+            line.append(", ".join(self.lanes), style=render.ZINC_100)
         self.update(line)
 
 
@@ -221,20 +427,21 @@ class StatusBar(Static):
 
     def refresh_status(self) -> None:
         line = Text()
-        line.append(f" {self.model}", style="cyan")
-        line.append(f"  {self.mode}", style="dim")
+        model = self.model.rsplit("/", 1)[-1]
+        line.append(f" MODEL / {model.upper()}", style=screen_style("muted"))
+        line.append(f"   {self.mode.upper().replace(':', ' / ')}", style=screen_style("muted"))
         if self.thinking and self.thinking != "off":
-            line.append(f"  thinking:{self.thinking}", style="dim")
+            line.append(f"   THINKING / {self.thinking.upper()}", style=screen_style("muted"))
         # The context gauge appears only once it is worth reading. Below a
         # third of the window it is a bar that is always empty, which teaches
         # nobody anything — the same threshold the REPL prompt uses.
         if self.context >= 0.33:
             line.append(
                 f"  {render.context_meter(self.context, width=8)} {int(self.context * 100)}%",
-                style="dim",
+                style=screen_style("muted"),
             )
         if self.hint:
-            line.append(f"   {self.hint}", style="dim")
+            line.append(f"   {self.hint.upper()}", style=screen_style("muted"))
         self.update(line)
 
 

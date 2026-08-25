@@ -43,10 +43,10 @@ an event going down or an answer coming up by id.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
 import time
-from datetime import datetime
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -54,6 +54,7 @@ from typing import Any
 from rich.text import Text
 from textual.app import App, ComposeResult, SuspendNotSupported
 from textual.binding import Binding
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Static
 
 from andromeda_agent.models import THINKING_LEVELS, supports_reasoning
@@ -64,7 +65,15 @@ from andromeda_cli.session import set_asker, set_lane_announcer
 from . import events as ev
 from .driver import AgentDriver
 from .prompts import ApprovalScreen, ClarifyScreen
-from .widgets import ActivityLane, Composer, StatusBar, Transcript
+from .widgets import (
+    ActivityLane,
+    Composer,
+    RecentUpdates,
+    StatusBar,
+    StudyPanel,
+    Transcript,
+    screen_style,
+)
 
 # Kept in step with the REPL's list. `tests/test_tui.py` parses
 # `repl.SLASH_HELP` and asserts every verb there is handled here — two surfaces
@@ -87,39 +96,101 @@ SLASH_HELP = """  /help      show this
   /cwd       show the workspace root
   /exit      leave (Ctrl-D also works)"""
 
-KEY_HINT = "ctrl+c interrupt · ctrl+g editor · ctrl+l new · ctrl+d quit"
+KEY_HINT = "CTRL+C INTERRUPT  ·  CTRL+G EDITOR  ·  CTRL+L NEW  ·  CTRL+D QUIT"
 
 
 class AndromedaApp(App):
     """One conversation on one screen."""
 
     CSS = """
-    Screen { background: $surface; }
+    Screen { background: #000000; color: #fafafa; }
 
-    #transcript { height: 1fr; padding: 0 1; scrollbar-size-vertical: 1; }
+    #chrome {
+        height: 3; margin: 0 2; padding: 1 1 0 1;
+        border-bottom: solid #e4e4e7 24%; background: #000000;
+    }
+    #brand { width: 1fr; color: #fafafa; text-style: bold; }
+    #header-meta {
+        width: auto; color: #e4e4e7; text-style: dim;
+        text-align: center;
+    }
+    #header-state {
+        width: 1fr; color: #e4e4e7; text-style: dim;
+        text-align: right;
+    }
+
+    #conversation-scroll {
+        height: 1fr; background: #000000;
+        scrollbar-size-vertical: 1; overflow-x: hidden; overflow-y: auto;
+        scrollbar-color: #e4e4e7 30%;
+        scrollbar-color-hover: #e4e4e7 45%;
+        scrollbar-color-active: #e4e4e7 60%;
+        scrollbar-background: #000000;
+        scrollbar-background-hover: #000000;
+        scrollbar-background-active: #000000;
+        scrollbar-corner-color: #000000;
+    }
+    #masthead { height: 27; margin: 1 3 0 3; }
+    #study {
+        width: 2fr; height: 1fr; padding: 0;
+        scrollbar-size-vertical: 0; overflow-y: hidden;
+    }
+    #study .study-row { height: auto; }
+    #recent-updates {
+        width: 1fr; height: 1fr; margin: 2 0 1 3; padding: 1 0 0 2;
+        background: #000000; color: #f4f4f5;
+    }
+
+    #transcript {
+        height: auto; min-height: 21; margin: 0 3; padding: 1 1 0 1;
+        border-top: solid #e4e4e7 24%;
+        background: #000000;
+    }
     #transcript .row { margin-bottom: 1; }
+    #transcript .prompt, #transcript .answer {
+        height: auto; margin: 0 0 1 0; padding: 0;
+        border: none; background: #000000;
+    }
+    #transcript .error { height: auto; margin: 0 0 1 0; padding: 0; }
     #transcript .tool, #transcript .tool-result, #transcript .note {
         margin-bottom: 0;
     }
 
-    #activity { height: auto; padding: 0 1; display: none; }
-    #composer {
-        height: auto; max-height: 12; border: none; padding: 0 1;
-        background: $surface; scrollbar-size-vertical: 1;
+    #activity {
+        height: auto; margin: 0 3; padding: 0 1; display: none;
+        background: #000000;
     }
-    #composer:focus { border: none; }
-    #status { height: 1; background: $panel; color: $text-muted; }
+    #composer-shell {
+        height: auto; max-height: 16; margin: 0 3; padding: 1;
+        border-top: solid #e4e4e7 24%; background: #000000;
+    }
+    #composer-help {
+        height: 1; margin-top: 1;
+        color: #e4e4e7; text-style: dim;
+    }
+    #composer {
+        height: auto; max-height: 10; border: none; padding: 0;
+        background: #000000; color: #fafafa; scrollbar-size-vertical: 1;
+    }
+    #composer:focus { border: none; background: #000000; }
+    #status {
+        height: 2; padding: 0 2; background: #000000; color: #e4e4e7;
+        border-top: solid #e4e4e7 24%;
+    }
 
     /* The prompts. A dimmed backdrop is not decoration here: it is the visible
        statement that the thing underneath is stopped and waiting. */
-    ApprovalScreen, ClarifyScreen { align: center middle; background: $surface 60%; }
+    ApprovalScreen, ClarifyScreen { align: center middle; background: #000000 70%; }
     #approval-box, #clarify-box {
         width: 80%; max-width: 100; height: auto; padding: 1 2;
-        background: $panel; border: round $warning;
+        background: #000000; border: solid #e4e4e7 36%;
     }
-    #clarify-box { border: round $accent; }
     #approval-summary { padding: 1 0; }
     #approval-choices { padding-top: 1; }
+    #clarify-input {
+        border: none; border-top: solid #e4e4e7 24%;
+        background: #000000; color: #fafafa;
+    }
     """
 
     BINDINGS = [
@@ -171,19 +242,54 @@ class AndromedaApp(App):
         # thing doing the looking up is the timer that drains the event queue.
         # That is a crash in exactly the state the surface most needs to keep
         # working. Caught by a test, not by reading.
+        self.brand = Static("∞  ANDROMEDA", id="brand")
+        self.header_meta = Static("PERSONAL AGENT  ·  CLI", id="header-meta")
+        self.header_state = Static("", id="header-state")
+        self.chrome = Horizontal(
+            self.brand, self.header_meta, self.header_state, id="chrome"
+        )
+        self.study = StudyPanel(id="study")
+        self.recent_updates = RecentUpdates(id="recent-updates")
+        self.masthead = Horizontal(self.study, self.recent_updates, id="masthead")
         self.transcript = Transcript(id="transcript")
+        self.conversation_scroll = VerticalScroll(
+            self.masthead, self.transcript, id="conversation-scroll"
+        )
         self.activity = ActivityLane(id="activity")
-        self.composer = Composer(placeholder="ask anything — / for commands, shift+enter for a new line", id="composer")
+        self.composer = Composer(placeholder="Ask Andromeda anything…", id="composer")
+        self.composer_shell = Vertical(
+            self.composer,
+            Static("ENTER TO SEND  ·  SHIFT+ENTER NEW LINE  ·  / COMMANDS", id="composer-help"),
+            id="composer-shell",
+        )
         self.status = StatusBar(id="status")
-        yield self.transcript
+        yield self.chrome
+        yield self.conversation_scroll
         yield self.activity
-        yield self.composer
+        yield self.composer_shell
         yield self.status
 
-    def on_mount(self) -> None:
+    async def on_mount(self) -> None:
         transcript = self.transcript
         provider = self.conversation.provider
+        self._sync_masthead_layout()
+        # A real terminal can mount before its first measured layout. In that
+        # state `self.size` is 0×0; treating it as a genuinely narrow terminal
+        # hides the whole hero and the header metadata permanently. Re-run
+        # after Textual has painted once and knows the actual cell dimensions.
+        self.call_after_refresh(self._sync_masthead_layout)
+        self.header_state.update(
+            f"{provider.model.rsplit('/', 1)[-1].upper()}  /  {self.conversation.policy.mode.upper()}"
+        )
 
+        self.recent_updates.configure(
+            provider=provider.label,
+            model=provider.model,
+            workspace=str(self.conversation.workspace.root),
+            tools=len(self.conversation.available),
+            approval=self.conversation.policy.mode,
+            thinking=provider.thinking,
+        )
         # The study opens this surface as well as the REPL's.
         #
         # It was added to `output.banner()` first, which only the REPL calls —
@@ -192,25 +298,15 @@ class AndromedaApp(App):
         # the product's face and the other not is exactly the drift the shared
         # renderer exists to prevent.
         #
-        # Static here rather than animated: the scan drives a rich `Live`
-        # region, and this transcript is a Textual widget tree. Two things
-        # redrawing the same screen fight each other. The reveal belongs to the
-        # REPL; what the two surfaces share is the composition.
-        for line, style in art.study(max(self.size.width - 2, 40)):
-            transcript.add_note(line.rstrip(), tone=style or "muted")
-        transcript.add_note("")
+        # Textual owns the screen, so its widgets perform the same one-pass
+        # reveal as the REPL instead of starting a competing Rich `Live`
+        # region. Every row is mounted up front: the layout stays still while
+        # the scan reveals the drawing, then remains fully drawn.
+        await self._reveal_study(self.study)
 
-        transcript.add_note(render.eyebrow("the personal agent"), tone="eyebrow")
-        transcript.add_note("")
-        transcript.add_note(f"{provider.label} · {provider.model}", tone="accent")
-        transcript.add_note(str(self.conversation.workspace.root))
-        transcript.add_note(
-            f"{len(self.conversation.available)} tools · approval: "
-            f"{self.conversation.policy.mode} · thinking: {provider.thinking}"
-        )
         if self.resumed is not None:
             transcript.add_note(
-                f"resumed {self.record.id} · {self.record.turns} turns"
+                f"SESSION / RESUMED {self.record.id} · {self.record.turns} TURNS"
             )
         for line in self._state_health():
             transcript.add_note(line, tone="yellow")
@@ -220,8 +316,6 @@ class AndromedaApp(App):
                 f"{pending} automation(s) suggested · andromeda cron suggest",
                 tone="yellow",
             )
-        transcript.add_note("/help for commands", tone="dim")
-
         status = self.status
         status.model = provider.model
         status.mode = f"approval:{self.conversation.policy.mode}"
@@ -241,6 +335,86 @@ class AndromedaApp(App):
         # so both surfaces feel the same and a long markdown answer is
         # re-rendered at the same rate in each.
         self.set_interval(1 / render.REFRESH_HZ, self._tick)
+
+    async def _reveal_study(self, study: StudyPanel) -> None:
+        """Reveal the study once in place, without a second screen renderer."""
+        await asyncio.sleep(0)
+        width = study.size.width or self.size.width
+        # The art has two discrete source plates: 24 and 34 rows. The wide
+        # plate used to be selected from width alone and then clipped by a
+        # shorter masthead. Choose the compact plate whenever all 34 rows
+        # cannot actually be shown, so Leonardo keeps his feet and caption.
+        art_width = max(width - 2, 40)
+        if study.size.height < 34:
+            art_width = min(art_width, 85)
+        rows = art.study(art_width)
+        if not rows:
+            return
+
+        widgets: list[Static] = []
+        figure_rows: list[int] = []
+        for index, (line, style) in enumerate(rows):
+            is_figure = style == "figure"
+            widgets.append(
+                study.add_row(
+                    "" if is_figure else line.rstrip(),
+                    tone=style or "muted",
+                )
+            )
+            if is_figure:
+                figure_rows.append(index)
+
+        if not figure_rows:
+            return
+
+        # Yield once so Textual paints the empty, already-sized frame before
+        # the sweep begins. This is the only run; there is no recurring timer.
+        if not self.masthead.display:
+            for row_index in figure_rows:
+                widgets[row_index].update(
+                    Text(rows[row_index][0].rstrip(), style=screen_style("figure"))
+                )
+            return
+
+        steps = len(figure_rows) + art.SCAN_BAND
+        delay = art.SCAN_SECONDS / max(steps, 1)
+        for head in range(steps + 1):
+            for position, row_index in enumerate(figure_rows):
+                distance = head - position
+                if distance < 0:
+                    text = ""
+                    tone = "figure"
+                else:
+                    text = rows[row_index][0].rstrip()
+                    tone = "bold white" if distance < art.SCAN_BAND else "figure"
+                widgets[row_index].update(Text(text, style=screen_style(tone)))
+            await asyncio.sleep(delay)
+
+        for row_index in figure_rows:
+            widgets[row_index].update(
+                Text(rows[row_index][0].rstrip(), style=screen_style("figure"))
+            )
+
+    def _sync_masthead_layout(self, measured_size=None) -> None:
+        """Keep the portrait generous on large screens and out of the way on small ones."""
+        size = measured_size or self.size
+        if size.width <= 0 or size.height <= 0:
+            return
+        self.masthead.display = size.height >= 38
+        self.recent_updates.display = size.width >= 116
+        self.header_meta.display = size.width >= 90
+        self.header_state.display = size.width >= 116
+        if self.masthead.display:
+            self.masthead.styles.height = min(29, max(27, int(size.height * 0.45)))
+
+    def on_resize(self, event) -> None:
+        # Textual dispatches this user handler before App._on_resize updates
+        # `self.size`. Reading `self.size` here therefore sees the *previous*
+        # terminal dimensions—the exact reason a session opened at 80×24 and
+        # stayed collapsed after the real 160×60 resize. The event is the
+        # source of truth for this transition.
+        if hasattr(self, "masthead"):
+            self._sync_masthead_layout(event.size)
 
     def _state_health(self) -> list[str]:
         """Anything the session index needs said, or nothing.
@@ -541,9 +715,9 @@ class AndromedaApp(App):
         self.transcript.add_note("new conversation", tone="green")
 
     def action_scroll_transcript(self, direction: int) -> None:
-        transcript = self.transcript
-        page = max(1, transcript.size.height - 2)
-        transcript.scroll_relative(y=direction * page, animate=False)
+        flow = self.conversation_scroll
+        page = max(1, flow.size.height - 2)
+        flow.scroll_relative(y=direction * page, animate=False)
 
     def action_edit_in_editor(self) -> None:
         """Hand the whole screen to `$EDITOR`, then take it back.

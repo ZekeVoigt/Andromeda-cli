@@ -25,7 +25,7 @@ import pytest
 
 from andromeda_agent import ApprovalRequest, Callbacks
 from andromeda_agent.loop import Conversation
-from andromeda_cli import repl, sessions as sessions_store
+from andromeda_cli import render, repl, sessions as sessions_store
 from andromeda_tools import ToolResult, ToolSpec
 from andromeda_tools.clarify import Question as ClarifyQuestion
 
@@ -34,7 +34,7 @@ from andromeda_tui import events as ev
 from andromeda_tui.app import SLASH_HELP, AndromedaApp
 from andromeda_tui.driver import AgentDriver, Pending, TurnInterrupted
 from andromeda_tui.prompts import APPROVAL_CHOICES, ApprovalScreen, ClarifyScreen
-from andromeda_tui.widgets import ActivityLane, Transcript
+from andromeda_tui.widgets import ActivityLane, RecentUpdates, StudyPanel, Transcript
 
 from support import ScriptedProvider, call, turn_with
 
@@ -391,6 +391,116 @@ def _app(tmp_path, script=None):
 
 
 class TestTheScreen:
+    def test_the_surface_uses_the_marketing_palette_not_terminal_colours(self):
+        css = AndromedaApp.CSS.lower()
+        for retired in (
+            "#8f9bff",
+            "#18181b",
+            "#202027",
+            "#52525b",
+            "cyan",
+            "magenta",
+            "yellow",
+            "red",
+            "green",
+            "border-left: thick",
+            "border: round",
+        ):
+            assert retired not in css
+
+        assert render.ZINC_50 == "#fafafa"
+        assert render.ZINC_100 == "#f4f4f5"
+        assert render.ZINC_200 == "#e4e4e7"
+        assert not hasattr(render, "PERIWINKLE")
+
+    @pytest.mark.asyncio
+    async def test_user_prompts_are_unlabelled_and_answers_are_bracketed(self, tmp_path):
+        app = _app(tmp_path, script=["Hello back"])
+        async with app.run_test() as pilot:
+            app.driver.submit("Hello there")
+            await _settle(pilot, app, lambda: not app.driver.busy)
+            prompt = app.query_one(Transcript).query_one(".prompt")
+
+            assert str(prompt.visual) == "Hello there"
+            assert "[ A N D R O M E D A ]" in _painted(app)
+            assert "INPUT" not in str(prompt.visual)
+            assert "OUTPUT" not in _painted(app)
+            assert "YOUR MESSAGE" not in AndromedaApp.CSS.upper()
+
+    @pytest.mark.asyncio
+    async def test_the_landing_page_chrome_frames_the_surface(self, tmp_path):
+        app = _app(tmp_path)
+        async with app.run_test(size=(160, 60)) as pilot:
+            await pilot.pause()
+
+            assert "∞  ANDROMEDA" in str(app.brand.visual)
+            assert "PERSONAL AGENT  ·  CLI" in str(app.header_meta.visual)
+            assert "MODEL  /  ASK" in str(app.header_state.visual)
+
+    @pytest.mark.asyncio
+    async def test_the_hero_and_chat_are_one_continuous_scroll_flow(self, tmp_path):
+        app = _app(tmp_path)
+        async with app.run_test(size=(160, 60)) as pilot:
+            await pilot.pause()
+
+            assert app.masthead.parent is app.conversation_scroll
+            assert app.transcript.parent is app.conversation_scroll
+            assert app.transcript.region.height >= 21
+            assert app.conversation_scroll.scroll_y == 0
+
+    @pytest.mark.asyncio
+    async def test_conversation_growth_gradually_pushes_the_hero_out_of_frame(self, tmp_path):
+        app = _app(tmp_path)
+        async with app.run_test(size=(160, 60)) as pilot:
+            await pilot.pause()
+            positions = []
+
+            for index in range(12):
+                app.transcript.add_prompt(f"Question {index}")
+                app.transcript.feed_answer(f"Answer {index}\nwith one more line")
+                app.transcript.end_answer()
+                await pilot.pause()
+                positions.append(app.conversation_scroll.scroll_y)
+
+            assert positions == sorted(positions)
+            assert positions[0] < positions[-1]
+            assert app.conversation_scroll.scroll_y > app.masthead.region.height
+
+    @pytest.mark.asyncio
+    async def test_completed_answers_keep_their_own_text_after_a_resize(self, tmp_path):
+        app = _app(tmp_path)
+        async with app.run_test(size=(160, 60)) as pilot:
+            app.transcript.feed_answer("First answer")
+            app.transcript.end_answer()
+            app.transcript.feed_answer("Second answer")
+            app.transcript.end_answer()
+            await pilot.resize_terminal(150, 55)
+            await pilot.pause()
+
+            answers = list(app.transcript.query(".answer"))
+            assert "First answer" in str(answers[0].visual)
+            assert "Second answer" not in str(answers[0].visual)
+            assert "Second answer" in str(answers[1].visual)
+
+    @pytest.mark.asyncio
+    async def test_a_real_resize_restores_the_hero_after_a_narrow_start(self, tmp_path):
+        app = _app(tmp_path)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+
+            assert app.masthead.display is False
+            assert app.header_meta.display is False
+            assert app.header_state.display is False
+
+            await pilot.resize_terminal(160, 60)
+            await pilot.pause()
+
+            assert app.masthead.display is True
+            assert app.header_meta.display is True
+            assert app.header_state.display is True
+            assert app.study.region.width > 0
+            assert app.recent_updates.region.width > 0
+
     @pytest.mark.asyncio
     async def test_an_answer_is_rendered_not_printed_raw(self, tmp_path):
         app = _app(tmp_path, script=["A **bold** answer"])
@@ -425,6 +535,21 @@ class TestTheScreen:
             await pilot.press("n")
             await _settle(pilot, app, lambda: not app.composer.disabled)
             assert app.composer.disabled is False
+
+    @pytest.mark.asyncio
+    async def test_the_composer_keeps_a_visible_text_row_after_typing(self, tmp_path):
+        app = _app(tmp_path)
+        async with app.run_test(size=(160, 60)) as pilot:
+            app.composer.focus()
+            await pilot.press("h", "i")
+            await pilot.pause()
+
+            assert app.composer.text == "hi"
+            assert app.composer.region.height == 1
+            assert app.composer.content_region.height == 1
+            help_line = app.query_one("#composer-help")
+            assert help_line.region.y - app.composer.region.bottom == 1
+            assert app.composer_shell.region.bottom - help_line.region.bottom == 1
 
     @pytest.mark.asyncio
     async def test_the_clock_keeps_running_while_a_prompt_is_open(self, tmp_path):
@@ -546,7 +671,7 @@ class TestTheScreen:
             await _settle(pilot, app, lambda: isinstance(app.screen, ApprovalScreen))
             lane = app.query_one(ActivityLane)
             assert lane.waiting is True
-            assert "waiting for your answer" in str(lane.visual)
+            assert "WAITING FOR YOUR ANSWER" in str(lane.visual)
             await pilot.press("n")
             await _settle(pilot, app, lambda: not lane.waiting)
 
@@ -862,6 +987,11 @@ def _notes(app) -> str:
     return ANSI.sub("", "\n".join(str(getattr(w, "visual", "")) for w in rows))
 
 
+def _study(app) -> str:
+    rows = app.query_one(StudyPanel).query(".study-row")
+    return ANSI.sub("", "\n".join(str(getattr(w, "visual", "")) for w in rows))
+
+
 class TestBothSurfacesOpenTheSame:
     """The study belongs to the product, not to one interface.
 
@@ -878,12 +1008,12 @@ class TestBothSurfacesOpenTheSame:
         app = _app(tmp_path)
         async with app.run_test() as pilot:
             await pilot.pause()
-            notes = _notes(app)
+            study = _study(app)
 
         # The coordinates and the caption are text rather than braille, so they
         # survive width clamping and are the honest thing to assert on.
-        assert "00h 42m 44s" in notes
-        assert "HUMAN / SYSTEM / ORBIT" in notes
+        assert "00h 42m 44s" in study
+        assert "HUMAN / SYSTEM / ORBIT" in study
 
     @pytest.mark.asyncio
     async def test_it_does_not_push_off_what_you_are_connected_to(self, tmp_path):
@@ -891,7 +1021,34 @@ class TestBothSurfacesOpenTheSame:
         app = _app(tmp_path)
         async with app.run_test() as pilot:
             await pilot.pause()
-            notes = _notes(app)
+            updates = str(app.query_one(RecentUpdates).visual)
 
-        assert "approval:" in notes
-        assert "tools" in notes
+        assert "APPROVAL / ASK" in updates
+        assert "TOOLS / 2" in updates
+
+    @pytest.mark.asyncio
+    async def test_recent_updates_occupy_the_wide_side_of_the_study(self, tmp_path):
+        app = _app(tmp_path)
+        async with app.run_test(size=(160, 60)) as pilot:
+            await pilot.pause()
+
+            assert app.masthead.display is True
+            assert app.recent_updates.display is True
+            assert app.study.region.x < app.recent_updates.region.x
+
+    @pytest.mark.asyncio
+    async def test_updates_rail_contains_cli_changes_not_chat_activity(self, tmp_path):
+        app = _app(tmp_path, script=["A user-facing answer"])
+        async with app.run_test(size=(160, 60)) as pilot:
+            app.driver.submit("A private user message")
+            await _settle(pilot, app, lambda: not app.driver.busy)
+            await pilot.pause()
+            updates = str(app.query_one(RecentUpdates).visual)
+
+        assert "SYS. 001" in updates
+        assert "RECENT CLI CHANGES" in updates
+        assert "0.3.2 / CHANGED" in updates
+        assert "RECENT CONVERSATIONS" not in updates
+        assert "A private user message" not in updates
+        assert "A user-facing answer" not in updates
+        assert str(tmp_path) not in updates
