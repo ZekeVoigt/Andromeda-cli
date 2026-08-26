@@ -524,3 +524,25 @@ def test_an_unparseable_schedule_does_not_raise_here():
     failing a command over."""
     assert cloud.wake_cost_note("not a schedule") == ""
     assert cloud.wake_cost_note("") == ""
+
+
+def test_the_tool_tells_the_agent_how_to_hand_the_cloud_over():
+    """Barred is not the same as unable to help.
+
+    The tool has no cloud parameter and must not grow one. But with nothing in
+    its description mentioning the hosted lane at all, the model answered "I
+    have no agent cloud capability" and stopped — which is true about the
+    parameter and false about the product. It can make the job; the user grants
+    the location. Both halves have to be in front of it.
+    """
+    from andromeda_tools import scheduling
+
+    spec = scheduling.cron_spec(schedule=None, workspace_root="/tmp")
+    description = spec.description
+
+    assert "cron approve <id> --run-on cloud" in description
+    assert "cannot put a job on a hosted runner yourself" in description
+    # And the boundary is still stated as a grant, not as an incapacity.
+    assert "theirs to grant" in description
+    # The schema is unchanged — this is prose, not a new argument.
+    assert "cloud" not in spec.parameters["properties"]

@@ -66,6 +66,14 @@ CRON_DESCRIPTION = (
     "anyway and tell the user to run `andromeda cron approve <id> --approval "
     "auto` — granting a job the ability to change things unattended is their "
     "decision, not yours.\n\n"
+    "IF THE USER ASKS FOR IT TO RUN IN THE CLOUD — hosted, remote, or 'with my "
+    "laptop closed' — create it here anyway and then tell them, in your reply, "
+    "to run `andromeda cron approve <id> --run-on cloud`. You cannot put a job "
+    "on a hosted runner yourself and there is no parameter for it: that runner "
+    "spends their credit on a schedule with nobody watching, so moving a job "
+    "onto it is theirs to grant. Do not describe this as something you are "
+    "unable to help with — you make the job, they grant the location, and the "
+    "command is the whole of their half.\n\n"
     "Use this when the user asks for something recurring or for later. Do not "
     "use it to remember a fact (that is memory_store) or to do something now."
 )
@@ -238,7 +246,12 @@ def cron_spec(schedule: Any, workspace_root: str) -> ToolSpec:
                     "It is read-only. Tell the user that, and tell them to run "
                     f"`andromeda cron approve {job.id} --approval auto` if it "
                     "needs to change files or run commands. The scheduler must "
-                    "be running for it to fire: `andromeda cron install`."
+                    "be running for it to fire: `andromeda cron install`.\n\n"
+                    "It runs on THIS machine, so it only fires while the "
+                    "computer is awake. If they wanted it to run with the "
+                    "laptop closed, give them this line and say it is the one "
+                    "thing only they can do:\n"
+                    f"  andromeda cron approve {job.id} --run-on cloud"
                 ),
                 display=f"scheduled {job.id}: {job.name}",
             )
