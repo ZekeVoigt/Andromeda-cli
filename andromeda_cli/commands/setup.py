@@ -4,15 +4,21 @@ Four screens, one decision each, everything skippable. That shape is a
 reaction to what the alternative looks like: a wizard that opens with a
 forty-five item provider list and a twenty-nine item messaging list is not
 onboarding, it is a form, and the person filling it in has no way to know which
-answers matter. This build has a locked model and no messaging gateway, so the
-only genuine decision is how it reaches a model — and even that has a default
-that works.
+answers matter.
 
-Three rules, each of them a thing that goes wrong otherwise.
+Four rules, each of them a thing that goes wrong otherwise.
 
-**Always say where you are.** `1 of 4` on every screen. Setup sends you to a
-browser and back, and without a counter you return with no idea whether you are
-nearly done or nearly at the start.
+**Sign in first.** The first screen is the account, before any preference, and
+it happens in a browser rather than by copying a code between windows. It is
+first because it is the step that decides what the rest of the product can do:
+signed in, the model is reachable and a plan can be upgraded when the free one
+runs out; not signed in, every later question is being asked of something that
+cannot answer yet. Setup is also the only moment we can be sure the person is
+sitting in front of both a terminal and a browser.
+
+**One question on the screen at a time.** Each step clears the last. A wizard
+that scrolls leaves question one visible while you are answering question two,
+and two things on screen both look like the thing being asked.
 
 **Escape is always a real answer.** Every screen can be skipped and none of
 them strand you: skipping leaves the default in place and setup carries on. A
@@ -20,46 +26,26 @@ prompt that cannot be dismissed teaches people to answer without reading.
 
 **Nothing is written until the end.** Config is saved once, after the summary,
 so a wizard abandoned halfway leaves the previous configuration exactly as it
-was rather than half-rewritten.
+was rather than half-rewritten. Credentials are the exception and have to be:
+they are written the moment the browser hands them back, because that is the
+only moment they exist.
 """
 
 from __future__ import annotations
 
 import os
-import sys
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Callable
 
 from andromeda_agent import soul
 
 from .. import config as config_module
 from .. import output
+from .. import prompt as prompt_module
+from ..prompt import interactive_input  # re-exported: tests and callers patch it here
 from ..render import console, eyebrow
 
 TOTAL_STEPS = 4
-
-
-def interactive_input():
-    """A reader bound to the terminal, not to stdin.
-
-    The installer runs as `curl … | bash`, which makes the script's stdin the
-    *pipe carrying the script itself*. A wizard that reads stdin there gets
-    either EOF immediately or, worse, the remaining bytes of its own source as
-    answers. Re-opening `/dev/tty` reaches the actual terminal regardless of
-    what stdin was redirected to, and it is the reason the wizard can be
-    launched from inside a piped installer at all.
-
-    Returns None when there is no controlling terminal — cron, CI, Docker
-    without `-t` — and every caller treats that as "do not prompt" rather than
-    blocking forever on a read that will never return.
-    """
-    if sys.stdin.isatty():
-        return sys.stdin
-    try:
-        return open("/dev/tty", "r", encoding="utf-8")  # noqa: SIM115 - lifetime is the session
-    except OSError:
-        return None
 
 
 @dataclass
@@ -70,7 +56,8 @@ class Step:
     body: str
 
 
-def _header(step: Step) -> None:
+def _header(reader, step: Step) -> None:
+    prompt_module.clear(reader)
     console.print()
     console.print(
         f"  [eyebrow]{eyebrow('andromeda / setup')}[/eyebrow]"
@@ -86,76 +73,84 @@ def _header(step: Step) -> None:
 
 
 def _choose(reader, options: list[tuple[str, str, str]], default: int = 0) -> int | None:
-    """A numbered chooser rather than an arrow-key list.
+    return prompt_module.choose(reader, options, default=default)
 
-    Deliberately not a cursor UI. This runs inside a piped installer where the
-    terminal is shared with a shell script, raw mode is not reliably available,
-    and a broken cursor UI is unrecoverable — you cannot see what you are
-    selecting. Numbers work on every terminal, over ssh, and in a transcript
-    somebody pastes into a bug report.
+
+def _sign_in(reader, settings: dict) -> None:
+    """Open the browser, wait for the redirect, and say what came back.
+
+    Deliberately blocking. The alternative — launch the browser and carry on
+    asking questions — puts a wizard and a sign-in on screen at the same time,
+    and whichever one finishes second overwrites the other's output.
     """
-    for index, (label, detail, _value) in enumerate(options, start=1):
-        marker = "●" if index - 1 == default else "○"
-        console.print(f"    [accent]{marker}[/accent]  [bold]{index}[/bold]  {label}")
-        if detail:
-            console.print(f"           [muted]{detail}[/muted]")
+    from . import auth as auth_cmd
+
+    base_url = str(settings.get("base_url") or config_module.DEFAULTS["base_url"])
+
+    def announce(url: str, opened: bool) -> None:
+        console.print()
+        if opened:
+            console.print("  [muted]Your browser is open. Sign in or create an account there.[/muted]")
+        else:
+            console.print("  [muted]Open this to sign in or create an account:[/muted]")
+        console.print(f"    [accent]{url}[/accent]")
+        console.print()
+        console.print("  [muted]Waiting… this window continues by itself.[/muted]")
+
+    result = auth_cmd.browser_login(base_url=base_url, announce=announce)
     console.print()
-    console.print("  [muted]number to choose · enter for the default · s to skip[/muted]")
-    console.print()
+    if result.ok:
+        console.print("  [ok]✓[/ok]  [bold]Signed in.[/bold] [muted]This machine is paired.[/muted]")
+        return
 
-    if reader is None:
-        return default
-    try:
-        # Read from `reader`, never `input()`. `input()` reads `sys.stdin`, and
-        # under `curl … | bash` that is the pipe carrying the installer script —
-        # so the answer to the first question would be the next line of shell
-        # source. The whole reason `interactive_input()` re-opens /dev/tty is to
-        # get a handle on the actual terminal; calling `input()` throws that
-        # away and silently reintroduces the bug it exists to prevent.
-        console.file.write("  › ")
-        console.file.flush()
-        line = reader.readline()
-        if not line:  # EOF
-            return None
-        raw = line.strip().lower()
-    except (EOFError, KeyboardInterrupt, OSError):
-        return None
-    if raw in {"s", "skip"}:
-        return None
-    if not raw:
-        return default
-    if raw.isdigit() and 1 <= int(raw) <= len(options):
-        return int(raw) - 1
-    return default
+    console.print(f"  [warn]·[/warn]  [muted]{result.error}[/muted]")
+    console.print("  [muted]Setup carries on. Finish this later with[/muted] [accent]andromeda auth login[/accent]")
 
 
-def _step_provider(reader, settings: dict) -> None:
-    _header(Step(1, "provider", "How it reaches a model.", """
+def _step_account(reader, settings: dict) -> None:
+    _header(reader, Step(1, "account", "Sign in to Andromeda.", """
         Andromeda runs on this machine, against your files, with your approval.
         It needs one way to reach a model.
+
+        Signing in is free, and it is also where you upgrade later if you want
+        more than the free plan gives you.
     """))
 
-    options = [
-        ("Pair this machine", "Use your Andromeda account. Nothing else to set up.", "relay"),
-        ("Bring your own key", "OpenRouter. You handle billing.", "direct"),
-    ]
-    current = 0 if settings.get("provider", "relay") == "relay" else 1
+    already = config_module.load_credentials().paired
+    if already:
+        # Re-running setup must not sign a working machine out of its own
+        # account just to get to the next question, so staying is the default
+        # and signing in again is the deliberate second option.
+        console.print("  [ok]✓[/ok]  [muted]This machine is already signed in.[/muted]")
+        console.print()
+        options = [
+            ("Stay signed in", "Keep this machine on the account it already uses.", "keep"),
+            ("Sign in as someone else", "Opens your browser and replaces the account.", "relay"),
+            ("Bring your own key", "OpenRouter. You handle billing, no account needed.", "direct"),
+        ]
+        current = 0
+    else:
+        options = [
+            ("Sign in with your browser", "Free account, nothing to copy or paste. Recommended.", "relay"),
+            ("Bring your own key", "OpenRouter. You handle billing, no account needed.", "direct"),
+        ]
+        current = 0 if settings.get("provider", "relay") == "relay" else 1
+
     choice = _choose(reader, options, default=current)
     if choice is None:
         return
-    settings["provider"] = options[choice][2]
+    chosen = options[choice][2]
+    settings["provider"] = "relay" if chosen == "keep" else chosen
 
-    if options[choice][2] == "relay":
-        console.print()
-        console.print("  [muted]After setup, run[/muted] [accent]andromeda auth login[/accent]")
-        console.print("  [muted]Your code is in Settings → Paired machines.[/muted]")
-    elif not os.environ.get("OPENROUTER_API_KEY"):
+    if chosen == "relay":
+        _sign_in(reader, settings)
+    elif chosen == "direct" and not os.environ.get("OPENROUTER_API_KEY"):
         console.print()
         console.print("  [muted]Set[/muted] [accent]OPENROUTER_API_KEY[/accent] [muted]before your first run.[/muted]")
 
 
 def _step_approval(reader, settings: dict) -> None:
-    _header(Step(2, "approval", "What it may do without asking.", """
+    _header(reader, Step(2, "approval", "What it may do without asking.", """
         Andromeda reads and writes real files and runs real commands.
         This is the ceiling; you can change it any time.
     """))
@@ -176,7 +171,7 @@ def _step_soul(reader, settings: dict) -> None:
     home = config_module.home()
     created = soul.scaffold(home)
 
-    _header(Step(3, "soul", "How it should work with you.", f"""
+    _header(reader, Step(3, "soul", "How it should work with you.", f"""
         {soul.FILENAME} holds your standing instructions — how you want
         Andromeda to work and how to talk to you. It is read every session
         and this program never writes to it.
@@ -188,10 +183,11 @@ def _step_soul(reader, settings: dict) -> None:
         "  Edit it whenever.[/muted]"
     )
     console.print()
+    prompt_module.wait_for_enter(reader)
 
 
 def _step_summary(reader, settings: dict, gaps: list[tuple[str, str, str]]) -> None:
-    _header(Step(4, "ready", "What you have.", ""))
+    _header(reader, Step(4, "ready", "What you have.", ""))
     for label, state, fix in gaps:
         if state:
             console.print(f"    [ok]✓[/ok]  {label}  [muted]{state}[/muted]")
@@ -229,7 +225,7 @@ def capability_report(settings: dict) -> list[tuple[str, str, str]]:
     return [
         (
             "Model access",
-            ("paired" if credentials.paired else "")
+            ("signed in" if credentials.paired else "")
             if provider == "relay"
             else ("your own key" if os.environ.get("OPENROUTER_API_KEY") else ""),
             "andromeda auth login" if provider == "relay"
@@ -256,14 +252,17 @@ def run(quick: bool = False) -> int:
         output.info("Run `andromeda setup` when you have one.")
         return 0
 
+    prompt_module.clear(reader)
     console.print()
     console.print(f"  [eyebrow]{eyebrow('andromeda')}[/eyebrow]")
     console.print()
     console.print("  [bold]Your work has gravity.[/bold]")
     console.print()
     console.print("  [muted]Four questions and you're working. Skip any of them.[/muted]")
+    console.print()
+    prompt_module.wait_for_enter(reader)
 
-    steps: list[Callable] = [_step_provider, _step_approval, _step_soul]
+    steps: list[Callable] = [_step_account, _step_approval, _step_soul]
     for step in steps:
         step(reader, settings)
 

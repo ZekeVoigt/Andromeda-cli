@@ -215,7 +215,7 @@ class TestWithoutATerminal:
 
 
 def drive(argv: list[str], *, home: Path, keystrokes: list[bytes],
-          stdin_pipe: bool = False, timeout: float = 20.0) -> str:
+          stdin_pipe: bool = False, timeout: float = 20.0, raw: bool = False) -> str:
     """Run the real binary against a real terminal and return what it drew.
 
     `openpty` plus `subprocess` rather than `pty.fork()`: this suite runs
@@ -302,18 +302,59 @@ def drive(argv: list[str], *, home: Path, keystrokes: list[bytes],
     except subprocess.TimeoutExpired:
         process.kill()
     os.close(controller)
-    return strip(collected.decode("utf-8", "replace"))
+    text = collected.decode("utf-8", "replace")
+    return text if raw else strip(text)
+
+
+#: Welcome, then BYOK on the account screen, then approval, then the soul
+#: screen. The second step is deliberately *not* "sign in with your browser":
+#: that opens a browser and blocks on a loopback listener, which is tested
+#: directly in test_auth.py rather than through a pty.
+WALK = [b"\n", b"2\n", b"1\n", b"\n"]
 
 
 class TestTheWizardOnARealTerminal:
     def test_it_walks_all_four_steps(self, tmp_path):
         home = tmp_path / "home"
-        out = drive(["setup"], home=home, keystrokes=[b"1\n", b"1\n"])
+        out = drive(["setup"], home=home, keystrokes=WALK)
 
         assert "1 of 4" in out
         assert "2 of 4" in out
         assert "4 of 4" in out
         assert soul.path(home).is_file(), "setup did not scaffold SOUL.md"
+
+    def test_the_first_question_is_the_account(self, tmp_path):
+        """Sign-in comes before every preference.
+
+        It is the step that decides whether anything else in the product can
+        work, and setup is the one moment we know the person has both a
+        terminal and a browser in front of them.
+        """
+        out = drive(["setup"], home=tmp_path / "home", keystrokes=WALK)
+        account = out.index("1 of 4")
+        approval = out.index("2 of 4")
+        assert out.index("Sign in to Andromeda.") > account
+        assert out.index("Sign in to Andromeda.") < approval
+
+    def test_one_question_is_on_screen_at_a_time(self, tmp_path):
+        """Each step clears the last.
+
+        Without this the wizard scrolls, and question one is still on screen
+        while question two is being answered — two things that both look like
+        the thing being asked.
+        """
+        out = drive(["setup"], home=tmp_path / "home", keystrokes=WALK)
+        # rich clears with ESC[2J; the pty transcript is stripped of escapes,
+        # so the count comes from the raw bytes instead.
+        raw = drive_raw(["setup"], home=tmp_path / "raw", keystrokes=WALK)
+        assert raw.count("\x1b[2J") >= 4, "the wizard did not clear between steps"
+        assert "1 of 4" in out
+
+    def test_the_selected_option_is_pointed_at(self, tmp_path):
+        """A cursor, not a number to type. Nothing typed is nothing mistyped."""
+        out = drive(["setup"], home=tmp_path / "home", keystrokes=WALK)
+        assert "›" in out
+        assert "enter to choose" in out
 
     def test_it_reads_the_terminal_and_not_a_piped_stdin(self, tmp_path):
         """The bug this whole design exists to prevent.
@@ -324,11 +365,16 @@ class TestTheWizardOnARealTerminal:
         the real keystroke; the shell line must never be treated as input.
         """
         home = tmp_path / "home"
-        out = drive(["setup"], home=home, keystrokes=[b"2\n", b"1\n"], stdin_pipe=True)
+        out = drive(["setup"], home=home, keystrokes=WALK, stdin_pipe=True)
 
         assert "THIS LINE IS SHELL SOURCE" not in out.replace("\r", "")
         assert "1 of 4" in out
         assert soul.path(home).is_file()
+
+
+def drive_raw(argv: list[str], **kwargs) -> str:
+    """The same run with the escape codes left in, for asserting on redraws."""
+    return drive(argv, raw=True, **kwargs)
 
 
 class TestTheTwoSizes:

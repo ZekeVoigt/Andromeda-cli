@@ -1,6 +1,6 @@
 [project]
 name = "andromeda-cli"
-version = "0.5.0"
+version = "0.5.1"
 description = "Andromeda — a local-first agent harness for the terminal"
 readme = "README.md"
 # Upper bound is load-bearing. uv resolves the interpreter from this field, and
