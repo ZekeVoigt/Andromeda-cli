@@ -23,7 +23,6 @@ import time
 import re
 from pathlib import Path
 
-from rich.console import Group
 from rich.text import Text
 from textual.containers import VerticalGroup, VerticalScroll
 from textual.message import Message
@@ -117,6 +116,53 @@ def latest_cli_changes(limit: int = 3) -> list[tuple[str, str]]:
     return changes
 
 
+class FrameRule(Static):
+    """The bracket that opens or closes one whole reply.
+
+    A turn is prose, then a tool row, then more prose, then another tool row.
+    Heading the prose alone drew the boundary in the wrong place: the tools a
+    reply used are part of that reply and sat outside the mark that was meant
+    to contain them. So the mark is a frame around the turn — opened before
+    the first thing the turn produces, closed after the last — and everything
+    the reply did happens between the two rules.
+
+    Sized on resize rather than at construction: the rule has to reach the
+    full width of the transcript, and a widget does not know that width until
+    it has been laid out.
+    """
+
+    def __init__(self, label: str = "", **kwargs) -> None:
+        super().__init__("", **kwargs)
+        self._label = label
+        self._painted_at = 0
+
+    def _repaint(self) -> None:
+        width = self.content_size.width or self.size.width
+        if width <= 0 or width == self._painted_at:
+            return
+        self._painted_at = width
+
+        head = f" {self._label} " if self._label else " "
+        # 1 for "[", 2 for " ]".
+        fill = max(1, width - 1 - len(head) - 2)
+
+        line = Text()
+        line.append("[", style=screen_style("rule"))
+        if self._label:
+            line.append(head, style=screen_style("eyebrow"))
+        else:
+            line.append(head, style=screen_style("rule"))
+        line.append("─" * fill, style=screen_style("rule"))
+        line.append(" ]", style=screen_style("rule"))
+        self.update(line)
+
+    def on_mount(self) -> None:
+        self._repaint()
+
+    def on_resize(self) -> None:
+        self._repaint()
+
+
 class Painted(Static):
     """A block whose content comes from a rich renderable.
 
@@ -153,15 +199,12 @@ class Transcript(VerticalGroup):
         super().__init__(**kwargs)
         self._answer: Painted | None = None
         self._answer_text = ""
-        # Whether this turn has already been labelled. A tool call closes the
-        # open answer block, so a model that alternates prose and tools opens a
-        # new block every few lines — and heading each one restated the same
-        # word between every pair of tool rows. The label belongs to the turn,
-        # not to the fragment of it that happens to sit between two tools.
-        self._turn_labelled = False
-        # Whether the block currently open carries the label, so the final
-        # repaint reproduces what streaming drew rather than growing one.
-        self._answer_labelled = False
+        # Whether a frame is open around the turn in progress. A tool call
+        # closes the answer block, so a model that alternates prose and tools
+        # opens a new one every few lines. Marking each of those said the same
+        # word between every pair of tool rows and still left the tools
+        # themselves outside the mark. The boundary belongs to the turn.
+        self._framed = False
 
     # ---- rows -------------------------------------------------------------
 
@@ -185,13 +228,30 @@ class Transcript(VerticalGroup):
         self.scroll_end(animate=False)
 
     def add_prompt(self, text: str) -> None:
-        # A new prompt is a new turn, and the next answer block earns a label
-        # again. Reset here rather than in `end_answer`: that runs on every
-        # tool call, which is the thing being coalesced.
-        self._turn_labelled = False
         self._append(
             Static(Text(text, style=render.ZINC_50), classes="row prompt")
         )
+
+    def open_frame(self) -> None:
+        """Open the turn's frame, once, before its first output.
+
+        Called from both the first text delta and the first tool call, because
+        either can come first — a turn that opens with a tool must not have
+        that tool land above its own frame.
+        """
+        if self._framed:
+            return
+        self._framed = True
+        self._append(
+            FrameRule(render.eyebrow("andromeda"), classes="row frame")
+        )
+
+    def close_frame(self) -> None:
+        """Close it. Safe to call when none is open."""
+        if not self._framed:
+            return
+        self._framed = False
+        self._append(FrameRule(classes="row frame"))
 
     def add_note(self, text: str, tone: str = "muted") -> Static:
         """Append a note and return it so one-shot reveals can repaint it."""
@@ -233,24 +293,9 @@ class Transcript(VerticalGroup):
             block.append(f"\n{hint}", style=screen_style("muted"))
         self._append(Static(block, classes="row error"))
 
-    def _answer_block(self, text: str, labelled: bool, streaming: bool = False):
-        """One answer segment, headed only if it opens the turn.
-
-        `[ A N D R O M E D A ]` says whose words these are, which is worth
-        saying once where the answer starts. Repeating it above every fragment
-        between two tool calls says nothing the reader did not already know and
-        breaks a single reply into a stack of unrelated-looking boxes.
-        """
-        body = render.expand_charts(text, streaming=streaming)
-        if not labelled:
-            return body
-        return Group(
-            Text(
-                f"[ {render.eyebrow('andromeda')} ]",
-                style=screen_style("eyebrow"),
-            ),
-            body,
-        )
+    def _answer_block(self, text: str, streaming: bool = False):
+        """One segment of prose. Unheaded — `FrameRule` marks the turn."""
+        return render.expand_charts(text, streaming=streaming)
 
     # ---- the streaming answer ---------------------------------------------
 
@@ -265,13 +310,8 @@ class Transcript(VerticalGroup):
         already used it.
         """
         if self._answer is None:
-            labelled = not self._turn_labelled
-            self._turn_labelled = True
-            self._answer_labelled = labelled
             self._answer = Painted(
-                lambda: self._answer_block(
-                    self._answer_text, labelled, streaming=True
-                ),
+                lambda: self._answer_block(self._answer_text, streaming=True),
                 classes="row answer",
             )
             self._answer_text = ""
@@ -286,15 +326,10 @@ class Transcript(VerticalGroup):
             # actually is: at the end of the turn it is content, not a chart
             # halfway through arriving.
             answer_text = self._answer_text
-            labelled = self._answer_labelled
             # Bind the completed segment. Pointing every finished block back
             # at `self._answer_text` made an old response repaint with a later
             # response whenever the shared hero/chat flow resized.
-            self._answer.source = (
-                lambda text=answer_text, header=labelled: self._answer_block(
-                    text, header
-                )
-            )
+            self._answer.source = lambda text=answer_text: self._answer_block(text)
         self._answer.repaint()
         self.scroll_end(animate=False)
 

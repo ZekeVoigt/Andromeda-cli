@@ -156,6 +156,9 @@ class AndromedaApp(App):
     #transcript .tool, #transcript .tool-result, #transcript .note {
         margin-bottom: 0;
     }
+    /* The rules that open and close a turn. They must reach the full width,
+       so no horizontal padding of their own. */
+    #transcript .frame { height: 1; margin: 0 0 1 0; padding: 0; }
 
     #activity {
         height: auto; margin: 0 3; padding: 0 1; display: none;
@@ -466,12 +469,16 @@ class AndromedaApp(App):
             transcript.add_prompt(event.prompt)
 
         elif isinstance(event, ev.TextDelta):
+            transcript.open_frame()
             transcript.feed_answer(event.text)
 
         elif isinstance(event, ev.ToolStarted):
             # The answer block is closed here and the next one opens on the
             # next delta, so prose the model wrote before a tool stays above
             # the tool line and prose it writes after stays below.
+            # Opened here as well as on the first delta: a turn whose first
+            # act is a tool call must not put that call above its own frame.
+            transcript.open_frame()
             transcript.end_answer()
             transcript.add_tool(event.summary, event.tier)
             self.activity.start_tool(event.summary)
@@ -499,16 +506,20 @@ class AndromedaApp(App):
         elif isinstance(event, ev.TurnFinished):
             transcript.end_answer()
             self._report_still_running(event, transcript)
+            transcript.close_frame()
             self._finish_turn()
 
         elif isinstance(event, ev.TurnFailed):
             transcript.end_answer()
             transcript.add_error(event.message, event.hint)
+            # Inside the frame: the failure is what this turn produced.
+            transcript.close_frame()
             self._finish_turn()
 
         elif isinstance(event, ev.TurnInterrupted):
             transcript.end_answer()
             transcript.add_note("interrupted")
+            transcript.close_frame()
             self._finish_turn()
 
         elif isinstance(event, ev.Notice):

@@ -418,11 +418,25 @@ class TestTheScreen:
         app = _app(tmp_path, script=["Hello back"])
         async with app.run_test() as pilot:
             app.driver.submit("Hello there")
-            await _settle(pilot, app, lambda: not app.driver.busy)
+            # Settle on the closing rule rather than on `busy`: the flag drops
+            # when the worker finishes, which is before the tick that drains
+            # `TurnFinished` and draws the end of the frame.
+            await _settle(pilot, app, lambda: len(_frames(app)) == 2)
             prompt = app.query_one(Transcript).query_one(".prompt")
 
             assert str(prompt.visual) == "Hello there"
-            assert "[ A N D R O M E D A ]" in _painted(app)
+
+            # The label lives on the frame that opens the turn, not on the
+            # prose — a reply is its text and the tools it called, and the
+            # bracket has to be able to contain both.
+            frames = _frames(app)
+            assert len(frames) == 2, "one rule opens the turn, one closes it"
+            assert "A N D R O M E D A" in frames[0]
+            assert "A N D R O M E D A" not in frames[1]
+            for rule in frames:
+                assert rule.startswith("[") and rule.endswith("]")
+
+            assert "A N D R O M E D A" not in _painted(app)
             assert "INPUT" not in str(prompt.visual)
             assert "OUTPUT" not in _painted(app)
             assert "YOUR MESSAGE" not in AndromedaApp.CSS.upper()
@@ -456,9 +470,14 @@ class TestTheScreen:
             positions = []
 
             for index in range(12):
+                # The frame is part of a turn's height, so a test about how
+                # fast turns push the hero out has to build turns the way
+                # `_handle` does rather than prose alone.
                 app.transcript.add_prompt(f"Question {index}")
+                app.transcript.open_frame()
                 app.transcript.feed_answer(f"Answer {index}\nwith one more line")
                 app.transcript.end_answer()
+                app.transcript.close_frame()
                 await pilot.pause()
                 positions.append(app.conversation_scroll.scroll_y)
 
@@ -963,6 +982,16 @@ def _classes(app) -> list[str]:
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
+def _frames(app) -> list[str]:
+    """The rules that open and close a turn, escape codes stripped."""
+    transcript = app.query_one(Transcript)
+    return [
+        ANSI.sub("", str(w.visual))
+        for w in transcript.children
+        if w.has_class("frame")
+    ]
+
+
 def _painted(app) -> str:
     """What the answer block actually shows, escape codes stripped."""
     transcript = app.query_one(Transcript)
@@ -1058,44 +1087,63 @@ class TestBothSurfacesOpenTheSame:
         assert str(tmp_path) not in updates
 
 
-def test_one_label_per_turn_not_one_per_tool_gap():
-    """A reply broken up by tool calls is still one reply.
+def test_the_frame_encloses_the_tools_a_reply_used():
+    """A reply is its prose AND the tools it called, inside one bracket.
 
-    Every `ToolStarted` closes the open answer block, so a model that
-    alternates prose and tools opens a new one every few lines. Heading each
-    of them printed `[ A N D R O M E D A ]` between every pair of tool rows,
-    which reads as several separate answers rather than one.
+    `ToolStarted` closes the open answer block, so a turn is a stack of prose
+    fragments with tool rows between them. Marking a fragment leaves the tools
+    outside the mark; the boundary has to be the turn.
     """
-    from andromeda_tui.widgets import Transcript
+    from andromeda_tui.widgets import FrameRule, Transcript
 
     transcript = Transcript.__new__(Transcript)
-    transcript._answer = None
-    transcript._answer_text = ""
-    transcript._turn_labelled = False
-    transcript._answer_labelled = False
+    transcript._framed = False
+    mounted: list = []
+    transcript._append = mounted.append
 
-    def rendered(text: str, labelled: bool) -> str:
-        from rich.console import Console
+    # Either a delta or a tool call may come first; whichever does opens it.
+    transcript.open_frame()
+    transcript.open_frame()
+    transcript.open_frame()
+    assert len(mounted) == 1, "the frame opens once, however many times asked"
+    assert isinstance(mounted[0], FrameRule)
 
-        console = Console(width=60, force_terminal=False, highlight=False)
-        with console.capture() as captured:
-            console.print(transcript._answer_block(text, labelled))
-        return captured.get()
+    transcript.close_frame()
+    transcript.close_frame()
+    assert len(mounted) == 2, "and closes once"
 
-    # First segment of the turn is labelled...
-    assert transcript._turn_labelled is False
-    first = not transcript._turn_labelled
-    transcript._turn_labelled = True
-    assert first is True
+    # The opening rule is labelled and the closing one is not.
+    assert mounted[0]._label
+    assert not mounted[1]._label
 
-    # ...every later segment of the same turn is not.
-    for _ in range(3):
-        assert (not transcript._turn_labelled) is False
+    # A new turn opens a fresh frame.
+    transcript.open_frame()
+    assert len(mounted) == 3
 
-    # A new prompt starts a new turn, and the label comes back.
-    transcript._turn_labelled = False
-    assert (not transcript._turn_labelled) is True
 
-    # And the header only exists in the labelled rendering.
-    assert "A N D R O M E D A" in rendered("hello", True)
-    assert "A N D R O M E D A" not in rendered("hello", False)
+def test_the_frame_rule_spans_the_full_width():
+    """A bracket that stops halfway is a dash, not a frame."""
+    from rich.console import Console
+    from andromeda_tui.widgets import FrameRule
+
+    rule = FrameRule.__new__(FrameRule)
+    rule._label = "A N D R O M E D A"
+    rule._painted_at = 0
+    painted: list = []
+    rule.update = painted.append
+
+    class _Size:
+        width = 60
+
+    type(rule).content_size = property(lambda self: _Size())
+    rule._repaint()
+
+    console = Console(width=80, force_terminal=False, highlight=False)
+    with console.capture() as captured:
+        console.print(painted[0])
+    line = captured.get().rstrip("\n")
+
+    assert line.startswith("[")
+    assert line.endswith("]")
+    assert len(line) == 60
+    assert "A N D R O M E D A" in line
