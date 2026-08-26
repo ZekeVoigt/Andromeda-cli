@@ -29,9 +29,13 @@ import time
 from pathlib import Path
 from typing import Any, Protocol
 
+from . import cloud as cloud_module
 from . import delivery as delivery_module
+from . import hooks
 from . import monitor as monitor_module
 from . import scripts as scripts_module
+from andromeda_tools import tier_rank
+
 from .errors import AgentError
 from .notepad import Notepad
 from .schedule import Job, Run, Schedule
@@ -122,7 +126,45 @@ def execute(
     build: Builder,
     notepad: Notepad | None = None,
 ) -> Run:
-    """Run the job once and return what happened. Never raises."""
+    """Run the job once and return what happened. Never raises.
+
+    The two lifecycle events are fired here rather than inside `_execute`,
+    which returns from four places: a hook that only saw the ordinary ending
+    would miss exactly the runs someone set it up to watch — the suppressed
+    ones and the failed ones.
+    """
+    kind = "script" if job.no_agent else "agent"
+    hooks.fire(
+        "on_job_start",
+        job_id=job.id,
+        job_name=job.name,
+        kind=kind,
+        scheduled_for=job.next_run_at,
+    )
+    started = time.monotonic()
+    run = _execute(job, schedule, config, home, build=build, notepad=notepad)
+    hooks.fire(
+        "on_job_end",
+        job_id=job.id,
+        job_name=job.name,
+        kind=kind,
+        scheduled_for=job.next_run_at,
+        status=run.status,
+        duration_ms=round((time.monotonic() - started) * 1000, 3),
+        output_chars=len(run.summary or ""),
+    )
+    return run
+
+
+def _execute(
+    job: Job,
+    schedule: Schedule,
+    config: dict[str, Any],
+    home: Path,
+    *,
+    build: Builder,
+    notepad: Notepad | None = None,
+) -> Run:
     started = time.time()
     late = job.lateness(started)
     notepad = notepad or Notepad(Path(home) / "cron" / "notepad.json")
@@ -306,8 +348,37 @@ def _agent_job(
             name for name in config.get("enabled_tools", []) if name in set(job.enabled_tools)
         ]
 
+    # The third term of the intersection, applied last and unconditionally.
+    # `Schedule.add` already refuses a belt that names a forbidden tool, so at
+    # this point there should be nothing left to remove — which is exactly why
+    # it runs anyway. A store edited by hand, a job restored from a backup
+    # written before this shipped, or a future caller that forgets all reach
+    # here, and the ceiling has to hold for each of them. It can only subtract.
+    settings["enabled_tools"] = cloud_module.narrow_tools(
+        settings.get("enabled_tools", config.get("enabled_tools", [])),
+        job.runs_on,
+        job.workspace_kind,
+    )
+    ceiling = cloud_module.max_tier_for(job.runs_on)
+    if ceiling is not None and tier_rank(ceiling) < tier_rank(settings.get("max_tier", ceiling)):
+        # Clamped rather than set: a machine already stricter than the cloud
+        # ceiling keeps its own answer. Narrowing must never be a way to widen.
+        settings["max_tier"] = ceiling
+
+    # A detached job is told, in the prompt, that it has no files. Without it
+    # the model spends its first tool call discovering the workspace is empty
+    # and its second explaining that it cannot find anything — and on a job
+    # that fires hourly that is the whole cost of the run, forever.
+    workspace = "" if job.workspace_kind == "detached" else job.workspace
+    if job.workspace_kind == "detached":
+        prompt = (
+            "You have no filesystem in this run — no workspace, no files to "
+            "read or write. Work from the network, your notepad and your "
+            "memory.\n\n---\n\n" + prompt
+        )
+
     try:
-        conversation = build(settings, job.workspace, job)
+        conversation = build(settings, workspace, job)
         answer = conversation.send(prompt)
     except AgentError as exc:
         return _failed(job, str(exc), started)

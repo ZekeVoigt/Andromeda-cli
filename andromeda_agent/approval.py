@@ -174,6 +174,11 @@ class ApprovalRequest:
     # So the prompt can offer to stop asking, without the surface having to
     # reach back into the policy for it.
     allowlist: Allowlist | None = None
+    # Why this call is at the gate when the policy would have let it past —
+    # set when a hook escalated it. Shown at the prompt: a question that
+    # appears for no visible reason is a question people answer without
+    # reading.
+    reason: str | None = None
 
 
 # What a prompt can answer.

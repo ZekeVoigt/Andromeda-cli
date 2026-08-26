@@ -141,6 +141,36 @@ you, and a pipe never sees them.
 A server that fails to start is recorded and reported, never fatal: the others
 still work, and its stderr is in `andromeda mcp`.
 
+### Tools the model finds rather than tools it is handed
+
+Every tool in the array is paid for on every request, used or not. Thirty
+built-in tools is worth it. Connect three MCP servers and it is four hundred
+tools, most of which this session will never call — and that bill arrives on
+every turn of every conversation.
+
+So MCP tools are not listed. Three bridge tools stand in for all of them:
+`tool_search` finds a capability by description, `tool_describe` loads one
+tool's parameters, `tool_call` invokes it. **Built-in tools never defer** —
+hiding those would make the agent slower at everything it does most.
+
+The bridge carries a listing of what is deferred, because a bridge without one
+produces a model that does not know what it does not know, and says a
+capability is unavailable rather than searching for it. How dense that listing
+is depends on what fits: a name and a line each, then names only, then a count
+per server for a catalogue whose names alone would not fit. It degrades rather
+than truncating — half a catalogue looks like a whole one.
+
+A call through the bridge takes the ordinary path: same policy, same approval
+prompt, same hooks. It changes what the model can see, never what it may do.
+Calling a deferred tool without its required arguments hands back the schema
+instead of a failure from inside the tool, which is the difference between one
+round trip and a loop.
+
+```yaml
+tool_search: auto                  # auto | on | off
+tool_search_listing_tokens: 4000   # 0 never embeds a listing
+```
+
 ## Background processes
 
 `terminal` blocks and kills its process tree on timeout, which is right for
@@ -163,8 +193,11 @@ REPL kills them — a session should not end with a dev server holding a port.
 ## Skills
 
 Read from the existing `skills/` directory — `skills/<name>/SKILL.md`, the same
-format the desktop app uses. Discovery checks `ANDROMEDA_BUNDLED_SKILLS_DIR`,
-then walks up from the workspace, then `~/.andromeda-cli/skills`.
+format the desktop app uses. Three layers, and they **stack**: what shipped
+with the install, then your own `~/.andromeda-cli/skills`, then the first
+`skills/` found walking up from the workspace. The nearest layer wins a name
+collision and everything else is still there — a project that ships one skill
+does not hide your library. `ANDROMEDA_BUNDLED_SKILLS_DIR` replaces the lot.
 
 Only names and one-line descriptions go into the prompt; bodies are loaded on
 demand with `skill_load`. A skill whose required binaries are missing is marked
@@ -172,6 +205,82 @@ unavailable, and loading it says so before the instructions — otherwise the
 agent follows steps that cannot work and reports a failure you have to decode.
 
 `/skills` lists them in the REPL.
+
+### The library keeps itself honest
+
+A skill library grows and never shrinks. The agent writes one for a job it does
+once, the job never comes back, and a year later the manifest in every prompt
+lists forty skills of which six are ever loaded.
+
+Every `skill_load` is recorded — when, and how often. From that, three states:
+**active**, **stale** (untouched for 30 days; still listed and still loadable),
+**archived** (untouched for 90; moved aside, not offered, not deleted).
+
+Two passes, and the split is the point.
+
+**The sweep** is arithmetic — dates against thresholds. It runs by itself when
+a session opens and a week has gone by, and it says so when anything moved.
+Four rules hold it up: only skills **the agent wrote**, only in your own
+`~/.andromeda-cli/skills`; a **pinned** skill is never touched; **nothing is
+ever deleted** — archive is a move, and `restore` is a move back; and a skill
+that has **never been used** gets a grace period, because that is absence of
+evidence, not evidence of staleness.
+
+**The review** reads the skills and proposes changes to what they *say* —
+two that should be one, a description that never triggers a load, instructions
+naming a tool that is gone. It costs a model call and it edits work you may
+care about, so it applies nothing: it writes proposals and you decide. An agent
+may propose; only a person grants.
+
+```bash
+andromeda curator status              # what is tracked, and its state
+andromeda curator sweep --dry-run
+andromeda curator review              # proposals, applied by nobody but you
+andromeda curator pin <name>          # never sweep this one
+andromeda curator restore <name>
+andromeda curator pause | resume
+```
+
+The first sight of an install never sweeps — it stamps the clock and waits one
+interval, because a library that predates this feature has no history and an
+immediate pass would read every skill as untouched since the epoch.
+
+### Skills are scanned before they are offered
+
+A skill is instructions that go into the model's context and a directory of
+files it may open. The realistic attack on this harness is not a malicious
+registry — there is no registry. It is a `skills/` directory that arrived with
+a repository somebody cloned. Nobody reads those; the agent reads them every
+session.
+
+So where a skill lives decides how much it has to prove:
+
+| Where | Trust | Allowed |
+|---|---|---|
+| shipped with this install | `builtin` | everything, unscanned |
+| `~/.andromeda-cli/skills` | `trusted` | anything but a `dangerous` verdict |
+| a workspace | `community` | only a `safe` verdict |
+
+The scan is regex over the text, structural checks (binaries, escaping
+symlinks, size), and a hunt for invisible characters — the ones that make what
+you read and what the model reads two different texts. A `critical` finding
+makes a skill **dangerous**, a `high` makes it **caution**, and medium/low
+never block anything on their own: a scanner that blocks on `subprocess.run`
+is a scanner people switch off.
+
+A withheld skill is never silently missing. `/skills` names it and says why.
+
+```bash
+andromeda skills list                # every skill, with its verdict
+andromeda skills scan <name>         # the actual lines that caused it
+andromeda skills trust <name>        # use it anyway
+andromeda skills untrust <name>
+```
+
+`trust` records your decision against the skill's **content hash**, so editing
+the skill puts it back behind the gate — what you accepted was the text you
+read, not the name it goes by. A skill can ship a `.skillignore` to keep
+development leftovers out of the scan; it can never exclude its own `SKILL.md`.
 
 ## Memory
 
@@ -295,9 +404,58 @@ all three slots hold lanes waiting for the browser.
 | Lane | Holds | Steps |
 |---|---|---|
 | `scout` | reads and the web; changes nothing | 12 |
+| `builder` | reads **and writes files**. No shell, no network | 16 |
 | `browser` | the browser, plus reads. One at a time | 20 |
 | `writer` | local reads only — no network at all | 10 |
 | `verifier` | reads, and cannot store what it concludes | 12 |
+
+### The Builder, and one working copy each
+
+`builder` is the lane that changes something. It reads and writes files and
+does nothing else — no shell and no network, deliberately: a shell can `cd`
+anywhere, and a lane holding one has confinement as a suggestion rather than a
+boundary. What it may touch is a closed list, so a tool added later is denied
+until somebody decides otherwise.
+
+Two lanes writing the same directory at the same time is the failure that has
+no symptom — the second one reads a file half-way through the first one's
+change and reports success against something that is already gone. So:
+
+```yaml
+worktree_isolation: true
+```
+
+Each lane then gets its own git worktree at `<repo>/.worktrees/lane-<id>` on
+branch `andromeda/lane-<id>`, branched from your current `HEAD`, and its tools
+are bound to that directory — the confinement check does the enforcing, not a
+sentence in its brief. Builders then run genuinely in parallel. **With the
+setting off, two builders take the working tree in turn**, the same way two
+browser lanes take the browser.
+
+Outside a git repository the setting is ignored and lanes share the directory
+exactly as before: a half-applied isolation is worse than none.
+
+The lane commits to its own branch and its report names the branch, the commit
+count and whether the tree is dirty — enough to merge it or go and read it. A
+copy holding **nothing** (no commits, clean tree) is removed automatically;
+anything holding work is kept.
+
+**Pruning requires proof.** If a git probe fails, the state is unknown, and
+unknown is not "clean": the copy is kept and the report says the numbers are
+unproven. The parent only ever sees that report, and a default of "0 commits,
+clean" reads as "the lane did nothing" for a tree that may hold an afternoon.
+
+```bash
+andromeda worktrees list          # what the lanes left, and what can go
+andromeda worktrees prune         # remove the ones holding nothing
+andromeda worktrees prune --dry-run
+```
+
+`prune` keeps anything with uncommitted edits to tracked files, with commits
+that exist nowhere else, or with untracked files — nobody else has those — and
+it keeps anything git would not answer a question about. It removes the tree
+before the branch, always: the other order orphans commits that were reachable
+a moment earlier.
 
 The browser is a single-occupancy surface, so only the browser lane may touch
 it. Two lanes driving one browser is worse than two in one mailbox, because
@@ -617,6 +775,27 @@ andromeda approvals forget <tool>
 andromeda approvals clear
 ```
 
+Two commands answer the questions the gate raises:
+
+```bash
+andromeda approvals test terminal        # what would happen, without running it
+andromeda approvals test terminal --mode auto
+andromeda approvals suggest              # what you have approved often enough
+andromeda approvals suggest --apply 1,2
+```
+
+`test` runs the **real** gate and reports the verdict and the rule that
+produced it — the ceiling, a belt, an override, a learned entry, the mode.
+Nothing is executed, nobody is prompted and nothing is written down, which is
+what makes it safe to point at `terminal`. It exits 0 for allowed, 2 for asks,
+3 for denied, so a script can ask too.
+
+`suggest` proposes; it never promotes. **A destructive or irreversible tool is
+never proposed however often it was approved** — approving `git status` twenty
+times says nothing about the next command the model puts through the same tool
+— and a tool that is withheld for that reason is named rather than quietly
+missing.
+
 **A learned entry is bound to the tier it was granted at.** Trust `terminal`
 while it is `destructive` and it stays trusted at `destructive` — if a tool's
 tier ever rises, the entry stops applying and the gate is back. A permission
@@ -626,6 +805,125 @@ Learned trust never widens itself: counts only drive a suggestion, promotion is
 always your explicit answer. It cannot reopen a ceiling, a belt, or a disabled
 tool, an explicit config override beats it, and it does not descend into a
 delegated lane.
+
+## Hooks
+
+A shell script at a lifecycle boundary. Hooks are how you make this harness
+follow your rules without forking it — block a command, rewrite an argument,
+send a call to the approval prompt that would otherwise have gone straight
+through, or just record what happened.
+
+They live in the `hooks:` block of `config.yaml`, one list per event:
+
+```yaml
+hooks:
+  pre_tool_call:
+    - command: ~/.andromeda-cli/hooks/guard.sh
+      matcher: terminal          # regex over the tool name; tool events only
+      timeout: 10                # seconds, 1-300, default 60
+      fail_closed: true          # a broken gate blocks instead of allowing
+  on_session_end:
+    - command: /usr/bin/env python3 ~/hooks/log-the-session.py
+```
+
+The script is handed one JSON object on stdin:
+
+```json
+{"hook_event_name": "pre_tool_call", "tool_name": "terminal",
+ "tool_input": {"command": "git push --force"}, "session_id": "01J…",
+ "cwd": "/Users/me/project", "extra": {"risk_tier": "destructive", "step": 3}}
+```
+
+and may print one JSON object on stdout to change what happens next:
+
+| stdout | effect |
+| --- | --- |
+| `{"action": "block", "message": "…"}` | the call does not run; the message is what the model reads |
+| `{"action": "modify", "args": {…}}` | the named arguments are replaced, then the call proceeds |
+| `{"action": "approve", "message": "…"}` | the call goes to the approval prompt even if the policy allowed it |
+| `{"context": "…"}` | `pre_llm_call` only — text added to this turn's user message |
+| `{"output": "…"}` | `transform_*` only — replaces the text passing through |
+| nothing | an observer; the run continues untouched |
+
+`{"decision": "block", "reason": "…"}` and `{"decision": "modify",
+"tool_input": {…}}` are accepted too, so a script written for another harness
+works here. Exiting **2** blocks a `pre_tool_call` whether or not anything was
+printed, which is all a one-line guard needs.
+
+### The events
+
+| event | when |
+| --- | --- |
+| `pre_tool_call` | a tool is about to run — the only event that can block |
+| `post_tool_call` | it finished, succeeded, failed or was blocked |
+| `transform_tool_result` | its output, on the way to the model |
+| `pre_llm_call` | a request is about to go to the model |
+| `post_llm_call` | a turn came back |
+| `transform_llm_output` | the final answer, on the way to you |
+| `on_session_start` / `on_session_end` / `on_session_reset` | a session opened, ended, or was cleared with `/new` |
+| `on_compaction` | the transcript was shortened, and what it cost |
+| `pre_approval_request` / `post_approval_response` | the gate opened, and what you answered |
+| `subagent_start` / `subagent_stop` | a delegated lane, with the tools it actually called |
+| `pre_command` | a slash command was typed |
+| `on_job_start` / `on_job_end` | a scheduled job ran |
+
+### Consent
+
+A hook runs a command on your machine with your credentials, from a file a
+`git pull` can change under you. So each `(event, command)` pair is approved
+once, at a prompt, and:
+
+- the approval records the script's **mtime**, and `andromeda hooks doctor`
+  tells you when the file has changed since — the approval was for the script
+  you read, not for the path it sits at;
+- a run with no terminal registers **nothing** unless you opt in with
+  `--accept-hooks`, `ANDROMEDA_ACCEPT_HOOKS=1`, or `hooks_auto_accept: true`.
+  A scheduled job is not the moment a new script first executes;
+- `ANDROMEDA_SAFE_MODE=1` skips hooks entirely, along with everything else you
+  configured — it is the "is it me or is it my config" switch.
+
+```bash
+andromeda hooks list                 # what is configured, and whether it may run
+andromeda hooks doctor               # check every hook without waiting for a session
+andromeda hooks test pre_tool_call --for-tool terminal
+andromeda hooks revoke ~/.andromeda-cli/hooks/guard.sh
+```
+
+`test` and `doctor` execute the script, so neither will touch a hook you have
+not approved yet — the reason to run `doctor` on a config you just pulled is to
+see what is *about to* register, and running those scripts to tell you about
+them would already have done the thing you were checking for.
+
+### Failing
+
+Hooks fail **open**: a missing script, a timeout or unreadable output is logged
+and contributes nothing, because a broken hook must not be able to stop you
+working. `fail_closed: true` inverts that for `pre_tool_call`, which is what a
+secret scanner or a policy check wants — a gate that crashed has not granted
+permission. A hook that times out has its whole process tree taken down; one
+that finishes keeps whatever it started, so `some-daemon &` still works.
+
+## Stopping
+
+```bash
+andromeda pause --reason "deploying by hand"
+andromeda resume
+```
+
+Holds the scheduler. **New work only** — a job half-way through is not made
+safer by being killed mid-write — and **never your own terminal**: a REPL, a
+one-shot and an editor session are a person asking for something while watching
+the answer, and a stop button that takes those away is a stop button you cannot
+use to find out what is wrong.
+
+It is a file (`~/.andromeda-cli/PAUSED`), so anything can set it: another
+terminal, a script, a `touch` over SSH from a phone. An empty file still pauses;
+the JSON inside is a courtesy. **An unreadable sentinel counts as paused** —
+failing open would lift somebody's emergency stop at exactly the moment the
+filesystem is misbehaving, which is the moment they engaged it.
+
+A paused install says so in `andromeda doctor` and at the top of a session,
+because the alternative is a scheduler that looks healthy and fires nothing.
 
 ## Moving to another machine
 
@@ -891,6 +1189,93 @@ asserting on phrasing gives you a suite that fails on a synonym and passes on a
 lie.
 
 They cost money, which is the point: a mocked eval measures the mock.
+
+### Repeat, compare, and run them at once
+
+```bash
+andromeda eval --repeat 5          # a pass rate, not a verdict
+andromeda eval --jobs 4
+andromeda eval report              # what moved since the last run
+andromeda eval runs
+```
+
+An agent is stochastic, and one run of a stochastic system is an anecdote.
+`--repeat` reports **n/m passed** and calls a scenario that passed some of the
+time **flaky** rather than rounding it to either answer — an intermittent
+behaviour is a real finding that a single run reports as fine or broken
+depending on the day. When a repeated scenario fails at all, the report shows
+the failing run, not the one that happened to work.
+
+Every run is saved, so `eval report` can say what changed: what **broke**, what
+was **fixed**, and what got **less reliable** without failing outright — 5/5 to
+3/5 is the earliest thing worth knowing, and a pass count on its own cannot say
+it. If the model changed between the two runs, the report says so first, since
+that is the likeliest explanation for everything under it.
+
+Checks also cover order and cost: `tools_in_order` asserts a subsequence ("it
+read the file before it wrote it") rather than an exact call list, `steps_under`
+bounds how many tool calls it took, and `file_matches` is a regex over a file.
+
+## Inside an editor
+
+```
+andromeda acp
+```
+
+Speaks the [Agent Client Protocol](https://agentclientprotocol.com) on stdin
+and stdout, so an editor that has adopted it — Zed and the others — can drive
+this harness as its agent. Point the editor's ACP agent configuration at that
+command. The editor owns the window; this owns the turn.
+
+While a turn runs the editor sees the answer as it arrives, each tool call with
+its title and how it ended, and the todo list as a plan. The approval gate is
+asked **through** the editor: same policy, same tiers, same learned approvals,
+in a dialog instead of a terminal. Anything that is not one of the four answers
+— a cancelled dialog, a closed window — is a refusal, because the alternative
+is a tool that runs when nobody answered.
+
+Written against the wire rather than an SDK, for the same reason the MCP client
+is: the protocol is versioned and a few hundred lines, and a dependency is one
+whose next release breaks every session.
+
+**Nothing else may write to stdout while it runs** — the protocol is the
+stream. Every console this program owns is pointed at stderr for the duration,
+which is where an editor's log looks anyway.
+
+## Completion
+
+```bash
+eval "$(andromeda completion bash)"    # ~/.bashrc
+eval "$(andromeda completion zsh)"     # ~/.zshrc
+andromeda completion fish | source     # fish config
+```
+
+Generated from the program's own argument parser, so it cannot go stale — a
+hand-kept list is wrong the first time somebody adds a command, and the symptom
+is a tab that does nothing, which reads as "completion is not installed".
+Profile names are completed from disk after `-p`.
+
+## The same job over many inputs
+
+```bash
+andromeda batch tickets.jsonl --prompt "Classify this ticket: {body}"
+andromeda batch tickets.jsonl --resume
+andromeda batch --show tickets.jsonl.results.jsonl --failures
+```
+
+A shell loop does this too, and then the laptop sleeps at item 137 and you have
+no idea which ones finished. So the unit here is the **ledger**: every row's
+answer is appended to a JSONL the moment it exists, and `--resume` skips what is
+already in it.
+
+Each row gets its own conversation, so nothing one row says can reach the next
+— that costs the prompt cache and buys the only property that makes two rows'
+answers comparable. A row that fails is recorded as a failure and the batch
+carries on; `--resume` then retries only those. `--dry-run` shows what would
+run and spends nothing.
+
+A row's `id` is what a resume matches on. Rows without one are matched by line
+number, so reordering the file between runs breaks a resume — give them ids.
 
 ## Configuration
 

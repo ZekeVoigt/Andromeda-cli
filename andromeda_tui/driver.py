@@ -211,6 +211,9 @@ class AgentDriver:
                 "tool": request.spec.name,
                 "tier": request.spec.risk_tier,
                 "summary": request.summary,
+                # Set when a hook escalated a call the policy would have
+                # allowed; the screen shows it under the summary.
+                "reason": getattr(request, "reason", None) or "",
                 # >0 means "you have approved this N times"; the screen offers
                 # to stop asking. The suggestion never widens anything by
                 # itself — promotion is always the explicit answer.

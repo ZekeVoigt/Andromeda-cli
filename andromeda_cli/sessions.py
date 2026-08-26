@@ -56,6 +56,10 @@ class Session:
     messages: list[dict[str, Any]] = field(default_factory=list)
     # Serialised checkpoint stack, so resuming restores the ability to rewind.
     checkpoints: list[dict[str, Any]] = field(default_factory=list)
+    # Tokens this session has spent. Kept on the transcript rather than in the
+    # index because the index is derived and may be rebuilt at any time — and a
+    # token count is the one thing that cannot be recovered from a transcript.
+    usage: dict[str, Any] = field(default_factory=dict)
 
     @property
     def title(self) -> str:
@@ -79,6 +83,7 @@ class Session:
             "workspace": self.workspace,
             "messages": self.messages,
             "checkpoints": self.checkpoints,
+            "usage": self.usage,
         }
 
     @classmethod
@@ -98,6 +103,7 @@ class Session:
             checkpoints=(
                 raw["checkpoints"] if isinstance(raw.get("checkpoints"), list) else []
             ),
+            usage=raw["usage"] if isinstance(raw.get("usage"), dict) else {},
         )
 
     def save(self) -> Path:

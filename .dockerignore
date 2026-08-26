@@ -1,0 +1,9 @@
+# The build context is `cli/`. Everything below either cannot work in the image
+# or should not be baked into it.
+.venv
+**/__pycache__
+**/*.pyc
+tests
+install
+*.egg-info
+docker

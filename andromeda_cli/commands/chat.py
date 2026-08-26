@@ -17,7 +17,7 @@ from andromeda_agent import AgentError, Callbacks, OutOfCredit, build_provider
 from andromeda_tools import ToolResult, ToolSpec
 
 from .. import output, render
-from ..session import build_conversation, set_lane_announcer
+from ..session import build_conversation, ended as session_ended, set_lane_announcer
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -42,12 +42,14 @@ def one_shot(prompt: str, config: dict[str, Any], workspace_root: str | None = N
         config, provider, interactive=False, workspace_root=workspace_root
     )
 
+    completed = False
     try:
         # Rendered when a person is watching; raw text when redirected, so
         # `andromeda "..." > out.md` produces markdown rather than a
         # screenshot of markdown.
         with render.AnswerStream() as stream:
             conversation.send(prompt, _callbacks(stream))
+        completed = True
     except OutOfCredit as exc:
         sys.stdout.flush()
         output.agent_error(exc)
@@ -59,6 +61,10 @@ def one_shot(prompt: str, config: dict[str, Any], workspace_root: str | None = N
     except KeyboardInterrupt:
         sys.stdout.flush()
         return EXIT_INTERRUPTED
+    finally:
+        # In `finally`, so an interrupted or failed one-shot still reports its
+        # ending — with `completed` saying which it was.
+        session_ended(conversation, completed=completed)
 
     if not render.rendering_enabled():
         sys.stdout.write("\n")
@@ -80,6 +86,9 @@ def _callbacks(stream: "render.AnswerStream") -> Callbacks:
         on_tool_denied=lambda spec, reason: output.err_console.print(
             f"[dim]✗ {spec.name}: {reason}[/dim]"
         ),
+        # Also stderr: a pipe that waited thirty seconds should say why in the
+        # place a person is watching, without putting it in the captured answer.
+        on_retry=lambda reason: output.err_console.print(f"[dim]… {reason}[/dim]"),
     )
 
 

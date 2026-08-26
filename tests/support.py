@@ -43,6 +43,11 @@ class ScriptedProvider:
             raise self.raises
 
         step = self.script.pop(0) if self.script else ""
+        # An exception in the script raises when that turn is reached, which is
+        # how a test scripts a failure *part way through* rather than from the
+        # first call — `raises` is all-or-nothing.
+        if isinstance(step, BaseException):
+            raise step
         turn = AssistantTurn(content=step) if isinstance(step, str) else step
 
         if turn.content:

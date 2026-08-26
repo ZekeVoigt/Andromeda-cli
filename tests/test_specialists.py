@@ -151,3 +151,46 @@ class TestBrowserIsOneSurface:
         assert SPECIALISTS["browser"].max_turns == max(
             belt.max_turns for belt in SPECIALISTS.values()
         )
+
+
+class TestBuilder:
+    """The one belt that changes anything."""
+
+    def test_it_can_write_files(self, registry):
+        belt = SPECIALISTS["builder"]
+        assert belt.admits(registry["write_file"])
+        assert belt.admits(registry["patch"])
+
+    def test_it_can_still_read(self, registry):
+        belt = SPECIALISTS["builder"]
+        assert belt.admits(registry["read_file"])
+        assert belt.admits(registry["search_files"])
+        assert belt.admits(registry["list_dir"])
+
+    def test_it_has_no_shell(self, registry):
+        """A shell can `cd` anywhere, so a lane holding one has isolation as a
+        suggestion rather than a boundary."""
+        assert not SPECIALISTS["builder"].admits(registry["terminal"])
+
+    def test_it_cannot_reach_the_network(self, registry):
+        belt = SPECIALISTS["builder"]
+        for name in ("web_fetch", "web_search"):
+            spec = registry.get(name)
+            if spec is not None:
+                assert not belt.admits(spec)
+
+    def test_it_cannot_delegate_further(self, registry):
+        spec = registry.get("delegate")
+        if spec is not None:
+            assert not SPECIALISTS["builder"].admits(spec)
+        assert SPECIALISTS["builder"].can_spawn is False
+
+    def test_it_is_the_only_belt_that_writes_the_tree(self):
+        writers = [belt.id for belt in SPECIALISTS.values() if belt.writes_tree]
+        assert writers == ["builder"]
+
+    def test_every_other_belt_still_refuses_to_write(self, registry):
+        for belt in SPECIALISTS.values():
+            if belt.id == "builder":
+                continue
+            assert not belt.admits(registry["write_file"]), belt.id

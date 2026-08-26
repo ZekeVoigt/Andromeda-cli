@@ -43,8 +43,21 @@ class Terminal:
         threading.Thread(target=send, daemon=True).start()
 
     def close(self) -> None:
-        self.reader.close()
-        os.close(self.controller)
+        """Give the pty back, whichever end already went.
+
+        Tolerant on purpose: one of these tests closes the controller as the
+        thing under test, and on Linux the follower is unusable afterwards —
+        closing it then raises EBADF and turns a passing test into a teardown
+        error.
+        """
+        try:
+            self.reader.close()
+        except OSError:
+            pass
+        try:
+            os.close(self.controller)
+        except OSError:
+            pass
 
 
 @pytest.fixture
@@ -117,12 +130,45 @@ class TestChoosing:
         assert choose(terminal, b"s", b"\r", skippable=False) == 0
 
     def test_end_of_input_is_not_an_answer(self, terminal):
-        """A closed terminal must never be read as agreeing to the default."""
+        """A closed terminal must never be read as agreeing to the default.
+
+        The two platforms disagree about how a pty reports this, and the
+        chooser has to answer the same way to both: macOS gives EOF from the
+        read, Linux raises EIO from `tcgetattr` before the read happens. The
+        second escaped the handler for a while, because `termios.error` is not
+        an `OSError` — so this returned None on one platform and a traceback
+        on the other.
+        """
         os.close(terminal.controller)
         result = prompt._choose_by_key(terminal.reader, OPTIONS, default=0, skippable=True)
         assert result is None
         # Already closed; stop the fixture closing it twice.
         terminal.controller = os.open(os.devnull, os.O_RDWR)
+
+
+    def test_a_terminal_that_cannot_be_configured_is_not_an_answer(self, terminal):
+        """The Linux shape of the same rule, provoked directly.
+
+        `termios.error` is not a subclass of `OSError`, so a handler that
+        catches `OSError` alone lets it through — and a chooser that raises
+        where it should decline is a crash in front of a person who was only
+        being asked a question.
+        """
+        import termios as termios_module
+
+        def refuse(*_args, **_kwargs):
+            raise termios_module.error(5, "Input/output error")
+
+        original = termios_module.tcgetattr
+        termios_module.tcgetattr = refuse
+        try:
+            result = prompt._choose_by_key(
+                terminal.reader, OPTIONS, default=0, skippable=True
+            )
+        finally:
+            termios_module.tcgetattr = original
+
+        assert result is None
 
 
 #: The two flags the chooser borrows. Asserted on by name rather than by

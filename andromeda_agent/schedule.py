@@ -50,6 +50,7 @@ try:
 except ImportError:  # pragma: no cover - Windows
     fcntl = None
 
+from . import cloud as cloud_module
 from . import monitor as monitor_module
 from .models import THINKING_LEVELS
 
@@ -331,6 +332,20 @@ class Job:
     # unattended kind — see `Schedule.add`.
     origin: str = "user"
 
+    # Where the loop runs, and what it may touch. Two fields rather than one
+    # flag because the useful combinations are not the diagonal — `cloud.py`
+    # has the table. Both default to `device`, so every job that existed before
+    # this shipped loads unchanged and behaves identically.
+    runs_on: str = "device"
+    workspace_kind: str = "device"
+
+    # For `workspace_kind: repo`. The remote is stored and the branch is not:
+    # a branch name this job could carry is a branch name a prompt could set,
+    # and `repo.prepare` generates one per run instead. See `repo.py`.
+    repo_url: str = ""
+    repo_ref: str = ""
+    repo_branch_prefix: str = "andromeda"
+
     # Why it stopped, when it stopped itself. Distinct from `enabled=False`,
     # which is a person's decision and carries no reason.
     paused_reason: str = ""
@@ -451,6 +466,11 @@ class Job:
             "skills": list(self.skills),
             "attachTo": self.attach_to,
             "origin": self.origin,
+            "runsOn": self.runs_on,
+            "workspaceKind": self.workspace_kind,
+            "repoUrl": self.repo_url,
+            "repoRef": self.repo_ref,
+            "repoBranchPrefix": self.repo_branch_prefix,
             "pausedReason": self.paused_reason,
             "consecutiveFailures": self.consecutive_failures,
             "runs": [run.to_json() for run in self.runs],
@@ -474,6 +494,8 @@ class Job:
         kind = str(raw.get("monitorKind") or "")
         deliver = str(raw.get("deliver") or "none")
         origin = str(raw.get("origin") or "user")
+        runs_on = str(raw.get("runsOn") or "device")
+        workspace_kind = str(raw.get("workspaceKind") or "device")
         return cls(
             id=identifier,
             name=str(raw.get("name") or identifier),
@@ -509,6 +531,20 @@ class Job:
             # provenance reads as `agent`, the one that may not be widened
             # without a person saying so.
             origin=origin if origin in ORIGINS else "agent",
+            # Same rule as the approval mode, in the same direction, on the
+            # axis cloud added: a damaged field must never widen what a job may
+            # do, and `device` is the narrow answer on both. A corrupt
+            # `runsOn` that read as `cloud` would move a job onto hardware
+            # nobody granted it.
+            runs_on=runs_on if runs_on in cloud_module.RUN_LOCATIONS else "device",
+            workspace_kind=(
+                workspace_kind
+                if workspace_kind in cloud_module.WORKSPACE_KINDS
+                else "device"
+            ),
+            repo_url=str(raw.get("repoUrl") or ""),
+            repo_ref=str(raw.get("repoRef") or ""),
+            repo_branch_prefix=str(raw.get("repoBranchPrefix") or "andromeda"),
             paused_reason=str(raw.get("pausedReason") or ""),
             consecutive_failures=max(0, int(raw.get("consecutiveFailures") or 0)),
             runs=[Run.from_json(r) for r in (raw.get("runs") or []) if isinstance(r, dict)],
@@ -556,21 +592,65 @@ class Schedule:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
         self._jobs: dict[str, Job] = {}
+        # Why the last read failed, or "". Held rather than raised because a
+        # scheduler that refuses to start has stopped, and the jobs it already
+        # holds are still worth running — but it has to be *sayable*, because
+        # the failure it replaces is the worst kind. See `load`.
+        self.load_error = ""
         self.load()
 
     def load(self) -> None:
+        """Read the store, replacing what is held rather than merging into it.
+
+        Replacing matters for any long-lived process that re-reads — the hosted
+        runner does so on every fire, because jobs are added and removed by
+        other processes while it is asleep. Merging would keep a deleted job
+        alive in memory and let it be fired after somebody removed it, which is
+        the one thing a person expects `cron rm` to make impossible.
+
+        A file that cannot be read leaves the previous contents in place rather
+        than emptying the schedule — running the last known-good set beats
+        running nothing — and records **why**, because the alternative is the
+        worst failure this class can have.
+
+        Found on a real deployment: a management command run over `fly ssh`
+        executes as root and wrote `cron.json` 0600 root-owned. The runner runs
+        as an unprivileged user, its read raised `PermissionError`, and this
+        method swallowed it and left an empty store. The fire endpoint then
+        answered **"no such job"** for a job the operator could see in
+        `cron list` one command earlier.
+
+        That is the shape to avoid everywhere, not just here: *"I could not read
+        the store" must never be reported as "that thing does not exist."* A
+        missing file is genuinely an empty schedule. Anything else is an error
+        with a cause, and callers ask `load_error` before concluding a job is
+        absent.
+        """
         if not self.path.exists():
+            self._jobs = {}
+            self.load_error = ""
             return
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            # A corrupt schedule runs nothing rather than running something
-            # unpredictable. The file is left for a person to look at.
+        except OSError as exc:
+            self.load_error = (
+                f"{self.path} could not be read ({exc.strerror or exc}). The "
+                "jobs already loaded are still held; new ones are not visible."
+            )
             return
+        except json.JSONDecodeError as exc:
+            self.load_error = (
+                f"{self.path} is not valid JSON ({exc}). The last readable set "
+                "of jobs is still held."
+            )
+            return
+        self.load_error = ""
+        loaded: dict[str, Job] = {}
         for item in raw.get("jobs", []) if isinstance(raw, dict) else []:
             job = Job.from_json(item) if isinstance(item, dict) else None
             if job is not None:
-                self._jobs[job.id] = job
+                loaded[job.id] = job
+        self._jobs = loaded
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -608,6 +688,11 @@ class Schedule:
         skills: list[str] | None = None,
         attach_to: str = "",
         origin: str = "user",
+        runs_on: str = "device",
+        workspace_kind: str = "device",
+        repo_url: str = "",
+        repo_ref: str = "",
+        repo_branch_prefix: str = "andromeda",
     ) -> Job:
         canonical = parse_schedule(schedule)
         prompt = (prompt or "").strip()
@@ -617,6 +702,27 @@ class Schedule:
             raise ScheduleError(f"deliver must be one of {', '.join(DELIVERY_MODES)}.")
         if origin not in ORIGINS:
             raise ScheduleError(f"origin must be one of {', '.join(ORIGINS)}.")
+
+        # Where it runs, checked before anything else about what it does,
+        # because the location decides which of the checks below even apply.
+        guard = cloud_module.location_refusal(runs_on, workspace_kind, workspace)
+        if guard:
+            raise ScheduleError(guard)
+
+        if workspace_kind == "repo":
+            # Validated at creation, where a person can read the answer, rather
+            # than at 3am as a clone failure in a container.
+            from .repo import RepoError, validate_remote
+
+            try:
+                repo_url = validate_remote(repo_url)
+            except RepoError as exc:
+                raise ScheduleError(str(exc)) from None
+        elif repo_url:
+            raise ScheduleError(
+                "A remote was given but this job's workspace is not a repo. "
+                "Pass `--repo <url>` to make it one, or drop the remote."
+            )
 
         if no_agent:
             if not script:
@@ -671,6 +777,25 @@ class Schedule:
                 "<id> --approval auto` if they agree."
             )
 
+        # The same rule on the second axis. Refused at *every* approval mode,
+        # not just `auto`: on a hosted runner the location is itself the grant,
+        # because even a read-only job spends the person's credit on a schedule
+        # while they are asleep.
+        if origin == "agent":
+            guard = cloud_module.agent_origin_refusal(runs_on)
+            if guard:
+                raise ScheduleError(guard)
+
+        # A named tool the location forbids is refused, never quietly dropped.
+        # Silently narrowing what somebody typed produces a job that
+        # mysteriously does nothing, which is the failure this whole axis
+        # exists to prevent.
+        guard = cloud_module.tools_refusal(
+            enabled_tools or [], runs_on, workspace_kind
+        )
+        if guard:
+            raise ScheduleError(guard)
+
         guard = lifecycle_refusal(prompt, script)
         if guard:
             raise ScheduleError(guard)
@@ -703,6 +828,11 @@ class Schedule:
             skills=[i for i in (skills or []) if i],
             attach_to=attach_to,
             origin=origin,
+            runs_on=runs_on,
+            workspace_kind=workspace_kind,
+            repo_url=repo_url,
+            repo_ref=repo_ref,
+            repo_branch_prefix=repo_branch_prefix or "andromeda",
         )
         job.schedule_next()
         self._jobs[job.id] = job
@@ -723,6 +853,50 @@ class Schedule:
         if job is None:
             return None
         job.approval_mode = approval_mode
+        self.save()
+        return job
+
+    def set_location(
+        self,
+        identifier: str,
+        *,
+        runs_on: str | None = None,
+        workspace_kind: str | None = None,
+    ) -> Job | None:
+        """Move an existing job to different hardware.
+
+        The second widening path in the module, and it sits next to `approve`
+        deliberately: both are the only ways a job ends up able to do more than
+        it could when it was created, and a reader looking for "where does this
+        get more permissive" should find them together.
+
+        Every refusal `add` applies is re-applied here rather than assumed.
+        A job created a month ago for this laptop has a `/Users/…` workspace and
+        a belt with `terminal` in it; moving it to a container has to fail on
+        both of those exactly as creating it there would, or `approve` becomes
+        the way around `add`.
+        """
+        job = self.resolve(identifier)
+        if job is None:
+            return None
+
+        next_runs_on = job.runs_on if runs_on is None else runs_on
+        next_kind = job.workspace_kind if workspace_kind is None else workspace_kind
+
+        guard = cloud_module.location_refusal(next_runs_on, next_kind, job.workspace)
+        if guard:
+            raise ScheduleError(guard)
+
+        guard = cloud_module.tools_refusal(job.enabled_tools, next_runs_on, next_kind)
+        if guard:
+            raise ScheduleError(
+                guard
+                + "\n\nThis job's belt was chosen for this machine. Recreate it "
+                "with `--tools` naming only what a hosted runner may have."
+            )
+
+        job.runs_on = next_runs_on
+        job.workspace_kind = next_kind
         self.save()
         return job
 

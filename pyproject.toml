@@ -1,6 +1,6 @@
 [project]
 name = "andromeda-cli"
-version = "0.3.3"
+version = "0.5.0"
 description = "Andromeda — a local-first agent harness for the terminal"
 readme = "README.md"
 # Upper bound is load-bearing. uv resolves the interpreter from this field, and
@@ -36,7 +36,18 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest==8.4.2", "pytest-asyncio==1.2.0", "respx==0.22.0"]
+dev = [
+  "pytest==8.4.2",
+  "pytest-asyncio==1.2.0",
+  "respx==0.22.0",
+  # For the ed25519 fire verifier's tests. A *dev* dependency and not a core
+  # one on purpose: the default scheme is HMAC, which uses only `hashlib`, and
+  # a runner that never selects `ed25519` should not carry a compiled
+  # cryptography wheel to prove it. `serve.verify_ed25519` refuses with a clear
+  # message when the scheme is selected and the library is absent, rather than
+  # falling back to something weaker.
+  "cryptography==46.0.3",
+]
 # Lazy, not core. Playwright is ~40MB of wheel plus a browser download, and a
 # session that never opens a page should not pay for either. `andromeda browser
 # install` pulls it on demand; until then the browser_* tools are simply not

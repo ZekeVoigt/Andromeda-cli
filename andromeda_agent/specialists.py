@@ -6,6 +6,12 @@ predicates the belts are written in terms of. Four of the five port; `operator`
 stubbed — a belt that admits nothing useful is worse than no belt, because it
 looks like a capability.
 
+`builder` is the one belt that is not a port. Every other specialist reads, so
+for a long time delegation could not be used for the work people actually
+delegate: making the change. It writes files and nothing else — no shell, no
+network — and with `worktree_isolation` on it does that in a copy of the tree
+of its own.
+
 The load-bearing property, carried over verbatim: **a belt is a hard denial,
 read before anything else.** A child runs in `auto` mode, so a tool that a belt
 rejects must come back `denied` and not `needs_approval` — otherwise a Writer
@@ -82,6 +88,11 @@ class Specialist:
     # Every specialist here is false. Kept as a field rather than assumed, so
     # that raising depth later is a visible edit and not an emergent one.
     can_spawn: bool = False
+    # Whether this belt changes the working tree. Two such lanes must not run
+    # at once in the same directory, so unless each has a worktree of its own
+    # they take the tree surface in turn — the same rule the browser has, for
+    # the same reason.
+    writes_tree: bool = False
 
     def brief_line(self) -> str:
         return f"{self.id} — {self.purpose}"
@@ -111,6 +122,31 @@ def _writer_admits(tool: ToolSpec) -> bool:
     if is_egress(tool):
         return False
     return is_read_only(tool)
+
+
+# What a Builder may change. Named, not derived from a tier: `terminal` is the
+# one that matters and it is deliberately absent — a shell can `cd` anywhere,
+# so a lane holding one is a lane whose isolation is a suggestion rather than a
+# boundary. Everything here writes through the workspace, which is checked.
+FILE_WRITES = frozenset({"write_file", "patch"})
+
+
+def _builder_admits(tool: ToolSpec) -> bool:
+    if is_session_tool(tool):
+        return False
+    if is_browser_tool(tool):
+        return False
+    # The web reads are `safe_local` and category `read`, so they pass the
+    # read-only predicate — the same trap the Writer's egress check exists to
+    # close. Named here, because this belt cannot use `is_egress` at all: that
+    # predicate is tier-based, and the writes this belt exists for are
+    # `destructive`, so filtering on it would deny the whole point.
+    if tool.name in NETWORK_READS:
+        return False
+    # A closed list rather than a filter. Everything admitted is named, so a
+    # tool added later is denied until somebody decides otherwise — which is
+    # what keeps a send tool out, by omission rather than by predicate.
+    return is_read_only(tool) or tool.name in FILE_WRITES
 
 
 def _verifier_admits(tool: ToolSpec) -> bool:
@@ -155,6 +191,20 @@ SPECIALISTS: dict[str, Specialist] = {
         # is the one belt whose budget is genuinely larger than the rest.
         max_turns=20,
         admits=_browser_admits,
+    ),
+    "builder": Specialist(
+        id="builder",
+        label="Builder",
+        purpose=(
+            "Makes a change. Reads, edits and writes files — in its own copy "
+            "of the tree, so other lanes are not editing underneath it."
+        ),
+        # Larger than the readers, because writing is a cycle: read the file,
+        # change it, read it back. A budget that runs out mid-cycle leaves a
+        # half-applied edit, which is the one outcome worse than no edit.
+        max_turns=16,
+        admits=_builder_admits,
+        writes_tree=True,
     ),
     "verifier": Specialist(
         id="verifier",

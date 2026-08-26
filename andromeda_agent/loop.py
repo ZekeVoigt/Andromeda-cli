@@ -12,13 +12,18 @@ not a paraphrase.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Callable, Protocol
+import re
+import time
+from dataclasses import dataclass, field, replace
+from typing import Any, Callable, Iterable, Protocol
 
 from andromeda_tools import ToolResult, ToolSpec, Workspace, build_registry
 from andromeda_tools.todo import TodoList
 
-from . import compaction
+from . import compaction, hooks, lsp as lsp_module, redact, resilience, tool_search
+from . import usage as usage_module
+from . import hints as hints_module
+from .errors import AgentError
 from .approval import Answer, ApprovalRequest, Policy
 from .providers import Provider
 from .providers.base import AssistantTurn, ToolCall
@@ -29,8 +34,8 @@ MAX_STEPS = 24
 
 SYSTEM_PROMPT = """You are Andromeda, running as a local-first agent in the user's terminal.
 
-You are on the user's own machine. You have tools that read and change real \
-files and run real commands — there is no sandbox between you and their work.
+You are on the user's own machine — there is no sandbox between you and their work.
+Your tools change real files and run real commands.
 
 - Prefer reading before writing. Look at a file before you patch it.
 - Use `patch` for part of a file and `write_file` only for a whole one.
@@ -59,6 +64,47 @@ anything where the relative size is the point. Use a table when the exact \
 figures are the point, and neither when there are only two numbers."""
 
 
+# Lines of `SYSTEM_PROMPT` that only make sense with a particular tool, keyed
+# on a distinctive substring. A session narrowed to `safe_local` — which is
+# every non-interactive run, by default — cannot call `patch` or `write_file`,
+# and being told how to choose between them is an instruction the model spends
+# a turn discovering it cannot follow. `tests/test_loop.py` asserts each key
+# still matches exactly one line, so re-wording the prompt cannot silently
+# orphan the tailoring.
+_PROMPT_REQUIRES: tuple[tuple[str, frozenset[str]], ...] = (
+    (
+        "Your tools change real files",
+        frozenset({"patch", "write_file", "terminal"}),
+    ),
+    ("Prefer reading before writing", frozenset({"patch", "write_file"})),
+    ("Use `patch` for part of a file", frozenset({"patch", "write_file"})),
+    (
+        "Non-zero exits and missing files",
+        frozenset({"terminal", "read_file", "patch", "write_file"}),
+    ),
+)
+
+
+def tailor_prompt(text: str, tool_names: Iterable[str] | None) -> str:
+    """`text` with every line that needs a missing tool removed.
+
+    `None` means "do not tailor" and returns the prompt whole — the right
+    answer for a caller that does not yet know the session's tools, since
+    guessing would drop advice the session can use.
+    """
+    if tool_names is None:
+        return text
+    names = set(tool_names)
+    kept = []
+    for line in text.splitlines():
+        required = next(
+            (needed for key, needed in _PROMPT_REQUIRES if key in line), None
+        )
+        if required is None or (required & names):
+            kept.append(line)
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
+
+
 class ApprovalPrompt(Protocol):
     def __call__(self, request: ApprovalRequest) -> Answer: ...
 
@@ -73,6 +119,10 @@ class Callbacks:
     on_tool_denied: Callable[[ToolSpec, str], None] | None = None
     ask_approval: ApprovalPrompt | None = None
     on_compaction: Callable[[compaction.CompactionResult], None] | None = None
+    # Called when a turn is about to be re-issued, with a short reason. The
+    # surface prints it: a terminal that goes quiet for twenty seconds reads as
+    # a hang, and "rate limited, retrying in 12s" reads as a wait.
+    on_retry: Callable[[str], None] | None = None
 
 
 @dataclass
@@ -121,6 +171,36 @@ class Conversation:
     lane_registry: Any = None
     process_registry: Any = None
     mcp_servers: Any = None
+    # Discovers a directory's own AGENTS.md as the model reaches it and appends
+    # it to that tool's result. `None` disables it entirely, which is what a
+    # session outside a workspace gets — there is nothing to discover.
+    hints: hints_module.Hints | None = None
+    # Language-server diagnostics after an edit. `None` outside a workspace and
+    # whenever no server for the project's languages is installed — see
+    # `andromeda_agent.lsp`, which never installs one.
+    lsp: Any = None
+    # Consecutive empty completions in this exchange. Held on the conversation
+    # rather than passed down, because the streak has to survive the retry loop
+    # and die on the first turn that says something.
+    _empties: resilience.Empties = field(default_factory=resilience.Empties)
+    # What this conversation has spent, in tokens. Accumulated here and written
+    # onto the transcript by the surface's `on_persist`, because the transcript
+    # is this harness's source of truth and a token count is the one thing that
+    # cannot be recovered from one.
+    usage: usage_module.Usage = field(default_factory=usage_module.Usage)
+    # Identity, for the hook payloads. A conversation that nobody named still
+    # fires its hooks — with an empty id rather than none at all, so a script
+    # can tell "no session" from "key missing".
+    session_id: str = ""
+    surface: str = "repl"
+    # How MCP tools are offered. `auto` and `on` put them behind the search
+    # bridge; `off` lists every one of them on every request.
+    tool_search_mode: str = "auto"
+    tool_search_listing_tokens: int = 4000
+    # This exchange's tool array, rebuilt at the top of every `send`. Held so
+    # the bridge calls can be answered from the same catalogue the model was
+    # shown, rather than from one assembled a second time.
+    assembly: Any = None
 
     def __post_init__(self) -> None:
         if not self.registry:
@@ -129,9 +209,22 @@ class Conversation:
             self.messages.append({"role": "system", "content": self._system_message()})
 
     def _system_message(self) -> str:
-        parts = [self.system_prompt, f"Workspace root: {self.workspace.root}"]
+        """The system prompt, tailored to the tools this session actually has.
+
+        A lane's brief arrives already tailored, so only the default prompt is
+        rewritten here — and only when the registry is populated, which is the
+        one moment the offered set is knowable.
+        """
+        prompt = self.system_prompt
+        if prompt is SYSTEM_PROMPT and self.registry:
+            prompt = tailor_prompt(prompt, self._offered())
+        parts = [prompt, f"Workspace root: {self.workspace.root}"]
         parts.extend(block for block in self.context_blocks if block.strip())
         return "\n\n".join(parts)
+
+    def _offered(self) -> set[str]:
+        """The tools the model is actually told about."""
+        return {spec.name for spec in self.available}
 
     @property
     def available(self) -> list[ToolSpec]:
@@ -152,13 +245,22 @@ class Conversation:
         callbacks = callbacks or Callbacks()
         self.messages.append({"role": "user", "content": prompt})
 
-        schemas = [spec.to_openai() for spec in self.available]
+        # Rebuilt every exchange from the live registry. A catalogue carried
+        # across turns drifts out of step with the tools that actually exist,
+        # and the failure is silent — a tool the model can see and cannot call.
+        self.assembly = tool_search.assemble(
+            self.available,
+            context_window=self.context_window,
+            mode=self.tool_search_mode,
+            listing_max_tokens=self.tool_search_listing_tokens,
+        )
+        schemas = self.assembly.schemas
         last_text = ""
         self.steps_taken = 0
 
         for step in range(self.max_steps):
             self._compact_if_needed(callbacks)
-            turn = self._model_turn(schemas, callbacks)
+            turn = self._model_turn(schemas, callbacks, step=step, user_message=prompt)
             self.steps_taken = step + 1
             self.messages.append(turn.to_message())
 
@@ -167,17 +269,32 @@ class Conversation:
 
             if not turn.tool_calls:
                 self._persist()
-                return last_text
+                return self._final_text(last_text)
 
             for call in turn.tool_calls:
-                self.messages.append(self._dispatch(call, callbacks))
+                self.messages.append(self._dispatch(call, callbacks, step=step))
 
         # The ceiling is reported into the transcript, so the model's next turn
         # knows why its tools stopped answering rather than trying again.
         note = f"Stopped after {self.max_steps} steps without finishing."
         self.messages.append({"role": "user", "content": note})
         self._persist()
-        return last_text or note
+        return self._final_text(last_text or note)
+
+    def _final_text(self, text: str) -> str:
+        """The last word of an exchange, after any `transform_llm_output` hook.
+
+        Transformed on the way out and *not* written back into the transcript:
+        the model has to keep seeing what it actually said, or the next turn
+        reasons from a version of its own history that never happened.
+        """
+        return hooks.transform(
+            "transform_llm_output",
+            text,
+            session_id=self.session_id,
+            model=getattr(self.provider, "model", ""),
+            steps_taken=self.steps_taken,
+        )
 
     def _persist(self) -> None:
         if self.on_persist is None:
@@ -294,6 +411,15 @@ class Conversation:
     ) -> None:
         if callbacks.on_compaction is not None:
             callbacks.on_compaction(result)
+        hooks.fire(
+            "on_compaction",
+            session_id=self.session_id,
+            stage=result.stage,
+            before_tokens=result.before_tokens,
+            after_tokens=result.after_tokens,
+            pruned_results=result.pruned_results,
+            summarised_messages=result.summarised_messages,
+        )
 
     @property
     def context_used(self) -> float:
@@ -301,23 +427,172 @@ class Conversation:
         return compaction.usage_fraction(self.messages, self.context_window)
 
     def _model_turn(
-        self, schemas: list[dict[str, Any]], callbacks: Callbacks
+        self,
+        schemas: list[dict[str, Any]],
+        callbacks: Callbacks,
+        *,
+        step: int = 0,
+        user_message: str = "",
     ) -> AssistantTurn:
-        generator = self.provider.stream_turn(
-            self.messages,
-            max_tokens=self.max_tokens,
-            temperature=self.temperature,
-            tools=schemas or None,
-        )
-        while True:
-            try:
-                text = next(generator)
-            except StopIteration as stop:
-                return stop.value
-            if callbacks.on_text is not None:
-                callbacks.on_text(text)
+        """One model turn, through the transport and the two content guards.
 
-    def _dispatch(self, call: ToolCall, callbacks: Callbacks) -> dict[str, Any]:
+        The retry loop counts *attempts at the same turn*, which is not the
+        same as the step loop above: a rate limit and a nudged empty both
+        re-issue this call without the conversation moving on.
+
+        The invariant that shapes it: nothing is retried once text has reached
+        the terminal. A stream cannot be unprinted, so re-issuing a half-shown
+        answer produces two half-answers stitched together — worse than one
+        failure that says what happened and keeps what arrived.
+        """
+        model = getattr(self.provider, "model", "")
+        nudge = ""
+        attempt = 0
+
+        while True:
+            attempt += 1
+            request = self._request_messages(
+                step=step, user_message=user_message, model=model, nudge=nudge
+            )
+            streamed = False
+            try:
+                generator = self.provider.stream_turn(
+                    request,
+                    max_tokens=self.max_tokens,
+                    temperature=self.temperature,
+                    tools=schemas or None,
+                )
+                while True:
+                    try:
+                        text = next(generator)
+                    except StopIteration as stop:
+                        turn = stop.value
+                        break
+                    streamed = True
+                    if callbacks.on_text is not None:
+                        callbacks.on_text(text)
+            except AgentError as exc:
+                plan = resilience.plan_retry(exc, attempt, streamed=streamed)
+                if not plan:
+                    # Whatever arrived before the failure is kept rather than
+                    # discarded: the model said it, the user saw it, and the
+                    # next turn has to reason from the same history they do.
+                    partial = getattr(exc, "partial", "") or ""
+                    if partial.strip():
+                        self.messages.append(
+                            AssistantTurn(content=partial).to_message()
+                        )
+                        self._persist()
+                    raise
+                if callbacks.on_retry is not None:
+                    callbacks.on_retry(plan.reason)
+                time.sleep(plan.delay)
+                continue
+
+            # Recorded for every response, including the empty ones and the
+            # ones about to be retried: they were billed, and a total that
+            # counts only the answers people liked is not a total.
+            if turn.usage:
+                self.usage.record(
+                    model,
+                    input=turn.usage.get("input", 0),
+                    output=turn.usage.get("output", 0),
+                    cached=turn.usage.get("cached", 0),
+                    reasoning=turn.usage.get("reasoning", 0),
+                )
+
+            hooks.fire(
+                "post_llm_call",
+                session_id=self.session_id,
+                model=model,
+                step=step,
+                content_chars=len(turn.content or ""),
+                tool_call_count=len(turn.tool_calls or ()),
+                input_tokens=(turn.usage or {}).get("input", 0),
+                output_tokens=(turn.usage or {}).get("output", 0),
+            )
+
+            if not resilience.is_empty_turn(turn):
+                self._empties.reset()
+                return self._guard_repetition(turn)
+
+            # An empty completion. One is a flaky decode and worth another
+            # request; the same emptiness twice from the same model with the
+            # same finish reason will not become an answer on the third
+            # attempt, and each attempt re-sends the whole conversation.
+            self._empties.record(model, turn.finish_reason)
+            if self._empties.should_retry() and not streamed:
+                nudge = resilience.EMPTY_NUDGE
+                if callbacks.on_retry is not None:
+                    callbacks.on_retry("the model returned nothing, asking again")
+                continue
+
+            self._empties.reset()
+            return replace(
+                turn,
+                content=(
+                    "The model returned an empty response twice in a row. This "
+                    "usually means the request was refused without saying so, "
+                    "or the conversation is in a state it will not answer. Try "
+                    "rephrasing, or `/new` to start a fresh session."
+                ),
+            )
+
+    def _guard_repetition(self, turn: AssistantTurn) -> AssistantTurn:
+        """Stop a length-truncated answer that is just one fragment repeating.
+
+        The natural response to `finish_reason="length"` is to ask for the
+        rest. Asking a model that has fallen into a loop for the rest buys more
+        of the loop at full price, so the loop is named instead — the text
+        already produced is kept, because the beginning of it is usually a real
+        answer that went wrong partway through.
+        """
+        if turn.finish_reason != "length":
+            return turn
+        if not resilience.is_repetition_dominated(turn.content):
+            return turn
+        return replace(
+            turn,
+            content=(
+                turn.content.rstrip()
+                + "\n\n[Stopped: the response ran to the output limit repeating "
+                "itself, so it was not continued.]"
+            ),
+        )
+
+    def _request_messages(
+        self, *, step: int, user_message: str, model: str, nudge: str = ""
+    ) -> list[dict[str, Any]]:
+        """The transcript as this request sees it, plus any injected context.
+
+        Injection lands in a trailing *user* message and never in the system
+        prompt: the system prompt has to stay byte-identical between turns or
+        the provider's cached prefix is thrown away on every request. It is
+        also never appended to `self.messages` — an injection that persisted
+        would be replayed next turn as though the user had typed it.
+        """
+        extra = hooks.injected_context(
+            session_id=self.session_id,
+            model=model,
+            message_count=len(self.messages),
+            step=step,
+            user_message=user_message,
+        )
+        # The nudge rides in the same trailing slot and for the same reason:
+        # a retry after an empty response has to tell the model what went
+        # wrong, and writing that into the transcript would replay it next
+        # turn as though the user had typed it.
+        trailing = "\n\n".join(part for part in (extra, nudge) if part)
+        if not trailing:
+            return self.messages
+        return [*self.messages, {"role": "user", "content": trailing}]
+
+    def _dispatch(
+        self, call: ToolCall, callbacks: Callbacks, *, step: int = 0
+    ) -> dict[str, Any]:
+        if tool_search.is_bridge(call.name):
+            return self._bridge(call, callbacks, step=step)
+
         spec = self.registry.get(call.name)
         if spec is None:
             return _tool_message(call, f"Error: no tool named {call.name!r}.")
@@ -334,14 +609,50 @@ class Conversation:
             reason = f"{spec.name} is not available in this session."
             if callbacks.on_tool_denied is not None:
                 callbacks.on_tool_denied(spec, reason)
+            self._after_tool(
+                spec, call, call.arguments, step, "blocked", reason, 0.0
+            )
             return _tool_message(call, f"Denied: {reason}")
 
+        # Hooks run *before* the approval prompt, deliberately. A hook that
+        # blocks should not first make the user answer a question about a call
+        # that was never going to run, and a hook that rewrites the arguments
+        # has to do it before consent is asked — the prompt states what will
+        # actually happen, so it must be shown the final arguments.
+        directive = hooks.pre_tool_directive(
+            spec.name,
+            call.arguments,
+            session_id=self.session_id,
+            tool_call_id=call.id,
+            risk_tier=spec.risk_tier,
+            step=step,
+        )
+        arguments = (
+            directive.modified_args
+            if directive.modified_args is not None
+            else call.arguments
+        )
+
+        if directive.action == "block":
+            reason = directive.message or "A hook blocked this call."
+            if callbacks.on_tool_denied is not None:
+                callbacks.on_tool_denied(spec, reason)
+            self._after_tool(spec, call, arguments, step, "blocked", reason, 0.0)
+            return _tool_message(call, f"Denied: {reason}")
+
+        if directive.action == "approve" and decision == "allowed":
+            # An escalation only ever adds a gate; it can never remove one.
+            decision = "needs_approval"
+
         if decision == "needs_approval":
-            answer = self._ask(spec, call, callbacks)
+            answer = self._ask(spec, call, arguments, callbacks, directive)
             if answer == "no":
                 reason = "The user declined this."
                 if callbacks.on_tool_denied is not None:
                     callbacks.on_tool_denied(spec, reason)
+                self._after_tool(
+                    spec, call, arguments, step, "blocked", reason, 0.0
+                )
                 return _tool_message(
                     call,
                     "Denied: the user declined this call. Do not retry it or look "
@@ -359,6 +670,9 @@ class Conversation:
                     reason = "The user chose never to allow this."
                     if callbacks.on_tool_denied is not None:
                         callbacks.on_tool_denied(spec, reason)
+                    self._after_tool(
+                        spec, call, arguments, step, "blocked", reason, 0.0
+                    )
                     return _tool_message(
                         call,
                         "Denied: the user has refused this tool permanently. Do not "
@@ -371,28 +685,271 @@ class Conversation:
                 )
 
         if callbacks.on_tool_start is not None:
-            callbacks.on_tool_start(spec, call.arguments)
+            callbacks.on_tool_start(spec, arguments)
 
-        result = self._run(spec, call.arguments)
+        # Taken before the edit, because a diagnostic is only useful as a
+        # delta and a delta needs a baseline. Cheap to ask for: outside a
+        # workspace, for a language nobody has a server for, or for a tool that
+        # does not edit, this is a dictionary lookup and a `None`.
+        snapshot = self._baseline(spec.name, arguments)
+
+        started = time.monotonic()
+        result = self._run(spec, arguments)
+        duration_ms = (time.monotonic() - started) * 1000
+
+        # The one place secrets are removed. Everything downstream of this line
+        # — the terminal, the transcript, the search index, an export, a hook,
+        # the model — reads the scrubbed result, so none of them can disagree
+        # about what a secret is. Before the surface callback, deliberately: a
+        # secret that reaches the scrollback has already been read.
+        result = self._scrub(spec, arguments, result)
 
         if callbacks.on_tool_result is not None:
             callbacks.on_tool_result(spec, result)
 
-        return _tool_message(call, result.content)
+        content = hooks.transform(
+            "transform_tool_result",
+            result.content,
+            tool_name=spec.name,
+            args=arguments,
+            session_id=self.session_id,
+            tool_call_id=call.id,
+            risk_tier=spec.risk_tier,
+            step=step,
+            status="ok" if result.ok else "error",
+        )
+        self._after_tool(
+            spec,
+            call,
+            arguments,
+            step,
+            "ok" if result.ok else "error",
+            None if result.ok else result.content,
+            duration_ms,
+            result=content,
+        )
 
-    def _ask(self, spec: ToolSpec, call: ToolCall, callbacks: Callbacks) -> Answer:
+        # A context file for the part of the tree this call just reached, if
+        # the model has not been here before. After the transform, so a hook
+        # that rewrites a result does not rewrite the project's own
+        # instructions; and only on success, because a failing call is about to
+        # be retried and burying its error under a page of conventions is the
+        # wrong thing to read next. The directory stays unvisited on a failure,
+        # so the next call that lands there still finds it.
+        if result.ok and self.hints is not None:
+            extra = self.hints.for_call(spec.name, arguments)
+            if extra:
+                content = f"{content}{extra}"
+
+        # What this edit broke, if anything. Only on success: a patch that did
+        # not apply changed nothing, and running a type checker to prove it is
+        # a wasted round trip.
+        if result.ok and snapshot is not None:
+            diagnostics = self._diagnostics(snapshot)
+            if diagnostics:
+                content = f"{content}{diagnostics}"
+
+        # The surface saw the tool's own output; the model sees the transformed
+        # text. Whoever rewrote it meant it for the model.
+        return _tool_message(call, content)
+
+    def _baseline(self, tool_name: str, arguments: dict[str, Any]) -> Any:
+        """What the file being edited looked like before, or `None`.
+
+        Wrapped rather than called directly so the language-server layer can
+        never end a turn: the edit is about to happen either way, and a
+        baseline that raised would take the tool call down with it.
+        """
+        if self.lsp is None or not lsp_module.watches(tool_name):
+            return None
+        path = arguments.get("path")
+        if not isinstance(path, str) or not path.strip():
+            return None
+        try:
+            return self.lsp.before(self.workspace.resolve(path))
+        except Exception:  # noqa: BLE001 - diagnostics are never load-bearing
+            return None
+
+    def _diagnostics(self, snapshot: Any) -> str:
+        if self.lsp is None:
+            return ""
+        try:
+            return self.lsp.after(snapshot)
+        except Exception:  # noqa: BLE001 - see `_baseline`
+            return ""
+
+    def _bridge(
+        self, call: ToolCall, callbacks: Callbacks, *, step: int
+    ) -> dict[str, Any]:
+        """Answer one of the three tools that stand in for the deferred ones.
+
+        `tool_search` and `tool_describe` read an in-memory catalogue and
+        change nothing, so they do not go near the gate. `tool_call` does not
+        answer anything itself — it resolves the real tool and hands it to the
+        ordinary dispatch path, so a call through the bridge meets exactly the
+        policy, the prompt and the hooks a direct call would.
+        """
+        assembly = getattr(self, "assembly", None)
+        if assembly is None or not assembly.activated:
+            return _tool_message(
+                call, f"Error: no tool named {call.name!r}."
+            )
+
+        if call.parse_error:
+            return _tool_message(call, f"Error: {call.parse_error}")
+
+        if call.name == tool_search.SEARCH:
+            self._note_bridge(callbacks, call, "searching for a tool")
+            return _tool_message(
+                call, tool_search.dispatch_search(assembly, call.arguments)
+            )
+
+        if call.name == tool_search.DESCRIBE:
+            self._note_bridge(callbacks, call, "loading a tool's parameters")
+            return _tool_message(
+                call, tool_search.dispatch_describe(assembly, call.arguments)
+            )
+
+        spec, arguments, error = tool_search.resolve_call(assembly, call.arguments)
+        if spec is None:
+            return _tool_message(call, f"Error: {error}")
+
+        blind = tool_search.missing_arguments(spec, arguments)
+        if blind:
+            # The schema back, rather than a failure from inside the tool that
+            # says nothing about what was expected.
+            return _tool_message(call, blind)
+
+        # Re-entered as though the model had named the tool directly. Every
+        # gate below this line is the one and only implementation of itself.
+        return self._dispatch(
+            replace(call, name=spec.name, arguments=arguments), callbacks, step=step
+        )
+
+    def _note_bridge(self, callbacks: Callbacks, call: ToolCall, label: str) -> None:
+        """Show bridge activity as itself.
+
+        A person watching a turn should see the lookup happen; showing nothing
+        makes a searching model look like a stalled one.
+        """
+        if callbacks.on_tool_start is None:
+            return
+        callbacks.on_tool_start(
+            ToolSpec(
+                name=call.name,
+                description=label,
+                parameters={},
+                risk_tier="safe_local",
+                category="read",
+                run=lambda **_kwargs: ToolResult(content=""),
+                summarize=lambda arguments: f"{call.name}: {label}",
+            ),
+            call.arguments,
+        )
+
+    def _scrub(
+        self, spec: ToolSpec, arguments: dict[str, Any], result: ToolResult
+    ) -> ToolResult:
+        """Remove secrets from a tool result, in place of the original.
+
+        `display` is scrubbed against the same policy but separately, because
+        it is usually a summary rather than a slice of `content` — scrubbing
+        one and copying it into the other would either lose the summary or
+        leak whatever the summary quoted.
+
+        A file read that lost something says so. The sentinel is unusable by
+        construction, but only a reader who knows that treats it as unusable;
+        without the note the model has been observed writing it onward as
+        though it were the value.
+        """
+        scrubbed = redact.scrub_tool_result(spec.name, arguments, result.content)
+        content = scrubbed.text
+        if scrubbed.changed and spec.name in {"read_file", "search_files"}:
+            content += redact.notice(scrubbed)
+
+        display = result.display
+        if display and display != result.content:
+            display = redact.scrub_tool_result(spec.name, arguments, display).text
+        elif display:
+            display = scrubbed.text
+
+        if content == result.content and display == result.display:
+            return result
+        return replace(result, content=content, display=display)
+
+    def _after_tool(
+        self,
+        spec: ToolSpec,
+        call: ToolCall,
+        arguments: dict[str, Any],
+        step: int,
+        status: str,
+        error_message: str | None,
+        duration_ms: float,
+        result: str = "",
+    ) -> None:
+        hooks.fire(
+            "post_tool_call",
+            tool_name=spec.name,
+            args=arguments,
+            session_id=self.session_id,
+            tool_call_id=call.id,
+            risk_tier=spec.risk_tier,
+            step=step,
+            status=status,
+            result=result,
+            error_message=error_message,
+            duration_ms=round(duration_ms, 3),
+        )
+
+    def _ask(
+        self,
+        spec: ToolSpec,
+        call: ToolCall,
+        arguments: dict[str, Any],
+        callbacks: Callbacks,
+        directive: hooks.Directive | None = None,
+    ) -> Answer:
+        # Only the echo of the call, never the call. The arguments themselves go
+        # to the tool and to the transcript unchanged: a scrubbed argument would
+        # run a different command than the one consented to, and a scrubbed
+        # transcript would replay a call the model never made. The model can
+        # only be holding a secret it was given, and everything it is given
+        # comes through `_scrub` — so this is a belt for the one case that
+        # bypasses it, a key the user typed themselves.
+        summary = redact.scrub(spec.summary(arguments), code_file=False).text
+        hooks.fire(
+            "pre_approval_request",
+            tool_name=spec.name,
+            summary=summary,
+            risk_tier=spec.risk_tier,
+            session_id=self.session_id,
+            surface=self.surface,
+        )
         if callbacks.ask_approval is None:
             # No one is watching. A tool that needs a person and has none is
             # refused — never auto-approved.
-            return "no"
-        return callbacks.ask_approval(
-            ApprovalRequest(
-                spec=spec,
-                arguments=call.arguments,
-                summary=spec.summary(call.arguments),
-                allowlist=self.policy.allowlist,
+            answer: Answer = "no"
+        else:
+            answer = callbacks.ask_approval(
+                ApprovalRequest(
+                    spec=spec,
+                    arguments=arguments,
+                    summary=summary,
+                    allowlist=self.policy.allowlist,
+                    reason=directive.message if directive is not None else None,
+                )
             )
+        hooks.fire(
+            "post_approval_response",
+            tool_name=spec.name,
+            summary=summary,
+            risk_tier=spec.risk_tier,
+            session_id=self.session_id,
+            surface=self.surface,
+            answer=answer,
         )
+        return answer
 
     def _run(self, spec: ToolSpec, arguments: dict[str, Any]) -> ToolResult:
         try:
@@ -413,12 +970,20 @@ class Conversation:
         supplies with all of those bindings closed over. Without it the rebuild
         would silently drop skill_load and the memory tools.
         """
+        turns = self.turn_count
         self.messages = [{"role": "system", "content": self._system_message()}]
         self.todos = TodoList()
         self.registry = (
             self.rebuild_registry(self.todos)
             if self.rebuild_registry is not None
             else build_registry(self.workspace, self.todos)
+        )
+        hooks.fire(
+            "on_session_reset",
+            session_id=self.session_id,
+            model=getattr(self.provider, "model", ""),
+            surface=self.surface,
+            turn_count=turns,
         )
 
     @property

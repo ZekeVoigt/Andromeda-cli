@@ -157,3 +157,75 @@ class TestNew:
         run("/new", conversation)
         assert len(conversation.messages) == 1
         assert conversation.messages[0]["role"] == "system"
+
+
+class TestCreditsAndUsage:
+    """The two questions that used to have one confusing answer.
+
+    A user reported `/credits` reading "$0.10 out of $0.10" while they were
+    plainly spending it. Three things caused that and all three are pinned
+    here: the figure was rounded to the cent at a scale where a turn costs
+    fractions of one, the headers describe the balance from *before* the reply
+    they arrive on, and nothing anywhere reported what had actually been used.
+    """
+
+    def test_credits_shows_enough_places_for_the_balance_to_move(
+        self, conversation, capsys
+    ):
+        from andromeda_agent import credits as credits_module
+
+        conversation.provider.balance = credits_module.Balance(
+            remaining_micros=99_700, grant_micros=100_000, access="active"
+        )
+
+        run("/credits", conversation)
+        printed = capsys.readouterr().out
+
+        assert "$0.0997" in printed
+        assert "$0.10 of $0.10" not in printed
+
+    def test_an_untouched_grant_still_reads_as_whole_dollars_and_cents(
+        self, conversation, capsys
+    ):
+        """A window that has just renewed should say "$0.10 of $0.10"."""
+        from andromeda_agent import credits as credits_module
+
+        conversation.provider.balance = credits_module.Balance(
+            remaining_micros=100_000, grant_micros=100_000, access="active"
+        )
+
+        run("/credits", conversation)
+
+        assert "$0.10 of $0.10" in capsys.readouterr().out
+
+    def test_credits_says_the_figure_lags_a_turn(self, conversation, capsys):
+        from andromeda_agent import credits as credits_module
+
+        conversation.provider.balance = credits_module.Balance(
+            remaining_micros=61_240, grant_micros=100_000, access="active"
+        )
+
+        run("/credits", conversation)
+        printed = capsys.readouterr().out
+
+        assert "previous turn" in printed
+        assert "/usage" in printed
+
+    def test_usage_reports_nothing_before_the_first_reply(self, conversation, capsys):
+        run("/usage", conversation)
+
+        assert "Nothing counted yet" in capsys.readouterr().out
+
+    def test_usage_reports_what_this_session_spent(self, conversation, capsys):
+        conversation.usage.record("test/model", input=1200, output=340)
+
+        run("/usage", conversation)
+        printed = capsys.readouterr().out
+
+        assert "this session" in printed
+        assert "1.5k" in printed  # 1,540 tokens
+
+    def test_usage_is_documented(self, conversation, capsys):
+        run("/help", conversation)
+
+        assert "/usage" in capsys.readouterr().out

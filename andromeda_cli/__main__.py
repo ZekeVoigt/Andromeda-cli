@@ -23,7 +23,7 @@ import argparse  # noqa: E402
 
 from . import __version__  # noqa: E402
 from . import config as config_module  # noqa: E402
-from . import output, repl  # noqa: E402
+from . import completion, output, repl  # noqa: E402
 from .commands import (  # noqa: E402
     auth,
     browser_cmd,
@@ -34,7 +34,15 @@ from .commands import (  # noqa: E402
     cron,
     evals,
     doctor,
+    batch_cmd,
+    curator_cmd,
+    hooks_cmd,
     mcp_cmd,
+    secrets_cmd,
+    skills_cmd,
+    lsp_cmd,
+    status as status_cmd,
+    worktrees_cmd,
     service,
     transfer,
     memory_cmd,
@@ -46,11 +54,24 @@ from .commands import (  # noqa: E402
 from . import sessions as sessions_store  # noqa: E402
 
 COMMANDS = (
+    "acp",
+    "cloud",
+    "batch",
+    "pause",
+    "resume",
     "setup",
     "auth",
     "cron",
+    "completion",
+    "curator",
+    "hooks",
+    "skills",
+    "lsp",
+    "status",
+    "worktrees",
     "eval",
     "mcp",
+    "secrets",
     "approvals",
     "backup",
     "export",
@@ -66,6 +87,45 @@ COMMANDS = (
     "doctor",
 )
 
+HOOKS_HELP = """Shell scripts run at lifecycle events.
+
+Hooks live in the `hooks:` block of config.yaml, one list per event:
+
+  hooks:
+    pre_tool_call:
+      - command: ~/.andromeda-cli/hooks/guard.sh
+        matcher: terminal          # regex over the tool name, this event only
+        timeout: 10                # seconds, 1-300, default 60
+        fail_closed: true          # a broken gate blocks instead of allowing
+    on_session_end:
+      - command: /usr/bin/env python3 ~/hooks/log.py
+
+The script is handed one JSON object on stdin:
+
+  {"hook_event_name": "pre_tool_call", "tool_name": "terminal",
+   "tool_input": {...}, "session_id": "...", "cwd": "...", "extra": {...}}
+
+and may print one JSON object on stdout to change what happens:
+
+  {"action": "block",   "message": "not on main"}     stop the call
+  {"action": "modify",  "args": {"command": "ls"}}    rewrite the call
+  {"action": "approve", "message": "confirm this"}    send it to the gate
+  {"context": "..."}                                  pre_llm_call only
+  {"output": "..."}                                   transform_* only
+
+Exiting 2 blocks a pre_tool_call whether or not anything was printed.
+
+Each (event, command) pair is approved once, at a prompt, and the approval
+records the script's mtime — `andromeda hooks doctor` reports when the file
+has changed since. Nothing registers on a run with no terminal unless you
+pass --accept-hooks or set hooks_auto_accept.
+
+  andromeda hooks list | doctor
+  andromeda hooks test pre_tool_call --for-tool terminal
+  andromeda hooks revoke ~/.andromeda-cli/hooks/guard.sh
+"""
+
+
 EPILOG = """
 examples:
   andromeda                          start the REPL
@@ -78,6 +138,7 @@ commands:
   andromeda auth login <code>        sign in with a code, for a machine with no browser
   andromeda auth status | logout
   andromeda config get [key]
+  andromeda hooks list               scripts run at lifecycle events
   andromeda config set <key> <value>
   andromeda config path
   andromeda tools                    list tools and how each is gated
@@ -121,6 +182,10 @@ commands:
   andromeda eval list
   andromeda mcp                      configured MCP servers and their tools
   andromeda mcp example              print a starter mcp.json
+  andromeda mcp login <server>       sign in to an MCP server that needs OAuth
+  andromeda mcp logout <server>
+  andromeda secrets                  vault references, and whether they resolve
+  andromeda secrets get <NAME> | schemes | example
   andromeda approvals                tools you have stopped being asked about
   andromeda approvals forget <tool> | clear
   andromeda backup <file.tar.gz>     everything, INCLUDING the device token
@@ -184,6 +249,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--workspace",
         help="Directory the agent may reach. Defaults to the current directory.",
     )
+    parser.add_argument(
+        "--accept-hooks",
+        action="store_true",
+        help="Approve the shell hooks in your config without a prompt, this run.",
+    )
     resume = parser.add_mutually_exclusive_group()
     resume.add_argument("--resume", metavar="ID", help="Resume a saved session by id.")
     resume.add_argument(
@@ -241,7 +311,16 @@ def build_command_parser() -> argparse.ArgumentParser:
     update_parser.add_argument(
         "--check", action="store_true", help="Report what is available, change nothing."
     )
-    sub.add_parser("doctor", help="Show what is and is not working.")
+    doctor_parser = sub.add_parser("doctor", help="Show what is and is not working.")
+    doctor_parser.add_argument(
+        "--cloud",
+        action="store_true",
+        help=(
+            "Also check what only a hosted runner can answer: the binaries a "
+            "job shells out to, that ANDROMEDA_HOME is the mounted volume and "
+            "not the image layer, free space, and that no model key is present."
+        ),
+    )
     sub.add_parser("setup", help="First-run setup. Four questions, all skippable.")
 
     backup_parser = sub.add_parser(
@@ -267,10 +346,25 @@ def build_command_parser() -> argparse.ArgumentParser:
         "pattern",
         nargs="?",
         default="",
-        help="Only scenarios whose name contains this. `list` to list them.",
+        help=(
+            "Only scenarios whose name contains this. `list` to list them, "
+            "`report` for what moved since the last run, `runs` for the history."
+        ),
     )
     eval_parser.add_argument("--json", action="store_true", dest="as_json")
     eval_parser.add_argument("--root", help="Directory of scenarios.")
+    eval_parser.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        help=(
+            "Run each scenario this many times and report a pass rate. An "
+            "agent is stochastic; one run is an anecdote."
+        ),
+    )
+    eval_parser.add_argument(
+        "--jobs", type=int, default=1, help="How many scenarios to run at once."
+    )
 
     cron_parser = sub.add_parser("cron", help="Scheduled jobs.")
     cron_sub = cron_parser.add_subparsers(dest="cron_command")
@@ -296,6 +390,36 @@ def build_command_parser() -> argparse.ArgumentParser:
         ),
     )
     cron_add.add_argument("--workspace", help="Directory to run in. Defaults to here.")
+    cron_add.add_argument(
+        "--cloud",
+        action="store_true",
+        help=(
+            "Run on a hosted runner instead of this machine, so it fires "
+            "whether or not this computer is awake. Needs --detached: a "
+            "container cannot see your files."
+        ),
+    )
+    cron_add.add_argument(
+        "--repo",
+        dest="repo_url",
+        default="",
+        metavar="URL",
+        help=(
+            "Work on a fresh clone of this https remote each run, and push what "
+            "changed onto a branch this run creates. Never onto your default one."
+        ),
+    )
+    cron_add.add_argument(
+        "--repo-ref", dest="repo_ref", default="", help="Branch to clone from."
+    )
+    cron_add.add_argument(
+        "--detached",
+        action="store_true",
+        help=(
+            "Give this job no filesystem at all — the network, its notepad and "
+            "its memory, and nothing else. Required with --cloud."
+        ),
+    )
     cron_add.add_argument(
         "--repeat",
         type=int,
@@ -411,7 +535,22 @@ def build_command_parser() -> argparse.ArgumentParser:
     )
     cron_approve.add_argument("id")
     cron_approve.add_argument(
-        "--approval", choices=["ask", "auto", "deny"], required=True
+        "--approval", choices=["ask", "auto", "deny"], default=""
+    )
+    cron_approve.add_argument(
+        "--run-on",
+        dest="run_on",
+        choices=["device", "cloud"],
+        default="",
+        help=(
+            "Move this job to a hosted runner, or back. A separate grant from "
+            "--approval: it decides whose hardware holds your credentials."
+        ),
+    )
+    cron_approve.add_argument(
+        "--detached",
+        action="store_true",
+        help="Also drop this job's filesystem access. Usually needed with --run-on cloud.",
     )
     cron_notepad = cron_sub.add_parser("notepad", help="What a job remembers.")
     cron_notepad.add_argument("id")
@@ -451,19 +590,317 @@ def build_command_parser() -> argparse.ArgumentParser:
         help="Only attempts that never reached a terminal state.",
     )
 
+    cron_serve = cron_sub.add_parser(
+        "serve",
+        help="Answer fires from a hosted scheduler. The runner's whole job.",
+    )
+    cron_serve.add_argument(
+        "--host",
+        default="0.0.0.0",
+        help="Bind address. The default is right inside a container and wrong on a laptop.",
+    )
+    cron_serve.add_argument("--port", type=int, default=8080)
+
+    cron_push = cron_sub.add_parser(
+        "push", help="Arm a cloud job on the server, or every cloud job."
+    )
+    cron_push.add_argument("id", nargs="?", default="")
+
+    cron_runs = cron_sub.add_parser(
+        "runs", help="What the hosted runner has done while you were away."
+    )
+    cron_runs.add_argument("-n", type=int, default=20, dest="limit")
+
+    cron_fires = cron_sub.add_parser(
+        "fires", help="Every fire this machine was asked to run, and what became of it."
+    )
+    cron_fires.add_argument("id", nargs="?", default="")
+    cron_fires.add_argument(
+        "--unresolved",
+        action="store_true",
+        help="Only fires whose lease ran out with nothing recorded.",
+    )
+
     cron_sub.add_parser("install", help="Run the scheduler in the background, at login.")
     cron_sub.add_parser("uninstall", help="Remove the background scheduler.")
     cron_sub.add_parser("service", help="Whether the background scheduler is installed.")
+
+    hooks_parser = sub.add_parser(
+        "hooks",
+        help="Shell scripts run at lifecycle events.",
+        description=HOOKS_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    hooks_sub = hooks_parser.add_subparsers(dest="hooks_command")
+    hooks_sub.add_parser("list", help="Configured hooks, and whether they may run.")
+    hooks_test = hooks_sub.add_parser("test", help="Fire one event now.")
+    hooks_test.add_argument("event", help="The event to fire.")
+    hooks_test.add_argument(
+        "--for-tool", default="", help="Pretend the call was this tool."
+    )
+    hooks_test.add_argument(
+        "--payload-file", default="", help="JSON object merged into the payload."
+    )
+    hooks_revoke = hooks_sub.add_parser("revoke", help="Withdraw an approval.")
+    # `target`, not `command`: the top-level subparser already writes its verb
+    # to `args.command`, and a second argument of that name silently overwrites
+    # it — `hooks revoke X` then dispatches as though the verb were X.
+    hooks_revoke.add_argument(
+        "target", help="The command line, exactly as it appears in the config."
+    )
+    hooks_sub.add_parser("doctor", help="Check every configured hook.")
+
+    sub.add_parser(
+        "acp",
+        help="Speak the Agent Client Protocol on stdin/stdout, for an editor.",
+        description=(
+            "Runs this agent as an editor's, over the Agent Client Protocol.\n"
+            "Point your editor's ACP agent configuration at:\n\n"
+            "    andromeda acp\n\n"
+            "Nothing else may write to stdout while it runs — the protocol is "
+            "the stream."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    curator_parser = sub.add_parser(
+        "curator", help="The skill library, and keeping it honest."
+    )
+    curator_sub = curator_parser.add_subparsers(dest="curator_command")
+    curator_status = curator_sub.add_parser("status", help="What is tracked, and its state.")
+    curator_status.add_argument("--workspace", default="")
+    curator_sweep = curator_sub.add_parser(
+        "sweep", help="Move skills between active, stale and archived."
+    )
+    curator_sweep.add_argument("--workspace", default="")
+    curator_sweep.add_argument(
+        "--dry-run", action="store_true", help="Say what would move, change nothing."
+    )
+    curator_review = curator_sub.add_parser(
+        "review", help="Ask a model what it would change. Proposals only."
+    )
+    curator_review.add_argument("--workspace", default="")
+    curator_review.add_argument(
+        "--show", action="store_true", help="Print the last proposals without a new run."
+    )
+    curator_pin = curator_sub.add_parser("pin", help="Never sweep this one.")
+    curator_pin.add_argument("name")
+    curator_pin.add_argument("--workspace", default="")
+    curator_unpin = curator_sub.add_parser("unpin", help="Take that back.")
+    curator_unpin.add_argument("name")
+    curator_unpin.add_argument("--workspace", default="")
+    curator_restore = curator_sub.add_parser("restore", help="Bring an archived skill back.")
+    curator_restore.add_argument("name")
+    curator_sub.add_parser("pause", help="Stop sweeping until further notice.")
+    curator_sub.add_parser("resume", help="Start again.")
+
+    completion_parser = sub.add_parser(
+        "completion",
+        help="Print a shell completion script.",
+        description=(
+            "Generated from this program's own argument parser, so it is never "
+            "out of date.\n\n"
+            "  bash:  eval \"$(andromeda completion bash)\"   in ~/.bashrc\n"
+            "  zsh:   eval \"$(andromeda completion zsh)\"    in ~/.zshrc\n"
+            "  fish:  andromeda completion fish | source     in your config"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    completion_parser.add_argument("shell", choices=list(completion.SHELLS))
+
+    skills_parser = sub.add_parser(
+        "skills", help="Skills on this machine, and what the scan found."
+    )
+    skills_sub = skills_parser.add_subparsers(dest="skills_command")
+    skills_list = skills_sub.add_parser("list", help="Every skill, and its verdict.")
+    skills_list.add_argument("--workspace", default="", help="Directory to look in.")
+    skills_scan = skills_sub.add_parser(
+        "scan", help="What a skill contains that is worth knowing about."
+    )
+    skills_scan.add_argument("name", nargs="?", default="", help="One skill, or all.")
+    skills_scan.add_argument("--workspace", default="", help="Directory to look in.")
+    skills_trust = skills_sub.add_parser(
+        "trust", help="Use a withheld skill anyway, at its current content."
+    )
+    skills_trust.add_argument("name")
+    skills_trust.add_argument("--workspace", default="", help="Directory to look in.")
+    skills_untrust = skills_sub.add_parser("untrust", help="Take that back.")
+    skills_untrust.add_argument("name")
+
+    status_parser = sub.add_parser(
+        "status", help="What this install is set to, and what it has spent."
+    )
+    status_parser.add_argument(
+        "--days", type=int, default=7, help="How far back the usage total reaches."
+    )
+
+    lsp_parser = sub.add_parser(
+        "lsp", help="Language servers used for diagnostics after an edit."
+    )
+    lsp_sub = lsp_parser.add_subparsers(dest="lsp_command")
+    lsp_status = lsp_sub.add_parser(
+        "status", help="What would run here, and what is missing."
+    )
+    lsp_status.add_argument("--path", default="", help="Directory to inspect.")
+    lsp_sub.add_parser("servers", help="Every language server this harness knows.")
+
+    worktrees_parser = sub.add_parser(
+        "worktrees", help="Working copies delegated lanes left behind."
+    )
+    worktrees_sub = worktrees_parser.add_subparsers(dest="worktrees_command")
+    worktrees_list = worktrees_sub.add_parser("list", help="Every lane worktree.")
+    worktrees_list.add_argument("--repo", default="", help="Repository to inspect.")
+    worktrees_prune = worktrees_sub.add_parser(
+        "prune", help="Remove the ones holding nothing."
+    )
+    worktrees_prune.add_argument("--repo", default="", help="Repository to inspect.")
+    worktrees_prune.add_argument(
+        "--dry-run", action="store_true", help="Say what would go, change nothing."
+    )
+
+    batch_parser = sub.add_parser(
+        "batch",
+        help="Run one prompt over every row of a file.",
+        description=(
+            "Each row gets its own conversation, and its answer is appended to "
+            "a results file the moment it lands — so a run that stops half-way "
+            "is resumed rather than repeated.\n\n"
+            "  andromeda batch tickets.jsonl --prompt 'Classify: {body}'\n"
+            "  andromeda batch tickets.jsonl --resume\n\n"
+            "A JSONL row's `id` is what --resume matches on. Rows without one "
+            "are matched by line number, so reordering the file breaks a resume."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    batch_parser.add_argument(
+        "path",
+        nargs="?",
+        default="",
+        help="A .jsonl file, or one item per line. Omit with --show.",
+    )
+    batch_parser.add_argument(
+        "--prompt",
+        default="",
+        help="Template. {field} is replaced from each row; omit to use its `prompt`.",
+    )
+    batch_parser.add_argument("--out", default="", help="Where results go.")
+    batch_parser.add_argument(
+        "--jobs", type=int, default=1, help="How many rows to run at once."
+    )
+    batch_parser.add_argument(
+        "--resume", action="store_true", help="Skip rows already in the results."
+    )
+    batch_parser.add_argument("--workspace", default="", help="Directory to run in.")
+    batch_parser.add_argument(
+        "--dry-run", action="store_true", help="Say what would run, spend nothing."
+    )
+    batch_parser.add_argument(
+        "--show", default="", metavar="RESULTS", help="Print a results file instead."
+    )
+    batch_parser.add_argument(
+        "--failures", action="store_true", help="With --show, only the failures."
+    )
+
+    pause_parser = sub.add_parser(
+        "pause",
+        help="Hold scheduled jobs. Your own terminal is unaffected.",
+        description=(
+            "Stops the scheduler firing anything new. Work already running is "
+            "never killed, and an interactive session is never touched — this "
+            "holds the work nobody is watching. `andromeda resume` lifts it, "
+            "and the next tick picks up with no restart."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    pause_parser.add_argument(
+        "--reason", default="", help="Why, for whoever reads it later."
+    )
+    sub.add_parser("resume", help="Lift the hold set by `andromeda pause`.")
 
     approvals_parser = sub.add_parser("approvals", help="Learned approvals.")
     approvals_sub = approvals_parser.add_subparsers(dest="approvals_command")
     forget = approvals_sub.add_parser("forget", help="Ask about this tool again.")
     forget.add_argument("tool")
     approvals_sub.add_parser("clear", help="Forget every learned approval.")
+    approvals_test = approvals_sub.add_parser(
+        "test", help="What the gate would do with a tool, without running it."
+    )
+    approvals_test.add_argument("tool")
+    approvals_test.add_argument(
+        "--mode",
+        default="",
+        choices=["auto", "ask", "deny"],
+        help="Try a different approval mode than the configured one.",
+    )
+    approvals_test.add_argument("--workspace", default="")
+    approvals_suggest = approvals_sub.add_parser(
+        "suggest", help="Tools you have approved often enough to stop being asked."
+    )
+    approvals_suggest.add_argument(
+        "--apply", default="", help="Numbers from the list, comma separated."
+    )
+
+    cloud_parser = sub.add_parser(
+        "cloud", help="Your hosted runner — the thing that fires jobs while you are away."
+    )
+    cloud_sub = cloud_parser.add_subparsers(dest="cloud_command")
+    cloud_up = cloud_sub.add_parser("up", help="Register a runner you have deployed.")
+    cloud_up.add_argument(
+        "endpoint",
+        nargs="?",
+        default="",
+        help="Its https URL — `modal deploy cli/modal_app.py` prints one.",
+    )
+    cloud_up.add_argument("--provider", default="modal")
+    cloud_sub.add_parser("status", help="Whether a runner exists and is answering.")
+    cloud_down = cloud_sub.add_parser(
+        "down", help="Disarm every cloud job and revoke the runner's credential."
+    )
+    cloud_down.add_argument(
+        "--yes", action="store_true", help="Required. It revokes a credential."
+    )
+
+    secrets_parser = sub.add_parser(
+        "secrets", help="Credentials resolved from a vault."
+    )
+    secrets_sub = secrets_parser.add_subparsers(dest="secrets_command")
+    secrets_get = secrets_sub.add_parser("get", help="Check one, masked.")
+    secrets_get.add_argument("name", help="The environment-variable name.")
+    secrets_put = secrets_sub.add_parser(
+        "put", help="Store a credential a hosted job can use."
+    )
+    secrets_put.add_argument("name", help="The environment variable it becomes.")
+    secrets_put.add_argument(
+        "value",
+        nargs="?",
+        default="",
+        help="Omit it and you are prompted — an argument is a line in your shell history.",
+    )
+    secrets_put.add_argument(
+        "--cloud",
+        action="store_true",
+        help=(
+            "Required. Every other scheme references THIS machine and cannot "
+            "follow a job into a container; this is the one that can."
+        ),
+    )
+    secrets_list = secrets_sub.add_parser(
+        "list", help="Hosted secrets, by name. Never values."
+    )
+    secrets_list.add_argument("--cloud", action="store_true")
+    secrets_forget = secrets_sub.add_parser("forget", help="Remove a hosted secret.")
+    secrets_forget.add_argument("name")
+    secrets_forget.add_argument("--cloud", action="store_true")
+    secrets_sub.add_parser("schemes", help="What this build can read from.")
+    secrets_sub.add_parser("example", help="Print a starter `secrets:` block.")
 
     mcp_parser = sub.add_parser("mcp", help="Configured MCP servers.")
     mcp_sub = mcp_parser.add_subparsers(dest="mcp_command")
     mcp_sub.add_parser("example", help="Print a starter mcp.json.")
+    mcp_login = mcp_sub.add_parser("login", help="Authorize an OAuth MCP server.")
+    mcp_login.add_argument("server", help="The name from mcp.json.")
+    mcp_logout = mcp_sub.add_parser("logout", help="Forget an MCP server's tokens.")
+    mcp_logout.add_argument("server", help="The name from mcp.json.")
 
     browser_parser = sub.add_parser("browser", help="The browser tools.")
     browser_sub = browser_parser.add_subparsers(dest="browser_command")
@@ -652,8 +1089,117 @@ def _run_command(argv: list[str]) -> int:
     if args.command == "update":
         return update_cmd.run(check_only=args.check)
 
+    if args.command == "hooks":
+        if args.hooks_command == "test":
+            return hooks_cmd.test(
+                args.event, for_tool=args.for_tool, payload_file=args.payload_file
+            )
+        if args.hooks_command == "revoke":
+            return hooks_cmd.revoke(args.target)
+        if args.hooks_command == "doctor":
+            return hooks_cmd.doctor()
+        return hooks_cmd.show_list()
+
+    if args.command == "batch":
+        if args.show:
+            return batch_cmd.show(args.show, failures_only=args.failures)
+        if not args.path:
+            output.fail("andromeda batch needs a file.", "andromeda batch rows.jsonl")
+            return 2
+        return batch_cmd.run(
+            args.path,
+            prompt=args.prompt,
+            out=args.out,
+            jobs=args.jobs,
+            resume=args.resume,
+            workspace=args.workspace,
+            dry_run=args.dry_run,
+        )
+
+    if args.command in {"pause", "resume"}:
+        from andromeda_agent import pause as pause_module
+
+        home = config_module.home()
+        if args.command == "resume":
+            if pause_module.disengage(home):
+                output.ok("Resumed. Scheduled jobs pick up on the next tick.")
+            else:
+                output.info("Not paused.")
+            return 0
+        path = pause_module.engage(home, args.reason)
+        detail = f" — {args.reason}" if args.reason else ""
+        output.ok(f"Paused{detail}.")
+        output.info(f"  {path}")
+        output.info(
+            "  Scheduled jobs are on hold. Work already running is untouched, "
+            "and your own sessions are unaffected."
+        )
+        return 0
+
+    if args.command == "acp":
+        from .commands import acp_cmd
+
+        return acp_cmd.run()
+
+    if args.command == "curator":
+        if args.curator_command == "sweep":
+            return curator_cmd.sweep(args.workspace, dry_run=args.dry_run)
+        if args.curator_command == "review":
+            return curator_cmd.review(args.workspace, show_only=args.show)
+        if args.curator_command == "pin":
+            return curator_cmd.pin(args.name, args.workspace)
+        if args.curator_command == "unpin":
+            return curator_cmd.unpin(args.name, args.workspace)
+        if args.curator_command == "restore":
+            return curator_cmd.restore(args.name)
+        if args.curator_command == "pause":
+            return curator_cmd.pause()
+        if args.curator_command == "resume":
+            return curator_cmd.resume()
+        return curator_cmd.status(getattr(args, "workspace", ""))
+
+    if args.command == "completion":
+        # The verb parser, not the bare one: completion is for the verbs, and
+        # the bare form is a free-text prompt with nothing to complete.
+        print(completion.generate(args.shell, build_command_parser()), end="")
+        return 0
+
+    if args.command == "skills":
+        if args.skills_command == "scan":
+            return skills_cmd.scan(args.name, workspace=args.workspace)
+        if args.skills_command == "trust":
+            return skills_cmd.trust(args.name, workspace=args.workspace)
+        if args.skills_command == "untrust":
+            return skills_cmd.untrust(args.name)
+        return skills_cmd.show_list(getattr(args, "workspace", ""))
+
+    if args.command == "status":
+        return status_cmd.run(days=max(1, int(getattr(args, "days", 7))))
+
+    if args.command == "lsp":
+        if args.lsp_command == "servers":
+            return lsp_cmd.servers()
+        return lsp_cmd.status(getattr(args, "path", ""))
+
+    if args.command == "worktrees":
+        if args.worktrees_command == "prune":
+            return worktrees_cmd.prune(args.repo, dry_run=args.dry_run)
+        return worktrees_cmd.show_list(getattr(args, "repo", ""))
+
+    if args.command == "cloud":
+        from .commands import cloud_cmd
+
+        if args.cloud_command == "up":
+            return cloud_cmd.up(args.endpoint, provider=args.provider)
+        if args.cloud_command == "status":
+            return cloud_cmd.status()
+        if args.cloud_command == "down":
+            return cloud_cmd.down(yes=args.yes)
+        cloud_parser.print_help()
+        return 2
+
     if args.command == "doctor":
-        return doctor.run()
+        return doctor.run(cloud=args.cloud)
 
     if args.command == "setup":
         from .commands import setup as setup_cmd
@@ -670,7 +1216,17 @@ def _run_command(argv: list[str]) -> int:
     if args.command == "eval":
         if args.pattern == "list":
             return evals.show_list(root=args.root)
-        return evals.run(pattern=args.pattern, as_json=args.as_json, root=args.root)
+        if args.pattern == "report":
+            return evals.report(root=args.root)
+        if args.pattern == "runs":
+            return evals.show_runs()
+        return evals.run(
+            pattern=args.pattern,
+            as_json=args.as_json,
+            root=args.root,
+            repeat=args.repeat,
+            jobs=args.jobs,
+        )
 
     if args.command == "cron":
         if args.cron_command == "add":
@@ -693,6 +1249,10 @@ def _run_command(argv: list[str]) -> int:
                 tools=args.tools,
                 skills=args.skill,
                 attach_to=args.attach,
+                cloud=args.cloud,
+                detached=args.detached,
+                repo_url=args.repo_url,
+                repo_ref=args.repo_ref,
             )
         if args.cron_command == "show":
             return cron.show(args.id)
@@ -709,11 +1269,24 @@ def _run_command(argv: list[str]) -> int:
         if args.cron_command == "resume":
             return cron.resume(args.id)
         if args.cron_command == "approve":
-            return cron.approve(args.id, args.approval)
+            return cron.approve(
+                args.id,
+                args.approval,
+                run_on=args.run_on,
+                detached=args.detached,
+            )
         if args.cron_command == "notepad":
             return cron.notepad(args.id, args.action, args.key, args.value)
         if args.cron_command == "daemon":
             return cron.daemon(once=args.once)
+        if args.cron_command == "serve":
+            return cron.serve(host=args.host, port=args.port)
+        if args.cron_command == "push":
+            return cron.push(args.id)
+        if args.cron_command == "runs":
+            return cron.runs(limit=args.limit)
+        if args.cron_command == "fires":
+            return cron.fires(args.id, unresolved_only=args.unresolved)
         if args.cron_command == "suggest":
             if args.suggest_command == "accept":
                 return cron.suggest_accept(args.ref, workspace=args.workspace)
@@ -741,11 +1314,45 @@ def _run_command(argv: list[str]) -> int:
             return approvals.forget(args.tool)
         if args.approvals_command == "clear":
             return approvals.clear()
+        if args.approvals_command == "test":
+            return approvals.test(args.tool, mode=args.mode, workspace=args.workspace)
+        if args.approvals_command == "suggest":
+            return approvals.suggest(apply=args.apply)
         return approvals.show()
+
+    if args.command == "secrets":
+        if args.secrets_command == "get":
+            return secrets_cmd.get(args.name)
+        if args.secrets_command == "put":
+            if not args.cloud:
+                # Refused rather than defaulted. A local `secrets:` block is a
+                # reference somebody writes in config; this command exists only
+                # for the hosted kind, and quietly doing something else would be
+                # a surprise about where a credential just went.
+                output.fail(
+                    "`secrets put` stores a HOSTED secret, so it needs --cloud.",
+                    "Local references go in `secrets:` in config.yaml — "
+                    "`andromeda secrets example` prints a starter block.",
+                )
+                return 2
+            return secrets_cmd.put_cloud(args.name, args.value)
+        if args.secrets_command == "list":
+            return secrets_cmd.list_cloud()
+        if args.secrets_command == "forget":
+            return secrets_cmd.forget_cloud(args.name)
+        if args.secrets_command == "schemes":
+            return secrets_cmd.schemes()
+        if args.secrets_command == "example":
+            return secrets_cmd.example()
+        return secrets_cmd.status()
 
     if args.command == "mcp":
         if args.mcp_command == "example":
             return mcp_cmd.example()
+        if args.mcp_command == "login":
+            return mcp_cmd.login(args.server)
+        if args.mcp_command == "logout":
+            return mcp_cmd.logout(args.server)
         return mcp_cmd.status()
 
     if args.command == "browser":
@@ -891,6 +1498,50 @@ def _take_profile(argv: list[str]) -> tuple[list[str], str]:
     return remaining, name
 
 
+def _apply_secrets(*, warn_literals: bool = True) -> None:
+    """Resolve the `secrets:` block, and never stop the run over it.
+
+    A locked vault at eight in the morning is a reason to say which command
+    unlocks it, not a reason `andromeda auth status` cannot run. Everything
+    that does not need that credential still works, and the one thing that does
+    fails with its own message when it is reached.
+
+    `warn_literals` is off for `andromeda secrets` itself, which says the same
+    thing better and in place. The startup warning exists for the people who
+    never run that command; saying it twice to the person who just did is how a
+    warning becomes something to scroll past.
+    """
+    from andromeda_agent import secrets as secrets_module
+
+    try:
+        config = config_module.load()
+    except config_module.ConfigError:
+        # Reported by whichever path reads the config next, with the file name
+        # and the parse error. Saying it twice, differently, is worse.
+        return
+
+    # Said at startup and not only when someone runs `andromeda secrets`: a
+    # pasted credential here is a plaintext key in a file documented as safe to
+    # print and to commit, and it stays one until somebody is told.
+    for name in secrets_module.literal_values(config) if warn_literals else ():
+        output.fail(
+            f"secrets.{name} is a value, not a reference — it is sitting in "
+            f"{config_module.config_path()} in plain text.",
+            "Move it into a vault. `andromeda secrets example`",
+        )
+
+    mapping = secrets_module.from_config(config)
+    if not mapping:
+        return
+
+    for failure in secrets_module.apply(mapping).failures:
+        output.fail(
+            f"{failure.name}: could not read "
+            f"{secrets_module.safe_reference(failure.reference)}",
+            failure.remedy,
+        )
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
 
@@ -915,6 +1566,15 @@ def main(argv: list[str] | None = None) -> int:
         # them is a change that would be forgotten in exactly one place.
         os.environ[profiles.ENV_PROFILE] = resolved
 
+    # Vault-backed credentials, before anything reads the environment — which
+    # means before the provider is built, before an MCP server's `env` block is
+    # expanded, and before the first `terminal` call inherits it.
+    #
+    # Here rather than inside `config.load()` for two reasons: `load()` is
+    # called many times in a run and has to stay a file read, and the resolvers
+    # live in the agent package, which already imports this one.
+    _apply_secrets(warn_literals=not (argv and argv[0] == "secrets"))
+
     if argv and argv[0] in COMMANDS:
         try:
             return _run_command(argv)
@@ -929,6 +1589,16 @@ def main(argv: list[str] | None = None) -> int:
     except config_module.ConfigError as exc:
         output.fail(str(exc))
         return 2
+
+    # Before any surface opens, because a hook on `on_session_start` has to be
+    # registered before the session starts. On a terminal this is where the
+    # one-time approval prompt appears; with no terminal and no opt-in nothing
+    # registers at all, which is the point.
+    from andromeda_agent import shell_hooks
+
+    shell_hooks.register_from_config(
+        config, accept_hooks=getattr(args, "accept_hooks", False)
+    )
 
     resumed = None
     if args.resume or args.continue_last:

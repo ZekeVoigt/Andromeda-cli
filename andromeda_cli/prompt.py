@@ -35,6 +35,7 @@ from __future__ import annotations
 import os
 import select
 import sys
+import termios
 from contextlib import contextmanager
 from typing import Sequence
 
@@ -247,7 +248,17 @@ def _choose_by_key(
                     else:
                         continue
                     live.update(_render(options, selected, hint), refresh=True)
-        except (OSError, ValueError, KeyboardInterrupt):
+        except (OSError, ValueError, KeyboardInterrupt, termios.error):
+            # `termios.error` is deliberately in this list even though it looks
+            # redundant next to `OSError` — it is NOT a subclass of one, so a
+            # terminal that cannot be configured escaped this handler and came
+            # out as a crash. That is the case this whole branch exists for: a
+            # terminal nobody can read is a terminal that did not answer, and
+            # the answer to "did not answer" is None, never the default.
+            #
+            # It happens for real. A pty whose other end has closed raises
+            # EIO from `tcgetattr` on Linux and returns EOF on macOS, so the
+            # platform decided whether this was a clean refusal or a traceback.
             return None
         finally:
             live.update(_render(options, selected, hint), refresh=True)

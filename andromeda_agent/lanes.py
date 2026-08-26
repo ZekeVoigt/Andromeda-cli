@@ -82,8 +82,15 @@ class LaneRegistry:
         self._pool = ThreadPoolExecutor(
             max_workers=max_concurrent, thread_name_prefix="andromeda-lane"
         )
-        # Held for the whole life of a lane that needs the browser.
-        self._browser_lock = threading.Lock()
+        # One lock per exclusive surface, held for the whole life of a lane
+        # that needs it. Two surfaces today: the browser, because there is one
+        # browser; and the working tree, because two lanes writing the same
+        # directory interleave their edits. A lane with its own git worktree
+        # does not take the tree lock — that is the whole point of having one.
+        self._surface_locks: dict[str, threading.Lock] = {
+            "browser": threading.Lock(),
+            "tree": threading.Lock(),
+        }
 
     # ---- starting ---------------------------------------------------------
 
@@ -94,6 +101,7 @@ class LaneRegistry:
         task: str,
         run: Callable[["Lane"], Any],
         exclusive_browser: bool = False,
+        exclusive: str = "",
     ) -> Lane:
         lane = Lane(
             id=f"l{uuid.uuid4().hex[:6]}",
@@ -104,17 +112,20 @@ class LaneRegistry:
         with self._lock:
             self._lanes[lane.id] = lane
 
+        surface = "browser" if exclusive_browser else (exclusive or "")
+        held = self._surface_locks.get(surface)
+
         def body() -> Any:
             # Slot first, surface second. This function is already running on a
-            # pool worker, so the slot is held; taking the browser here cannot
+            # pool worker, so the slot is held; taking a surface here cannot
             # deadlock against a lane waiting for a slot.
-            if exclusive_browser:
-                self._browser_lock.acquire()
+            if held is not None:
+                held.acquire()
             try:
                 return run(lane)
             finally:
-                if exclusive_browser:
-                    self._browser_lock.release()
+                if held is not None:
+                    held.release()
 
         future = self._pool.submit(body)
         lane._future = future

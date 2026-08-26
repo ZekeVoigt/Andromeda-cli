@@ -148,6 +148,12 @@ def _describe(job) -> str:
     if job.is_monitored:
         parts.append(f"  watches {job.monitor_kind} {job.monitor_source}")
     parts.append(f"  approval {job.approval_mode} · created by {job.origin}")
+    # Where it runs, so a report about "your scheduled jobs" cannot claim a
+    # local job survives a closed laptop, or that a hosted one is stoppable
+    # from here.
+    where = "a hosted runner" if job.runs_on == "cloud" else "this machine"
+    reach = "no filesystem" if job.workspace_kind == "detached" else job.workspace
+    parts.append(f"  runs on {where} · reaches {reach}")
     last = job.last_run
     if last is not None:
         parts.append(f"  last {last.status}: {(last.summary or last.error)[:160]}")

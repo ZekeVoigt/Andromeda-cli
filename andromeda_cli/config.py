@@ -72,6 +72,58 @@ DEFAULTS: dict[str, Any] = {
     # back to `json` for the same reason `cron_provider` does — a typo in a
     # setting must not take away the agent's memory.
     "memory_backend": "json",
+    # Whether the skill library tidies itself. The sweep is arithmetic — it
+    # moves agent-written skills between active, stale and archived from their
+    # last use, and every move is reversible. It never touches a skill you
+    # wrote, and never deletes anything.
+    "curator": True,
+    "curator_interval_days": 7,
+    "curator_stale_days": 30,
+    "curator_archive_days": 90,
+    # How connected MCP tools are offered to the model. `auto` and `on` put
+    # them behind `tool_search`/`tool_describe`/`tool_call`, so their schemas
+    # are not paid for on every request; `off` lists every one of them every
+    # time. Built-in tools are never affected — they are always listed.
+    "tool_search": "auto",
+    # The most context the deferred-tool listing may take. It degrades from
+    # a name-and-description line per tool, to names only, to a count per
+    # server. 0 means never embed one, which leaves the model searching
+    # blind — usually the wrong trade.
+    "tool_search_listing_tokens": 4000,
+    # One git worktree per delegated lane, branched from HEAD. Off by default
+    # because it only pays for itself in a git repository where lanes actually
+    # write — for a session that reads and reports, it is a directory per lane
+    # and nothing else. Ignored outside a git repository.
+    "worktree_isolation": False,
+    # Whether a shell hook named in the `hooks:` block may register without
+    # being confirmed at a prompt. Off, because the prompt is the whole point:
+    # a hook runs a command on this machine with the user's credentials, from
+    # a file a `git pull` can change under them. Turn it on for a machine that
+    # provisions its own config and has nobody at the keyboard to ask.
+    "hooks_auto_accept": False,
+    # Whether a session inside a codebase gets the coding posture: an
+    # operating brief, a snapshot of the repository, and the project's own
+    # AGENTS.md / CLAUDE.md / .cursorrules. `auto` decides from the working
+    # directory — a manifest or a git repository that actually holds code —
+    # so a session in a notes folder is unaffected. `on` forces it anywhere;
+    # `off` disables it, context files included.
+    "coding_context": "auto",
+    # Standing rules for coding work that belong to this install rather than to
+    # a checkout: "never run the formatter without asking", "this machine's
+    # Python is 3.11". A string or a list of them. Project conventions belong
+    # in the repository's own AGENTS.md, which travels with it.
+    "coding_instructions": "",
+    # Whether an edit is followed by the project's own language server saying
+    # what it broke. On, because the whole point of a coding harness is that it
+    # finds out before the user does. Nothing is ever installed to make this
+    # work: a language server that is not on this machine is named, with the
+    # command that would install it, and the edit proceeds without diagnostics.
+    "lsp": True,
+    # Which severities are reported. `error` alone by default — a warning is a
+    # matter of taste the project's own linter settles, and a model that stops
+    # to fix every hint never finishes. Accepts a list or a comma-separated
+    # string of error/warning/info/hint, or `all`.
+    "lsp_severities": "error",
     # Off by default. The URL a fetch or a navigation uses comes from the
     # model, and this machine sits inside the user's own network — a metadata
     # endpoint, a router page, a service bound to localhost. Turning it on is
@@ -180,6 +232,8 @@ VALID_VALUES: dict[str, tuple[str, ...]] = {
     "approval_mode": ("auto", "ask", "deny"),
     "max_tier": ("safe_local", "outbound", "destructive", "irreversible"),
     "memory_backend": ("json", "sqlite"),
+    "tool_search": ("auto", "on", "off"),
+    "coding_context": ("auto", "on", "off"),
 }
 
 

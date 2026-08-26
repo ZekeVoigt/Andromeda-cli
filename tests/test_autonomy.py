@@ -1261,3 +1261,96 @@ class TestTheProviderSeam:
 
         methods = set(dir(providers_cron.BuiltIn))
         assert "add" not in methods and "approve" not in methods
+
+
+def test_reloading_a_store_drops_a_job_someone_removed(tmp_path):
+    """`load` replaces what is held; it does not merge into it.
+
+    The hosted runner re-reads on every fire, because jobs are created and
+    removed by other processes while it sleeps. Merging would keep a deleted job
+    alive in memory and let it fire after somebody removed it, which is the one
+    thing a person expects `cron rm` to make impossible.
+    """
+    path = tmp_path / "cron.json"
+    first = Schedule(path)
+    kept = first.add("every 1h", "keep me", str(tmp_path))
+    doomed = first.add("every 1h", "remove me", str(tmp_path))
+
+    second = Schedule(path)
+    assert second.resolve(doomed.id) is not None
+
+    first.remove(doomed.id)
+    second.load()
+
+    assert second.resolve(doomed.id) is None
+    assert second.resolve(kept.id) is not None
+
+
+def test_a_corrupt_store_keeps_the_last_good_jobs_rather_than_emptying(tmp_path):
+    """Running the last known-good set beats running nothing, and the file is
+    left for a person to look at."""
+    path = tmp_path / "cron.json"
+    store = Schedule(path)
+    job = store.add("every 1h", "do the thing", str(tmp_path))
+
+    path.write_text("{ not json", encoding="utf-8")
+    store.load()
+
+    assert store.resolve(job.id) is not None
+
+
+def test_an_unreadable_store_is_an_error_not_an_empty_schedule(tmp_path):
+    """"I could not read the store" must never read as "there are no jobs".
+
+    Found on a real deployment: a management command run over `fly ssh`
+    executes as root and wrote `cron.json` 0600 root-owned. The runner runs
+    unprivileged, its read raised `PermissionError`, and `load` swallowed it —
+    so the fire endpoint answered "no such job" for a job the operator had seen
+    in `cron list` one command earlier.
+    """
+    path = tmp_path / "cron.json"
+    store = Schedule(path)
+    job = store.add("every 1h", "do the thing", str(tmp_path))
+
+    path.chmod(0o000)
+    try:
+        store.load()
+        # The jobs already held are kept — running the last known-good set beats
+        # running nothing.
+        assert store.resolve(job.id) is not None
+        assert "could not be read" in store.load_error
+    finally:
+        path.chmod(0o600)
+
+
+def test_a_readable_store_clears_a_previous_error(tmp_path):
+    """Otherwise one bad read poisons every surface until a restart."""
+    path = tmp_path / "cron.json"
+    store = Schedule(path)
+    store.add("every 1h", "do the thing", str(tmp_path))
+
+    path.chmod(0o000)
+    store.load()
+    assert store.load_error
+    path.chmod(0o600)
+    store.load()
+    assert store.load_error == ""
+
+
+def test_a_missing_store_is_genuinely_empty_and_not_an_error(tmp_path):
+    """The one case where "no jobs" is the truth."""
+    store = Schedule(tmp_path / "never-written.json")
+    assert store.all() == []
+    assert store.load_error == ""
+
+
+def test_corrupt_json_says_so_and_keeps_the_last_good_set(tmp_path):
+    path = tmp_path / "cron.json"
+    store = Schedule(path)
+    job = store.add("every 1h", "do the thing", str(tmp_path))
+
+    path.write_text("{ not json", encoding="utf-8")
+    store.load()
+
+    assert store.resolve(job.id) is not None
+    assert "not valid JSON" in store.load_error

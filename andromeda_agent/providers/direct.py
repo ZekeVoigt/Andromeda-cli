@@ -7,6 +7,7 @@ from typing import Any
 
 from openai import OpenAI
 
+from .. import redact
 from ..errors import AgentError
 from .base import Provider
 
@@ -22,6 +23,10 @@ def build_direct(config: dict[str, Any]) -> Provider:
                 "`andromeda config set provider relay`."
             ),
         )
+
+    # The user's own key, and the one most likely to be echoed back: it is in
+    # the environment, so `env` and `printenv` both print it.
+    redact.register_known(key, env_name)
 
     base = str(config.get("direct_base_url") or "").rstrip("/")
     if not base:

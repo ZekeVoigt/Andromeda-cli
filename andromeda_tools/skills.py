@@ -159,21 +159,78 @@ def parse_skill(path: Path) -> Skill | None:
     )
 
 
-def discover(start: Path | None = None) -> dict[str, Skill]:
-    root = resolve_skills_dir(start)
-    if root is None:
-        return {}
+def skills_dirs(start: Path | None = None) -> list[Path]:
+    """Every directory skills are read from, furthest first.
 
+    Layered rather than first-match, and that is a deliberate change from what
+    this did originally. "A project's own skills override what we ship" was
+    implemented as *replace*: one `skills/` directory in a repository hid the
+    user's entire personal library, including anything the agent had written
+    for itself. Override means per name — the nearest layer wins a collision,
+    and everything else is still there.
+
+    Furthest first so the nearest can overwrite it: bundled, then your own,
+    then the workspace. `ANDROMEDA_BUNDLED_SKILLS_DIR` still replaces the lot,
+    because a test or a packaging step that pins the directory means it.
+    """
+    override = os.environ.get(ENV_SKILLS_DIR, "").strip()
+    if override:
+        candidate = Path(override).expanduser()
+        return [candidate] if candidate.is_dir() else []
+
+    roots: list[Path] = []
+
+    bundled = bundled_skills_dir()
+    if bundled is not None:
+        roots.append(bundled)
+
+    home_override = os.environ.get("ANDROMEDA_HOME", "").strip()
+    root = Path(home_override).expanduser() if home_override else Path.home() / ".andromeda-cli"
+    personal = root / "skills"
+    if _looks_like_skills_dir(personal):
+        roots.append(personal)
+
+    current = (start or Path.cwd()).resolve()
+    for _ in range(MAX_WALK_UP):
+        candidate = current / "skills"
+        if _looks_like_skills_dir(candidate):
+            roots.append(candidate)
+            break
+        if current.parent == current:
+            break
+        current = current.parent
+
+    # De-duplicated by resolved path, keeping the first occurrence: running
+    # inside the install's own checkout makes the workspace and the bundled
+    # directory the same place, and reading it twice would be harmless but
+    # would report every skill as coming from wherever it was read last.
+    seen: set[Path] = set()
+    ordered: list[Path] = []
+    for path in roots:
+        try:
+            key = path.resolve()
+        except OSError:
+            key = path
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(path)
+    return ordered
+
+
+def discover(start: Path | None = None) -> dict[str, Skill]:
     skills: dict[str, Skill] = {}
-    for entry in sorted(root.iterdir()):
-        if not entry.is_dir() or entry.name.startswith("."):
-            continue
-        skill_file = entry / SKILL_FILE
-        if not skill_file.exists():
-            continue
-        skill = parse_skill(skill_file)
-        if skill is not None:
-            skills[skill.name] = skill
+    for root in skills_dirs(start):
+        for entry in sorted(root.iterdir()):
+            if not entry.is_dir() or entry.name.startswith("."):
+                continue
+            skill_file = entry / SKILL_FILE
+            if not skill_file.exists():
+                continue
+            skill = parse_skill(skill_file)
+            if skill is not None:
+                # Later layer wins the name; everything else survives.
+                skills[skill.name] = skill
     return skills
 
 
@@ -192,7 +249,10 @@ def manifest(skills: dict[str, Skill]) -> str:
 
 
 def load_skill(
-    skills: dict[str, Skill], name: str, resource: str | None = None
+    skills: dict[str, Skill],
+    name: str,
+    resource: str | None = None,
+    home: "Path | None" = None,
 ) -> ToolResult:
     skill = skills.get(name)
     if skill is None:
@@ -215,6 +275,14 @@ def load_skill(
             )
         except (OSError, UnicodeDecodeError) as exc:
             return failure(f"Could not read {resource}: {exc}")
+
+    # Recorded here, at the one place a skill is actually used. Best-effort by
+    # contract — the curator's arithmetic is worth less than a skill that
+    # loads, so a failure to write the record never fails the load.
+    if home is not None:
+        from . import skill_usage
+
+        skill_usage.note_use(home, name)
 
     body = skill.body
     if not skill.available:

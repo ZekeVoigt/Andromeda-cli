@@ -6,6 +6,7 @@ import pytest
 
 from andromeda_agent import Callbacks, Conversation, Policy
 from andromeda_agent.errors import AgentError
+from andromeda_agent import loop as loop_module
 from andromeda_agent.loop import MAX_STEPS
 from andromeda_agent.providers.base import AssistantTurn, ToolCall
 from andromeda_tools import Workspace, build_registry
@@ -241,3 +242,73 @@ def test_reset_clears_the_transcript_and_the_todos(tmp_path):
 def test_the_workspace_root_is_stated_in_the_system_prompt(tmp_path):
     conversation, _ = make(tmp_path, ["ok"])
     assert str(tmp_path.resolve()) in conversation.messages[0]["content"]
+
+
+# ---------------------------------------------------------------------------
+# The system prompt is tailored to the tools the session actually has
+# ---------------------------------------------------------------------------
+
+
+def test_every_prompt_tailoring_key_still_matches_one_line() -> None:
+    """Re-wording the prompt must not silently orphan a conditional line.
+
+    Without this, a rewrite stops the tailoring firing and the prompt goes back
+    to advertising tools the session cannot call — which is the failure the
+    tailoring exists to prevent, and it fails silently.
+    """
+    from andromeda_agent.loop import _PROMPT_REQUIRES
+
+    lines = loop_module.SYSTEM_PROMPT.splitlines()
+    for key, _needed in _PROMPT_REQUIRES:
+        matches = [line for line in lines if key in line]
+        assert len(matches) == 1, f"{key!r} matched {len(matches)} lines"
+
+
+def test_a_read_only_session_is_not_told_how_to_edit(tmp_path) -> None:
+    """`safe_local` is every non-interactive run by default, and it denies both
+    edit tools — so this was live on the most common scripted path."""
+    tailored = loop_module.tailor_prompt(
+        loop_module.SYSTEM_PROMPT, {"read_file", "search_files"}
+    )
+
+    assert "`patch`" not in tailored
+    assert "write_file" not in tailored
+    assert "change real files" not in tailored
+    # What survives is still the whole of the rest.
+    assert "rendered as markdown" in tailored
+    assert "Some tools stop for the user's approval" in tailored
+
+
+def test_a_full_session_keeps_the_whole_prompt() -> None:
+    tailored = loop_module.tailor_prompt(
+        loop_module.SYSTEM_PROMPT,
+        {"read_file", "patch", "write_file", "terminal"},
+    )
+
+    assert tailored == loop_module.SYSTEM_PROMPT
+
+
+def test_no_tool_list_means_no_tailoring() -> None:
+    assert loop_module.tailor_prompt(loop_module.SYSTEM_PROMPT, None) == (
+        loop_module.SYSTEM_PROMPT
+    )
+
+
+def test_the_tailoring_reaches_the_conversation(tmp_path) -> None:
+    from andromeda_agent.approval import Policy
+    from andromeda_tools import Workspace, build_registry
+    from andromeda_tools.todo import TodoList
+
+    workspace = Workspace(str(tmp_path))
+    registry = build_registry(workspace, TodoList())
+    conversation = Conversation(
+        provider=ScriptedProvider(script=["hi"]),
+        # The ceiling a non-interactive run is narrowed to.
+        policy=Policy(mode="auto", enabled=frozenset(registry), max_tier="safe_local"),
+        workspace=workspace,
+        registry=registry,
+    )
+
+    system = conversation.messages[0]["content"]
+
+    assert "Use `patch`" not in system

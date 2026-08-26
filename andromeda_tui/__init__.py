@@ -29,7 +29,7 @@ from typing import Any
 from andromeda_agent import AgentError, build_provider
 from andromeda_cli import config as config_module
 from andromeda_cli import output
-from andromeda_cli.session import build_conversation
+from andromeda_cli.session import build_conversation, ended as session_ended
 
 __all__ = ["available", "run"]
 
@@ -86,6 +86,7 @@ def run(
         interactive=True,
         workspace_root=workspace_root,
         session=resume,
+        surface="tui",
     )
 
     # Same reason as the REPL: an editor that types into new terminals would
@@ -107,8 +108,10 @@ def run(
     try:
         app.run()
     except BaseException as exc:  # noqa: BLE001 - recorded, then re-raised
+        session_ended(conversation, completed=False)
         _record_exit(started, f"{type(exc).__name__}: {exc}")
         raise
+    session_ended(conversation)
     _record_exit(started, "clean")
     return 0
 

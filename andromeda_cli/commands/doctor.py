@@ -1,4 +1,29 @@
-"""What is and is not working, in one screen."""
+"""What is and is not working, in one screen.
+
+`--cloud` asks a different question: not "is this install healthy" but **"could
+this container actually do the job".** They are not the same check and the
+difference is the whole point of having it. A hosted runner is booted by a
+request, does its work, and stops — nobody is at a terminal to notice that
+`rg` is missing or that the volume is full, and the symptom of either is a job
+that fails identically forever until the failure auto-pause catches it five
+runs later.
+
+So the cloud checks are the ones that can only be answered *inside* the
+container, and every one of them is a real failure somebody has had:
+
+  binaries      a job shells out to `git` or `rg`, it works on your Mac, and it
+                fails the moment the runner tries — invisible exactly while you
+                are looking at it
+  ANDROMEDA_HOME  pointing at the image layer instead of the mounted volume
+                means every monitor baseline and notepad is discarded on the
+                next boot, so a watcher re-reports what it already reported,
+                forever, and costs a model turn each time
+  writability   a read-only mount fails at the first save, which is after the
+                model call
+  free space    a partial write to `state.db` is worse than a skipped run
+  no model key  a container holding a provider key is a key on hardware the
+                user does not control
+"""
 
 from __future__ import annotations
 
@@ -21,7 +46,7 @@ def _line(ok: bool, label: str, detail: str = "") -> None:
     output.console.print(f"  {mark} [cyan]{label.ljust(18)}[/cyan] [dim]{detail}[/dim]")
 
 
-def run() -> int:
+def run(cloud: bool = False) -> int:
     from andromeda_cli import __version__
 
     output.console.print(f"\n  [bold]Andromeda CLI {__version__}[/bold]\n")
@@ -36,6 +61,14 @@ def run() -> int:
     _line(True, "home", str(config_module.home()))
     _line(True, "provider", f"{config['provider']} · {config['model']}")
     _line(True, "approval", f"{config['approval_mode']} · ceiling {config['max_tier']}")
+
+    # A paused install is the most confusing thing this program can be if it
+    # does not say so: jobs stop firing and everything else looks healthy.
+    from andromeda_agent import pause as pause_module
+
+    held = pause_module.describe(config_module.home())
+    if held:
+        _line(False, "paused", held)
 
     from andromeda_agent.models import context_window, supports_reasoning
 
@@ -157,5 +190,102 @@ def run() -> int:
     for binary in ("git", "rg"):
         _line(bool(shutil.which(binary)), binary, shutil.which(binary) or "not installed")
 
+    failures = _cloud_checks(config) if cloud else 0
+
     output.console.print()
-    return 0
+    # An exit code, unlike every other check here. `doctor` is read by a person;
+    # `doctor --cloud` is read by a container's healthcheck, and a healthcheck
+    # that always exits 0 is a healthcheck that never fails.
+    return 1 if failures else 0
+
+
+def _cloud_checks(config: dict) -> int:
+    """Everything that can only be answered from inside the runner.
+
+    Returns how many failed, so the caller can turn it into an exit code.
+    """
+    import os
+    import shutil as shutil_module
+
+    output.console.print("\n  [bold]as a hosted runner[/bold]\n")
+    failures = 0
+
+    def check(ok: bool, label: str, detail: str) -> None:
+        nonlocal failures
+        if not ok:
+            failures += 1
+        _line(ok, label, detail)
+
+    # The binaries a tool shells out to. Named explicitly rather than probed
+    # from the registry: the point is to fail the build when the image and the
+    # toolbelt drift apart, and a list derived from the toolbelt would drift
+    # with it silently.
+    for binary in ("git", "rg"):
+        found = shutil_module.which(binary)
+        check(bool(found), f"{binary} present", found or "MISSING — jobs using it will fail")
+
+    # Where the durable disk is mounted. `/data` is what the image declares;
+    # a deployment that mounts elsewhere says so here rather than failing a
+    # check it cannot pass. It is the operator's statement of fact, not a
+    # setting the agent or a job can reach.
+    volume = os.environ.get("ANDROMEDA_CLOUD_VOLUME", "/data")
+    home = config_module.home()
+    on_volume = str(home) == volume or str(home).startswith(volume.rstrip("/") + "/")
+    check(
+        on_volume,
+        "home on volume",
+        f"{home}"
+        + (
+            ""
+            if on_volume
+            else f" — not under {volume}; state is lost on every boot"
+        ),
+    )
+
+    writable = os.access(home, os.W_OK)
+    check(writable, "home writable", "yes" if writable else "NO — the first save will fail")
+
+    try:
+        usage = shutil_module.disk_usage(home)
+        free_mb = usage.free // (1024 * 1024)
+    except OSError:
+        free_mb = 0
+    # 256MB is not a tuned number, it is a floor: `state.db`, a session
+    # transcript and a run's output together are well under it, and anything
+    # below it means the next write is the one that half-lands.
+    check(free_mb >= 256, "free space", f"{free_mb} MB" + ("" if free_mb >= 256 else " — too low to write safely"))
+
+    # A runner must reach the model through the relay, on the account's credit,
+    # with billing authority server-side. A provider key in the environment is
+    # not a convenience here; it is a credential on hardware the user does not
+    # hold.
+    leaked = [
+        name
+        for name in os.environ
+        if name.endswith("_API_KEY") or name in {"OPENAI_API_KEY", "ANTHROPIC_API_KEY"}
+    ]
+    check(
+        not leaked,
+        "no model key",
+        "none in the environment" if not leaked else f"FOUND {', '.join(sorted(leaked))}",
+    )
+
+    # Not a failure, and deliberately so. Skills are user content and live on
+    # the volume (`<home>/skills`), not in the image — a runner is *supposed*
+    # to start with none. It is reported because the failure it precedes is
+    # confusing: a job that names a skill the runner does not have fails on a
+    # missing file, which reads as a broken job rather than as un-synced
+    # content.
+    from andromeda_tools import skills as skills_mod
+
+    found = skills_mod.discover()
+    _line(
+        True,
+        "skills",
+        f"{len(found)} on the volume ({home}/skills)",
+    )
+
+    relay = config.get("provider") == "relay"
+    check(relay, "provider", f"{config.get('provider')}" + ("" if relay else " — a runner must use the relay lane"))
+
+    return failures

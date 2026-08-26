@@ -1,0 +1,90 @@
+# The hosted runner, as a Fly app.
+#
+# The whole shape of this file is one idea: **the machine is stopped almost all
+# the time, and the request that fires a job is what wakes it.** Fly's proxy
+# starts a stopped machine on an inbound request, which is why the trigger
+# (Convex's scheduler) needs no orchestration API and holds no Fly credential —
+# it just makes an HTTP call and the machine appears.
+#
+# Deploy is documented in `docker/RUNBOOK.md`. Nothing here is per-user yet;
+# C7 turns this into a machine-per-account.
+
+app = "andromeda-runner"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  # The volume is the whole of ANDROMEDA_HOME. Stated twice — here and in the
+  # image — because `doctor --cloud` compares them, and a deployment that
+  # mounts somewhere else must say so rather than silently losing state.
+  ANDROMEDA_HOME = "/data"
+  ANDROMEDA_CLOUD_VOLUME = "/data"
+
+# One volume, and therefore one machine: Fly maps volumes to Machines one-to-one
+# and a volume cannot be attached to two at once. That is a structural guarantee
+# rather than a setting, and it is what actually prevents the failure the
+# concurrency block used to claim credit for — two schedulers reading one store,
+# each deciding the same job is due, with `flock` unable to help because it does
+# not cross a machine boundary.
+[[mounts]]
+  source = "andromeda_data"
+  destination = "/data"
+  # A job's monitor baseline, notepad and execution ledger are the only things
+  # that make the *next* run cheaper than the last. Lose the volume and every
+  # watcher re-reports what it already reported, forever, at a model turn each
+  # time. This is not a cache.
+  initial_size = "1gb"
+
+[http_service]
+  # C3's `andromeda cron serve` binds this. Until it exists the service has
+  # nothing behind it and a wake request will 502 — which is correct and
+  # visible, rather than a machine that starts and silently does nothing.
+  internal_port = 8080
+  force_https = true
+
+  # The two lines this file exists for.
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  # Deliberately high, and this is a correction of an earlier version of this
+  # file that set both to 1 with a comment claiming it kept the app to one
+  # machine. It does not. These limits control **routing**, not machine count:
+  # at or above `hard_limit` the proxy stops sending a machine new traffic, and
+  # with `auto_start_machines` it goes looking for another one. Setting them to
+  # 1 would have made two fires that land in the same second queue behind each
+  # other for no reason at all.
+  #
+  # A fire request is milliseconds — `cron serve` answers `202 accepted` and
+  # then works in the background, precisely so a long agent turn never sits in
+  # an HTTP connection. So HTTP concurrency is near zero even while several
+  # jobs are running, and binding on it would be measuring the wrong thing.
+  #
+  # **The real ceiling is how many agent turns fit in this machine's memory**,
+  # and it belongs in `cron serve` where the cost is visible, not in a proxy
+  # that can only count requests. C3 owns it.
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 20
+    hard_limit = 50
+
+# The drain, and the two halves have to agree. `cron serve` catches SIGTERM,
+# stops accepting fires and waits up to 25s for jobs already running; this is
+# the runtime's matching promise not to SIGKILL before then. Set shorter than
+# the drain and the grace period is decorative — the process is killed mid-drain
+# and the fire it was finishing becomes an `unknown` that needs a person.
+kill_signal = "SIGTERM"
+kill_timeout = "30s"
+
+[[vm]]
+  # Sized for one agent turn, not for many. The loop is I/O-bound on the model;
+  # the CPU matters only for the seconds of Python import at wake, which
+  # measured at 0.29s for the modules a fire needs.
+  size = "shared-cpu-1x"
+  memory = "512mb"
+
+# No [checks]. A periodic health probe would keep awake a machine that is
+# supposed to be stopped, which is the bill scale-to-zero exists to avoid. The
+# boot check is `doctor --cloud` running once at start.

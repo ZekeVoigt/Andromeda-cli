@@ -14,7 +14,8 @@ from typing import Any, Generator
 
 from openai import APIStatusError, OpenAI
 
-from .. import credits
+from .. import credits, resilience
+from .. import usage as usage_module
 from ..errors import AgentError, from_status
 from ..models import reasoning_for
 
@@ -37,6 +38,10 @@ class AssistantTurn:
     content: str = ""
     tool_calls: list[ToolCall] = field(default_factory=list)
     finish_reason: str = ""
+    # Tokens this response cost, from the provider's own final frame. Empty
+    # when the endpoint did not report any — which is a real possibility and
+    # not worth estimating around; a made-up count is worse than none.
+    usage: dict[str, int] | None = None
 
     def to_message(self) -> dict[str, Any]:
         message: dict[str, Any] = {"role": "assistant", "content": self.content or None}
@@ -64,6 +69,10 @@ class Provider:
     # until a call has been made, and unknown is not zero — the BYOK lane never
     # sets it at all, because there is no account here to have a balance.
     balance: credits.Balance = field(default_factory=credits.Balance)
+    # What the provider's `x-ratelimit-*` headers said on the last call. Read
+    # off the same raw response the balance comes from, so it costs nothing
+    # extra. Empty until a call has been made, and empty is not zero.
+    rate_limit: resilience.RateLimit = field(default_factory=resilience.RateLimit)
 
     def stream_turn(
         self,
@@ -90,6 +99,12 @@ class Provider:
             "max_tokens": max_tokens,
             "temperature": temperature,
             "stream": True,
+            # The final usage frame is the only place a token count comes from,
+            # and it is only sent when it is asked for. The relay forces this
+            # upstream because it settles a credit reservation against it; the
+            # BYOK lane has to ask, and without asking `andromeda status` has
+            # nothing to report.
+            "stream_options": {"include_usage": True},
         }
 
         if tools:
@@ -115,6 +130,7 @@ class Provider:
         # the first fragment, and is absent from every one after it.
         partial: dict[int, dict[str, Any]] = {}
         finish_reason = ""
+        usage: dict[str, int] | None = None
 
         try:
             # `with_raw_response` so the response headers are reachable: the
@@ -131,13 +147,23 @@ class Provider:
                 stream = completions.create(**request)
             else:
                 raw = raw_client.create(**request)
-                self.balance = credits.parse(getattr(raw, "headers", None))
+                headers = getattr(raw, "headers", None)
+                self.balance = credits.parse(headers)
+                self.rate_limit = resilience.parse_rate_limit(headers)
                 stream = raw.parse()
 
             for chunk in stream:
+                # Usage rides on a frame of its own, after the last content
+                # frame, and some providers also attach it to the last content
+                # frame instead. Read wherever it appears, last one winning:
+                # it is cumulative for the response, not incremental.
+                counts = usage_module.from_frame(getattr(chunk, "usage", None))
+                if counts is not None:
+                    usage = counts
+
                 if not chunk.choices:
-                    # The final usage-only frame carries no choices. It is what
-                    # the relay settles against, so it is expected, not an error.
+                    # The usage-only frame carries no choices. It is what the
+                    # relay settles against, so it is expected, not an error.
                     continue
 
                 choice = chunk.choices[0]
@@ -168,17 +194,32 @@ class Provider:
             # worth explaining to someone: "out of credit" reads very
             # differently from "out of credit, renews on the 3rd".
             response = getattr(exc, "response", None)
-            self.balance = credits.parse(getattr(response, "headers", None))
-            raise from_status(exc.status_code, _message_of(exc)) from exc
+            headers = getattr(response, "headers", None)
+            self.balance = credits.parse(headers)
+            self.rate_limit = resilience.parse_rate_limit(headers)
+            error = from_status(
+                exc.status_code,
+                _message_of(exc),
+                retry_after=resilience.parse_retry_after(headers),
+            )
+            # Whatever arrived before the failure. A stream that dies at ninety
+            # per cent is worth ninety per cent more than nothing, and the
+            # retry layer needs to know output had started before it decides
+            # whether re-issuing the call is safe.
+            error.partial = "".join(content)
+            raise error from exc
         except AgentError:
             raise
         except Exception as exc:  # noqa: BLE001 - surfaced as a message, not a traceback
-            raise AgentError(f"The request failed: {exc}") from exc
+            error = AgentError(f"The request failed: {exc}")
+            error.partial = "".join(content)
+            raise error from exc
 
         return AssistantTurn(
             content="".join(content),
             tool_calls=[_finish_call(slot) for _, slot in sorted(partial.items())],
             finish_reason=finish_reason,
+            usage=usage,
         )
 
 
@@ -206,11 +247,30 @@ def _finish_call(slot: dict[str, Any]) -> ToolCall:
 
 
 def _message_of(exc: APIStatusError) -> str:
-    body = getattr(exc, "body", None)
-    if isinstance(body, dict):
-        error = body.get("error")
+    def read(payload: Any) -> str:
+        if not isinstance(payload, dict):
+            return ""
+        error = payload.get("error")
         if isinstance(error, dict) and isinstance(error.get("message"), str):
             return error["message"]
         if isinstance(error, str):
             return error
+        message = payload.get("message")
+        return message if isinstance(message, str) else ""
+
+    message = read(getattr(exc, "body", None))
+    if message:
+        return message
+
+    # SDK versions do not agree on whether the parsed OpenAI envelope lives on
+    # ``body``. The response still has it, and using it keeps a structured 403
+    # from turning into ``Error code: 403 - {'error': ...}`` in the transcript.
+    response = getattr(exc, "response", None)
+    if response is not None:
+        try:
+            message = read(response.json())
+        except Exception:  # noqa: BLE001 - error rendering must not mask the error
+            message = ""
+        if message:
+            return message
     return str(exc)

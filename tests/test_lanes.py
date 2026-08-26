@@ -246,3 +246,62 @@ class TestListing:
         registry.wait(None, timeout=10)
         summary = lane.summary()
         assert lane.id in summary and "scout" in summary and "map the tools" in summary
+
+
+def test_two_tree_writing_lanes_do_not_run_at_once():
+    """Without a worktree each, two builders in one directory interleave their
+    edits. The lock is the same one the browser has, for the same reason."""
+    import threading
+    import time
+
+    registry = LaneRegistry()
+    overlapping = []
+    running = []
+    guard = threading.Lock()
+
+    def body(_lane):
+        with guard:
+            running.append(1)
+            overlapping.append(len(running))
+        time.sleep(0.05)
+        with guard:
+            running.pop()
+        return "done"
+
+    lanes = [
+        registry.start(
+            specialist="builder", label=f"l{index}", task="t", run=body, exclusive="tree"
+        )
+        for index in range(3)
+    ]
+    for lane in lanes:
+        lane._future.result()
+
+    assert max(overlapping) == 1
+
+
+def test_lanes_on_different_surfaces_do_run_at_once():
+    import threading
+    import time
+
+    registry = LaneRegistry()
+    started = threading.Event()
+
+    def slow(_lane):
+        started.set()
+        time.sleep(0.2)
+        return "slow"
+
+    def quick(_lane):
+        assert started.wait(2)
+        return "quick"
+
+    first = registry.start(
+        specialist="builder", label="a", task="t", run=slow, exclusive="tree"
+    )
+    second = registry.start(
+        specialist="scout", label="b", task="t", run=quick
+    )
+
+    assert second._future.result(timeout=5) == "quick"
+    assert first._future.result(timeout=5) == "slow"

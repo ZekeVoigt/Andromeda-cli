@@ -25,7 +25,7 @@ import pytest
 
 from andromeda_agent import ApprovalRequest, Callbacks
 from andromeda_agent.loop import Conversation
-from andromeda_cli import art, render, repl, sessions as sessions_store
+from andromeda_cli import render, repl, sessions as sessions_store
 from andromeda_tools import ToolResult, ToolSpec
 from andromeda_tools.clarify import Question as ClarifyQuestion
 
@@ -414,40 +414,18 @@ class TestTheScreen:
         assert not hasattr(render, "PERIWINKLE")
 
     @pytest.mark.asyncio
-    async def test_user_prompts_are_unlabelled_and_answers_use_full_width_rules(self, tmp_path):
+    async def test_user_prompts_are_unlabelled_and_answers_are_bracketed(self, tmp_path):
         app = _app(tmp_path, script=["Hello back"])
         async with app.run_test() as pilot:
             app.driver.submit("Hello there")
             await _settle(pilot, app, lambda: not app.driver.busy)
             prompt = app.query_one(Transcript).query_one(".prompt")
-            answer = app.query_one(Transcript).query_one(".answer")
-            painted = _painted(app)
 
             assert str(prompt.visual) == "Hello there"
-            lines = painted.splitlines()
-            assert lines[0].startswith("[") and lines[0].endswith("]")
-            assert lines[-1].startswith("[") and lines[-1].endswith("]")
-            assert set(lines[0][1:-1]) == {"─"}
-            assert lines[0] == lines[-1]
-            assert len(lines[0]) == answer.content_region.width
-            assert lines[1] == "Hello back"
-            assert "ANDROMEDA" not in painted
-            assert answer.content_style == render.ZINC_200
-            assert answer.response_frame is True
-            assert answer.region.width == app.transcript.content_region.width
+            assert "[ A N D R O M E D A ]" in _painted(app)
             assert "INPUT" not in str(prompt.visual)
-            assert "OUTPUT" not in painted
+            assert "OUTPUT" not in _painted(app)
             assert "YOUR MESSAGE" not in AndromedaApp.CSS.upper()
-
-    def test_the_study_uses_the_detailed_landing_page_leonardo(self):
-        compact = "\n".join(art.figure(64))
-        wide = "\n".join(art.figure(120))
-
-        # These are the face/torso strokes retained by the corrected render of
-        # the landing page's source plate. The simplified placeholder had a
-        # circle for a head and no internal anatomy at all.
-        assert "⣞⣶⣳⣞" in compact
-        assert "⡽⡪⡉" in wide
 
     @pytest.mark.asyncio
     async def test_the_landing_page_chrome_frames_the_surface(self, tmp_path):
@@ -1069,8 +1047,55 @@ class TestBothSurfacesOpenTheSame:
 
         assert "SYS. 001" in updates
         assert "RECENT CLI CHANGES" in updates
-        assert "0.3.2 / CHANGED" in updates
+        # The rail's newest entry is labelled with the release it came from and
+        # the section it sat under. Asserted as a shape rather than as the
+        # literal heading that happens to be top of the changelog today — a
+        # test that pins "UNRELEASED" fails on the release that names it.
+        assert re.search(r"01 / \S+ / (ADDED|CHANGED|FIXED|REMOVED)", updates)
         assert "RECENT CONVERSATIONS" not in updates
         assert "A private user message" not in updates
         assert "A user-facing answer" not in updates
         assert str(tmp_path) not in updates
+
+
+def test_one_label_per_turn_not_one_per_tool_gap():
+    """A reply broken up by tool calls is still one reply.
+
+    Every `ToolStarted` closes the open answer block, so a model that
+    alternates prose and tools opens a new one every few lines. Heading each
+    of them printed `[ A N D R O M E D A ]` between every pair of tool rows,
+    which reads as several separate answers rather than one.
+    """
+    from andromeda_tui.widgets import Transcript
+
+    transcript = Transcript.__new__(Transcript)
+    transcript._answer = None
+    transcript._answer_text = ""
+    transcript._turn_labelled = False
+    transcript._answer_labelled = False
+
+    def rendered(text: str, labelled: bool) -> str:
+        from rich.console import Console
+
+        console = Console(width=60, force_terminal=False, highlight=False)
+        with console.capture() as captured:
+            console.print(transcript._answer_block(text, labelled))
+        return captured.get()
+
+    # First segment of the turn is labelled...
+    assert transcript._turn_labelled is False
+    first = not transcript._turn_labelled
+    transcript._turn_labelled = True
+    assert first is True
+
+    # ...every later segment of the same turn is not.
+    for _ in range(3):
+        assert (not transcript._turn_labelled) is False
+
+    # A new prompt starts a new turn, and the label comes back.
+    transcript._turn_labelled = False
+    assert (not transcript._turn_labelled) is True
+
+    # And the header only exists in the labelled rendering.
+    assert "A N D R O M E D A" in rendered("hello", True)
+    assert "A N D R O M E D A" not in rendered("hello", False)

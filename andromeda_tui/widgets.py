@@ -23,6 +23,7 @@ import time
 import re
 from pathlib import Path
 
+from rich.console import Group
 from rich.text import Text
 from textual.containers import VerticalGroup, VerticalScroll
 from textual.message import Message
@@ -125,43 +126,16 @@ class Painted(Static):
     one would repaint the wrong thing on resize.
     """
 
-    def __init__(
-        self,
-        source,
-        *,
-        content_style: str = "",
-        response_frame: bool = False,
-        **kwargs,
-    ) -> None:
+    def __init__(self, source, **kwargs) -> None:
         super().__init__("", **kwargs)
         self.source = source
-        self.content_style = content_style
-        self.response_frame = response_frame
 
     def repaint(self) -> None:
         width = self.content_size.width or self.size.width
         if width <= 0:
             # Not laid out yet. The resize that gives it a width will call back.
             return
-        painted = render.paint(self.source(), width)
-        if self.content_style:
-            # Appending one foreground span preserves markdown's weight,
-            # emphasis and underline while giving the whole response a stable
-            # shade distinct from the brighter user prompt.
-            painted.stylize(self.content_style)
-        if self.response_frame:
-            # Literal brackets are part of the requested grammar, not a label.
-            # Build them from the measured content width so both rules keep
-            # spanning the row after any terminal resize.
-            rule_text = "[" + "─" * max(0, width - 2) + "]"
-            painted = Text.assemble(
-                Text(rule_text, style=screen_style("rule")),
-                "\n",
-                painted,
-                "\n",
-                Text(rule_text, style=screen_style("rule")),
-            )
-        self.update(painted)
+        self.update(render.paint(self.source(), width))
 
     def on_resize(self) -> None:
         self.repaint()
@@ -179,6 +153,15 @@ class Transcript(VerticalGroup):
         super().__init__(**kwargs)
         self._answer: Painted | None = None
         self._answer_text = ""
+        # Whether this turn has already been labelled. A tool call closes the
+        # open answer block, so a model that alternates prose and tools opens a
+        # new block every few lines — and heading each one restated the same
+        # word between every pair of tool rows. The label belongs to the turn,
+        # not to the fragment of it that happens to sit between two tools.
+        self._turn_labelled = False
+        # Whether the block currently open carries the label, so the final
+        # repaint reproduces what streaming drew rather than growing one.
+        self._answer_labelled = False
 
     # ---- rows -------------------------------------------------------------
 
@@ -202,6 +185,10 @@ class Transcript(VerticalGroup):
         self.scroll_end(animate=False)
 
     def add_prompt(self, text: str) -> None:
+        # A new prompt is a new turn, and the next answer block earns a label
+        # again. Reset here rather than in `end_answer`: that runs on every
+        # tool call, which is the thing being coalesced.
+        self._turn_labelled = False
         self._append(
             Static(Text(text, style=render.ZINC_50), classes="row prompt")
         )
@@ -246,6 +233,25 @@ class Transcript(VerticalGroup):
             block.append(f"\n{hint}", style=screen_style("muted"))
         self._append(Static(block, classes="row error"))
 
+    def _answer_block(self, text: str, labelled: bool, streaming: bool = False):
+        """One answer segment, headed only if it opens the turn.
+
+        `[ A N D R O M E D A ]` says whose words these are, which is worth
+        saying once where the answer starts. Repeating it above every fragment
+        between two tool calls says nothing the reader did not already know and
+        breaks a single reply into a stack of unrelated-looking boxes.
+        """
+        body = render.expand_charts(text, streaming=streaming)
+        if not labelled:
+            return body
+        return Group(
+            Text(
+                f"[ {render.eyebrow('andromeda')} ]",
+                style=screen_style("eyebrow"),
+            ),
+            body,
+        )
+
     # ---- the streaming answer ---------------------------------------------
 
     def feed_answer(self, text: str) -> None:
@@ -259,13 +265,13 @@ class Transcript(VerticalGroup):
         already used it.
         """
         if self._answer is None:
+            labelled = not self._turn_labelled
+            self._turn_labelled = True
+            self._answer_labelled = labelled
             self._answer = Painted(
-                lambda: render.expand_charts(
-                    self._answer_text,
-                    streaming=True,
+                lambda: self._answer_block(
+                    self._answer_text, labelled, streaming=True
                 ),
-                content_style=render.ZINC_200,
-                response_frame=True,
                 classes="row answer",
             )
             self._answer_text = ""
@@ -280,10 +286,15 @@ class Transcript(VerticalGroup):
             # actually is: at the end of the turn it is content, not a chart
             # halfway through arriving.
             answer_text = self._answer_text
+            labelled = self._answer_labelled
             # Bind the completed segment. Pointing every finished block back
             # at `self._answer_text` made an old response repaint with a later
             # response whenever the shared hero/chat flow resized.
-            self._answer.source = lambda text=answer_text: render.expand_charts(text)
+            self._answer.source = (
+                lambda text=answer_text, header=labelled: self._answer_block(
+                    text, header
+                )
+            )
         self._answer.repaint()
         self.scroll_end(animate=False)
 

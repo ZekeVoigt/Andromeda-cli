@@ -90,7 +90,8 @@ SLASH_HELP = """  /help      show this
   /tools     list the tools this session can use
   /skills    list the skills on this machine
   /lanes     list the delegation specialists
-  /credits   show the credit balance as of the last call
+  /credits   the account balance, as the last reply reported it
+  /usage     what this session and this week have spent, in tokens
   /model     show the model in use
   /think     show or set the thinking level (off, low, medium, high)
   /cwd       show the workspace root
@@ -147,14 +148,9 @@ class AndromedaApp(App):
         background: #000000;
     }
     #transcript .row { margin-bottom: 1; }
-    #transcript .prompt {
+    #transcript .prompt, #transcript .answer {
         height: auto; margin: 0 0 1 0; padding: 0;
         border: none; background: #000000;
-    }
-    #transcript .answer {
-        width: 1fr; height: auto; margin: 1 0 2 0; padding: 0;
-        border: none;
-        background: #000000; color: #e4e4e7;
     }
     #transcript .error { height: auto; margin: 0 0 1 0; padding: 0; }
     #transcript .tool, #transcript .tool-result, #transcript .note {
@@ -808,11 +804,19 @@ class AndromedaApp(App):
             provider = self.conversation.provider
             line = credits_module.summary(provider.balance)
             if line:
-                transcript.add_note(line)
+                # The lag is stated, because the number looks stuck otherwise:
+                # the relay stamps these headers from the balance it reserved
+                # *before* answering, and settles the charge when the reply
+                # ends. `/usage` is the figure for the turn you just watched.
+                transcript.add_note(
+                    f"{line}\nas of your previous turn — /usage for this session"
+                )
             elif provider.name != "relay":
                 transcript.add_note("No balance on this lane — you are using your own key.")
             else:
                 transcript.add_note("No balance yet. It is read from the next reply.")
+        elif verb == "/usage":
+            transcript.add_note(self._usage_lines())
         elif verb == "/tools":
             self._list_tools(transcript)
         elif verb == "/skills":
@@ -954,6 +958,54 @@ class AndromedaApp(App):
         block = Text("\n").join(rows)
         transcript.mount(Static(block, classes="row note"))
         transcript.scroll_end(animate=False)
+
+    def _usage_lines(self) -> str:
+        """`/usage` — tokens this session, and tokens this week.
+
+        The question `/credits` cannot answer: a balance is an account figure
+        that lags a turn and does not exist at all on the BYOK lane. This is
+        counted from the provider's own reply, and reads the same transcripts
+        `andromeda status` does, so the two cannot disagree.
+        """
+        import time
+
+        from andromeda_agent import usage as usage_module
+
+        from andromeda_cli.commands import status as status_cmd
+
+        lines: list[str] = []
+        session = getattr(self.conversation, "usage", None)
+        if session is None or session.empty:
+            lines.append(
+                "Nothing counted yet — usage is read from the provider's own "
+                "reply, so it starts at your next turn."
+            )
+        else:
+            lines.append(
+                f"this session  {usage_module.compact(session.total)} tokens "
+                f"({usage_module.compact(session.input)} in, "
+                f"{usage_module.compact(session.output)} out, "
+                f"{session.requests} request(s))"
+            )
+
+        week = usage_module.Usage()
+        sessions = 0
+        for record in status_cmd._recent(
+            time.time() - status_cmd.RECENT_DAYS * 86_400
+        ):
+            entry = usage_module.Usage.from_dict(record.usage)
+            if entry.empty:
+                continue
+            week.merge(entry)
+            sessions += 1
+        if not week.empty:
+            plural = "" if sessions == 1 else "s"
+            lines.append(
+                f"last {status_cmd.RECENT_DAYS} days  "
+                f"{usage_module.compact(week.total)} tokens "
+                f"({week.requests} request(s) across {sessions} session{plural})"
+            )
+        return "\n".join(lines)
 
     def _list_tools(self, transcript: Transcript) -> None:
         rows = []

@@ -85,6 +85,18 @@ def test_402_is_the_only_out_of_credit_signal():
     assert not isinstance(errors.from_status(403, "no credit"), errors.OutOfCredit)
 
 
+def test_gated_free_hosting_is_plain_and_actionable():
+    error = errors.from_status(
+        403,
+        "Free hosted execution is not enabled until durable identity, eligibility "
+        "controls, and the one-time welcome-grant migration are verified.",
+    )
+
+    assert str(error) == "Hosted chat on the Free plan is not available yet."
+    assert "provider charges apply" in error.hint
+    assert "config set provider direct" in error.hint
+
+
 class TestThinking:
     """The provider carries the setting; `models.reasoning_for` decides the
     field. The mapping itself is tested in `test_thinking.py`, next to the
@@ -106,5 +118,4 @@ class TestThinking:
 
         with pytest.raises(config_module.ConfigError):
             config_module.set_value("thinking", "ludicrous")
-
 

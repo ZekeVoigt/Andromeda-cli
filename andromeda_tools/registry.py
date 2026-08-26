@@ -8,6 +8,7 @@ counterpart there; the hosted runtime has no user filesystem to reach.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Iterable
 
 from . import browser as browser_module, clarify as clarify_module, files
@@ -78,6 +79,7 @@ def build_registry(
     schedule: object | None = None,
     notepad: object | None = None,
     job_id: str = "",
+    skills_home: "Path | None" = None,
 ) -> dict[str, ToolSpec]:
     """Bind the tool functions to this session's workspace and state."""
 
@@ -300,7 +302,9 @@ def build_registry(
             },
             risk_tier="safe_local",
             category="read",
-            run=lambda name, resource=None: skills_module.load_skill(skills, name, resource),
+            run=lambda name, resource=None: skills_module.load_skill(
+                skills, name, resource, home=skills_home
+            ),
             summarize=lambda arguments: f"skill {arguments.get('name', '?')}",
         )
     )

@@ -6,27 +6,260 @@ Until 1.0, a minor bump may change a command's shape. Anything that changes a
 tool's name, arguments or risk tier is called out explicitly, because a model
 that learned the old contract will keep using it.
 
-## [0.3.3]
+## [0.5.0] — 2026-08-25
+
+### Added
+- **Secrets are removed from tool output before anything can read them back.**
+  A tool result reaches the terminal, the transcript, the search index, an
+  export and the model; the redaction runs once, at the tool, so all five see
+  the same thing. Vendor-prefixed keys, JWTs, private keys, database
+  connection strings and `Authorization:` headers are masked in any output;
+  named assignments (`OPENAI_API_KEY=…`, `"apiKey": …`, `password: …`) are
+  masked additionally on the two surfaces that are credential dumps rather
+  than prose — `env`/`printenv` output and a read of `.env`, `.netrc`,
+  `.pgpass` or `.envrc`, where *every* value is masked whatever its key is
+  called. A redacted file read says how many values were removed and that they
+  must not be copied onward; the mask it uses is syntactically impossible as a
+  key, so it cannot be written back into a config as one. Credentials this
+  install is holding — the device token, your BYOK key, an MCP token — are
+  masked by exact match, which is the only thing that catches a credential
+  with no recognisable shape. Prose is deliberately left alone: `Secretary: J.
+  Smith` and `tokenizer: cl100k_base` are not credentials. Turn the pattern
+  passes off with `ANDROMEDA_REDACT_SECRETS=0`; your own credentials stay
+  masked regardless.
+- **`andromeda mcp login <server>`** — OAuth for MCP servers that will not
+  talk to an anonymous client, which is most hosted ones. Discovery, dynamic
+  client registration, PKCE and token refresh, against the specifications
+  rather than through an SDK. Add `"auth": "oauth"` to a server's entry in
+  `mcp.json` and run the command; tokens are stored 0600 and refreshed before
+  they expire. A tool call never opens a browser — an unauthorized server says
+  which command to run. `andromeda mcp logout <server>` forgets the tokens,
+  and `andromeda mcp` now says which OAuth servers are signed in.
+- **`andromeda secrets`** — credentials can live in a vault instead of in a
+  file. A `secrets:` block in `config.yaml` maps an environment-variable name
+  to a reference — `op://` (1Password), `bw://` (Bitwarden Secrets Manager),
+  `keychain://` (macOS), `cmd://` (any helper you configure) or `env://` —
+  resolved into the environment at startup, so the BYOK lane, an MCP server, a
+  hook and anything you run see the value without knowing a vault was
+  involved. Something your shell already sets always wins. Nothing is cached
+  to disk and nothing is ever installed: a missing helper is named with the
+  command that installs it. A locked vault is a warning naming the unlock
+  command, never a stopped session. `andromeda secrets` shows what resolves,
+  `secrets get <NAME>` checks one (masked — there is no flag to unmask it),
+  `secrets schemes` lists what this build can read from.
+
+### Fixed
+- A value resolved from a vault is masked in every tool result, transcript and
+  export for the rest of the session, automatically.
+
+## [0.4.0] — 2026-08-25
+
+### Added
+- **The coding posture** — a session started inside a codebase now gets an
+  operating brief, a snapshot of the repository (branch, dirty state, recent
+  commits, the manifest, the package manager and the project's own verify
+  commands), and the project's own `AGENTS.md` / `CLAUDE.md` / `.cursorrules`,
+  merged from the repository root down to the working directory. A notes
+  folder is unaffected: a bare `git init` only counts once the directory
+  actually holds code. Context files are scanned for prompt injection before
+  they are loaded, because one arrives with every clone and goes straight into
+  a prompt the user never sees.
+- **Context files discovered on the way.** When the model first reads
+  something under a directory nothing has looked at, that directory's
+  `AGENTS.md` is appended to the tool's own result — so a package's own
+  conventions arrive at the moment the model starts working in it, without
+  rewriting the cached system prompt mid-turn.
+- `coding_context` (`auto` | `on` | `off`) and `coding_instructions` — the
+  posture's switch, and standing coding rules that belong to this install
+  rather than to a checkout.
+
+- **Language-server diagnostics after an edit.** `patch` and `write_file` now
+  report what the change broke, using whichever language server the project
+  already has. Only the problems the edit *introduced* are reported: the
+  baseline is subtracted after being shifted onto the new line numbers, so
+  inserting a line at the top of a file no longer reports the whole file as
+  new. Errors only, by default.
+- **Nothing is ever installed for you.** A language server that is not on this
+  machine is named, with the command that would install it, and the edit
+  proceeds without diagnostics. `andromeda lsp status` says which servers
+  apply to the project you are in and which are missing; `andromeda lsp
+  servers` lists every one the harness knows.
+- `lsp` and `lsp_severities` — the switch, and which severities are reported.
+
+- **`/usage`**, in both interactive surfaces — what this session and this week
+  have spent, in tokens. The question `/credits` could not answer: a balance is
+  an account-level figure, it lags a turn, and on the BYOK lane it does not
+  exist at all.
+- **`andromeda status`** — one screen: the model, the lane, the approval mode,
+  whether this machine is signed in, what has been spent in the last seven
+  days, and what this directory means for the next session started in it. It
+  makes no network call.
+- **Token accounting.** Every response's usage is recorded from the provider's
+  own reply and kept on the session transcript, so `andromeda status` can say
+  what a week cost in tokens. There is no price table and there never will be
+  one: a local rate that has drifted produces a cost figure somebody plans
+  against.
+
+### Fixed
+- **A rate limit no longer ends the turn.** A 429 or a transient 5xx is retried
+  with jittered backoff, honouring the provider's own `Retry-After` when it
+  sends one, and the terminal says why it went quiet instead of appearing to
+  hang. Nothing is retried once output has started — a terminal cannot
+  unprint, and two half-answers stitched together is worse than one honest
+  failure.
+- **An answer that dies mid-stream is kept.** Whatever arrived before the
+  failure stays in the transcript rather than being discarded, so a reply that
+  died at ninety per cent is worth ninety per cent.
+- **An empty response is asked again once, and only once.** The same emptiness
+  twice from the same model will not become an answer on a third attempt, and
+  each attempt re-sends the whole conversation at full input cost.
+- **A model that spends its whole output budget repeating itself is stopped**
+  rather than asked to continue, which would have bought more of the same text
+  at full price.
+- **The system prompt no longer describes tools the session cannot call.** A
+  non-interactive run is narrowed to `safe_local` by default, which denies both
+  edit tools — and it was still being told how to choose between `patch` and
+  `write_file`. The brief and the prompt are both tailored to what is actually
+  offered, including inside a delegated lane.
+- **Language servers now shut down cleanly.** The farewell was written through
+  a handle that had already been cleared, so every server was killed after the
+  full timeout instead of exiting.
+- **`/credits` no longer reads as frozen while you are spending.** A `$0.10`
+  grant with three hundredths of a cent spent rendered as "$0.10 of $0.10",
+  because the two figures were rounded to the cent independently — at that
+  scale a whole turn is invisible. Decimal places are now added only when the
+  cent would hide the difference, so an untouched window still says "$0.10 of
+  $0.10" and a spent one does not.
+- **`/credits` says that its figure is from your previous turn.** The relay
+  stamps the balance headers from the reservation it takes *before* answering
+  and settles the charge when the reply ends, so the number has always been one
+  turn behind. It was never said out loud, which is most of why it looked
+  stuck.
 
 ### Changed
-- Replaced the simplified terminal figure with the detailed Leonardo render
-  generated from the landing page's source plate.
-- Andromeda responses are now one zinc shade darker than user prompts and are
-  separated by full-width rules above and below, without an output label.
+- TUI now matches the landing page: monochrome, unboxed, with CLI changes
+  beside Leonardo and bracketed responses.
+- Conversation growth now moves Leonardo and the release notes upward through
+  one shared scroll flow while the composer remains fixed.
 
-## [0.3.2]
+### Added
+- **Hooks** — shell scripts run at seventeen lifecycle boundaries, configured
+  in the `hooks:` block of `config.yaml`. A `pre_tool_call` hook can block a
+  call, rewrite its arguments, or send it to the approval prompt the policy
+  would have skipped; the rest observe or transform. Both the canonical and
+  the Claude-Code/Cursor spellings of every directive are accepted, and exit
+  code 2 blocks with no JSON at all, so a script written for another harness
+  works unchanged.
+- `andromeda hooks list | test | revoke | doctor`. `test` and `doctor` fire
+  through the same code path a live session uses, so a script that passes
+  there behaves the same in a real turn.
+- `--accept-hooks`, `ANDROMEDA_ACCEPT_HOOKS`, and `hooks_auto_accept` — the
+  three ways to register hooks where there is nobody to answer a prompt.
+  Without one of them a non-interactive run registers nothing.
+- `ANDROMEDA_SAFE_MODE=1` now also skips hook registration, so a
+  troubleshooting run executes none of your customizations.
+
+- **A `builder` lane** — the first specialist that changes anything. Every belt
+  until now was read-only, so delegation could not be used for the work people
+  most want to delegate. It reads and writes files; no shell and no network,
+  because a shell can `cd` out of any confinement it is given.
+- **`worktree_isolation`** — one git worktree per lane, branched from `HEAD`,
+  with the lane's tools bound to it. Lanes that write then run in parallel
+  without editing underneath each other, and the parent is told the branch,
+  the commit count and whether the tree is dirty. A copy holding nothing is
+  removed; a copy whose state git would not confirm is kept and reported as
+  unproven, because "unknown" is not "clean".
+- `andromeda worktrees list | prune [--dry-run]` — the attended pass over what
+  the lanes left behind. It keeps anything with tracked edits, unique commits,
+  or untracked files, and removes a tree before its branch.
+
+- **Skills are scanned before they are offered to the model** — 119 patterns
+  over exfiltration, prompt injection, destructive commands, persistence,
+  reverse shells, obfuscation, privilege escalation, supply chain, mining and
+  leaked credentials, plus structural checks and invisible-character
+  detection. Trust comes from where a skill lives, because that is the only
+  provenance a harness with no registry has: shipped-with-the-install is
+  never scanned, your own `~/.andromeda-cli/skills` may carry a `caution`
+  verdict, and a skill found in a workspace must come back `safe`.
+- `andromeda skills list | scan | trust | untrust`. `trust` is recorded
+  against the skill's content hash, so editing a trusted skill withdraws the
+  decision.
+
+- **`andromeda batch <file>`** — one prompt over every row of a JSONL (or a
+  plain list), each row in its own conversation, with answers appended to a
+  results file as they land and `--resume` skipping what is already recorded.
+  A failing row is recorded and the batch continues.
+- **`andromeda eval --repeat N`** — a pass rate instead of a verdict, with
+  scenarios that pass intermittently reported as flaky. `--jobs N` runs them
+  at once, results keep scenario order regardless of finishing order.
+- **`andromeda eval report`** — what broke, what was fixed, and what got less
+  reliable since the previous run, with the model change called out first when
+  there was one. Every run is saved under `~/.andromeda-cli/eval-runs/`.
+- Three eval checks: `tools_in_order` (a subsequence, not an exact list),
+  `steps_under`, and `file_matches`.
+- **`andromeda pause` / `andromeda resume`** — a resumable hold on scheduled
+  work. New jobs only: work already running is never killed, and interactive
+  sessions are untouched. A sentinel file, so anything can set it; an
+  unreadable one counts as paused, because failing open would lift an
+  emergency stop exactly when the filesystem is misbehaving. Surfaced in
+  `doctor` and at the top of a session.
+- `andromeda approvals test <tool>` — the real gate's verdict for a tool plus
+  the rule that produced it, executing nothing and persisting nothing.
+  Script-friendly exit codes (0 allow, 2 ask, 3 deny).
+- `andromeda approvals suggest [--apply N,M]` — tools approved often enough to
+  stop being asked about. Proposals only; destructive and irreversible tools
+  are never proposed, and a tool withheld for that reason is named.
+- **`andromeda acp`** — this agent inside an editor, over the Agent Client
+  Protocol. Streams the answer, each tool call and the todo plan as the turn
+  runs, and asks the approval gate through the editor rather than answering on
+  the user's behalf: a cancelled dialog is a refusal. Written against the wire
+  protocol, so it adds no dependency.
+- **A curator for the skill library.** Every `skill_load` is now recorded, and
+  agent-written skills in your own skills directory move between active, stale
+  (30 days) and archived (90) on their own. Archive is a move, never a delete —
+  `andromeda curator restore <name>` brings one back — pinned skills are never
+  touched, and a never-used skill gets a grace period rather than being read as
+  neglected. The first sight of an install stamps the clock and waits an
+  interval instead of sweeping a library it has no history for.
+- `andromeda curator status | sweep | review | pin | unpin | restore | pause |
+  resume`. `review` asks a model what it would change about what skills *say*
+  and writes proposals; it applies nothing, because an agent may propose and
+  only a person grants.
+- `andromeda completion bash | zsh | fish` — generated by walking the live
+  argument parser, so the verb list can never drift from the program.
+- **MCP tools are no longer listed on every request.** `tool_search`,
+  `tool_describe` and `tool_call` stand in for the whole connected catalogue,
+  with a listing of what is deferred embedded in the search tool so the model
+  still knows what exists — full descriptions, then names only, then a count
+  per server, whichever fits the budget. Built-in tools never defer. A call
+  through the bridge meets the same policy, prompt and hooks as a direct one,
+  and a call missing required arguments gets the schema back rather than an
+  opaque failure from inside the tool. `tool_search: off` restores the old
+  behaviour.
 
 ### Changed
-- Restored the full-screen, landing-page-aligned terminal interface in the
-  public installer: monochrome zinc styling, Leonardo at left, and actual CLI
-  release changes at right.
-- Conversation rows are deliberately unlabeled for the user and every agent
-  response is enclosed by an `[ ANDROMEDA ]` bracket.
-- The masthead and transcript now share one scroll region, so a growing
-  conversation naturally pushes Leonardo and the release panel above the
-  viewport while the composer remains visible.
-- Composer spacing is consistent and its helper text no longer crowds or
-  disappears behind the input field.
+- **Skill discovery is layered rather than first-match.** The bundled skills,
+  your own, and a workspace's now stack, with the nearest winning a name
+  collision. Before this, one `skills/` directory in a repository hid your
+  entire personal library — including anything the agent had written for
+  itself, which made the curator's subject invisible.
+- **A skill the scan withholds is no longer offered to the model, and its
+  instructions never enter the prompt.** It is not silently missing either:
+  `/skills` names it with the finding that withheld it. If you have a
+  workspace skill that trips a `high` pattern, `andromeda skills scan <name>`
+  shows the line and `skills trust <name>` keeps using it.
+- With `worktree_isolation` off, two tree-writing lanes take the working
+  directory in turn — the same exclusive-surface rule the browser has. The
+  lane registry's browser lock is now one lock per named surface.
+- The approval prompt shows *why* a call it would have allowed is being asked
+  about, when a hook escalated it. Both surfaces.
+- `transform_tool_result` rewrites what the model reads, not what the terminal
+  shows: the surface keeps printing the tool's own output.
+
+### Fixed
+- `andromeda hooks revoke <command>` would have dispatched as though `<command>`
+  were the verb — the subparser's positional shadowed the top-level `command`
+  destination. Caught by its own test before it shipped.
 
 ## [0.3.1]
 

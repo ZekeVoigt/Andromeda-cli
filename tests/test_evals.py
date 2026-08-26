@@ -280,3 +280,221 @@ class TestShippedScenarios:
 
         for scenario in evals.discover(root):
             assert scenario.approval in APPROVAL_MODES, scenario.path
+
+
+class TestRepetition:
+    """An agent is stochastic. One run of a stochastic system is an anecdote."""
+
+    def scenario(self, tmp_path):
+        (tmp_path / "s.yaml").write_text(
+            "name: sometimes\nprompt: go\nexpect:\n  - answer_contains: yes-please\n",
+            encoding="utf-8",
+        )
+        return evals.discover(tmp_path)[0]
+
+    def test_a_single_run_has_one_attempt(self, tmp_path):
+        outcome = evals.run_trials(
+            self.scenario(tmp_path), {}, lambda p, s, w: ("yes-please", []), repeat=1
+        )
+        assert outcome.attempts == 1
+        assert outcome.pass_rate == 1.0
+        assert outcome.flaky is False
+
+    def test_a_repeated_run_reports_a_pass_rate(self, tmp_path):
+        answers = iter(["yes-please", "no", "yes-please", "no"])
+        outcome = evals.run_trials(
+            self.scenario(tmp_path),
+            {},
+            lambda p, s, w: (next(answers), []),
+            repeat=4,
+        )
+        assert outcome.attempts == 4
+        assert outcome.passes == 2
+        assert outcome.pass_rate == 0.5
+
+    def test_passing_sometimes_is_called_flaky(self, tmp_path):
+        answers = iter(["yes-please", "no"])
+        outcome = evals.run_trials(
+            self.scenario(tmp_path), {}, lambda p, s, w: (next(answers), []), repeat=2
+        )
+        assert outcome.flaky is True
+
+    def test_always_passing_is_not_flaky(self, tmp_path):
+        outcome = evals.run_trials(
+            self.scenario(tmp_path), {}, lambda p, s, w: ("yes-please", []), repeat=3
+        )
+        assert outcome.flaky is False
+        assert outcome.status == "pass"
+
+    def test_the_reported_outcome_is_a_failure_when_there_was_one(self, tmp_path):
+        """The report should show what went wrong, not the run that happened to
+        work."""
+        answers = iter(["yes-please", "nope"])
+        outcome = evals.run_trials(
+            self.scenario(tmp_path), {}, lambda p, s, w: (next(answers), []), repeat=2
+        )
+        assert outcome.status == "fail"
+        assert outcome.failures
+
+    def test_a_skip_is_not_repeated(self, tmp_path):
+        (tmp_path / "s.yaml").write_text(
+            "name: needs\nprompt: go\nrequires: [bin:definitely-not-installed]\n"
+            "expect:\n  - answer_contains: x\n",
+            encoding="utf-8",
+        )
+        calls: list[int] = []
+        outcome = evals.run_trials(
+            evals.discover(tmp_path)[0],
+            {},
+            lambda p, s, w: (calls.append(1) or "x", []),
+            repeat=5,
+        )
+        assert outcome.status == "skip"
+        assert calls == []
+
+
+class TestTheSuite:
+    def scenarios(self, tmp_path, count=3):
+        for index in range(count):
+            (tmp_path / f"s{index}.yaml").write_text(
+                f"name: scenario {index}\nprompt: go\n"
+                f"expect:\n  - answer_contains: fine\n",
+                encoding="utf-8",
+            )
+        return evals.discover(tmp_path)
+
+    def test_every_scenario_runs(self, tmp_path):
+        outcomes = evals.run_suite(
+            self.scenarios(tmp_path), {}, lambda p, s, w: ("fine", [])
+        )
+        assert len(outcomes) == 3
+        assert all(o.status == "pass" for o in outcomes)
+
+    def test_results_keep_scenario_order_when_parallel(self, tmp_path):
+        """A report whose order changes between runs cannot be diffed."""
+        import time
+
+        def uneven(prompt, settings, workspace):
+            time.sleep(0.05)
+            return "fine", []
+
+        outcomes = evals.run_suite(
+            self.scenarios(tmp_path, 4), {}, uneven, jobs=4
+        )
+        assert [o.scenario.name for o in outcomes] == [
+            "scenario 0",
+            "scenario 1",
+            "scenario 2",
+            "scenario 3",
+        ]
+
+    def test_parallel_is_faster(self, tmp_path):
+        import time
+
+        def slow(prompt, settings, workspace):
+            time.sleep(0.1)
+            return "fine", []
+
+        started = time.time()
+        evals.run_suite(self.scenarios(tmp_path, 5), {}, slow, jobs=5)
+        assert time.time() - started < 0.4
+
+
+class TestRunHistory:
+    def outcome(self, name, status="pass", passes=1, attempts=1):
+        scenario = evals.Scenario(name=name, prompt="go", path=Path(name))
+        out = evals.Outcome(scenario=scenario, passed=status == "pass")
+        if attempts > 1:
+            out.trials = [
+                evals.Outcome(scenario=scenario, passed=index < passes)
+                for index in range(attempts)
+            ]
+        return out
+
+    def test_a_run_is_saved_and_read_back(self, tmp_path):
+        evals.save_run(tmp_path, [self.outcome("one")], model="test/model")
+        runs = evals.past_runs(tmp_path)
+        assert len(runs) == 1
+        assert runs[0]["model"] == "test/model"
+        assert runs[0]["results"]["one"]["status"] == "pass"
+
+    def test_runs_come_back_newest_first(self, tmp_path):
+        import time
+
+        evals.save_run(tmp_path, [self.outcome("one")])
+        time.sleep(1.05)
+        evals.save_run(tmp_path, [self.outcome("two")])
+        runs = evals.past_runs(tmp_path)
+        assert list(runs[0]["results"]) == ["two"]
+
+    def test_no_runs_is_an_empty_list(self, tmp_path):
+        assert evals.past_runs(tmp_path) == []
+
+    def test_a_corrupt_run_file_is_skipped(self, tmp_path):
+        evals.runs_dir(tmp_path).mkdir(parents=True)
+        (evals.runs_dir(tmp_path) / "20260101-000000.json").write_text("{not json")
+        assert evals.past_runs(tmp_path) == []
+
+    def test_a_scenario_that_broke_is_reported(self):
+        before = {"results": {"a": {"status": "pass", "passes": 1, "attempts": 1}}}
+        after = {"results": {"a": {"status": "fail", "passes": 0, "attempts": 1}}}
+        assert evals.compare(before, after)["broke"] == ["a"]
+
+    def test_a_scenario_that_was_fixed_is_reported(self):
+        before = {"results": {"a": {"status": "fail", "passes": 0, "attempts": 1}}}
+        after = {"results": {"a": {"status": "pass", "passes": 1, "attempts": 1}}}
+        assert evals.compare(before, after)["fixed"] == ["a"]
+
+    def test_a_scenario_getting_shakier_is_reported(self):
+        """5/5 to 3/5 has not started failing, and it is the earliest thing
+        worth knowing."""
+        before = {"results": {"a": {"status": "pass", "passes": 5, "attempts": 5}}}
+        after = {"results": {"a": {"status": "pass", "passes": 3, "attempts": 5}}}
+        assert "a (100% → 60%)" in evals.compare(before, after)["shakier"]
+
+    def test_a_scenario_getting_steadier_is_reported(self):
+        before = {"results": {"a": {"status": "pass", "passes": 3, "attempts": 5}}}
+        after = {"results": {"a": {"status": "pass", "passes": 5, "attempts": 5}}}
+        assert evals.compare(before, after)["steadier"]
+
+    def test_new_and_removed_scenarios_are_reported(self):
+        before = {"results": {"gone": {"status": "pass"}}}
+        after = {"results": {"new": {"status": "pass"}}}
+        moved = evals.compare(before, after)
+        assert moved["added"] == ["new"]
+        assert moved["removed"] == ["gone"]
+
+    def test_nothing_moving_is_all_empty(self):
+        same = {"results": {"a": {"status": "pass", "passes": 1, "attempts": 1}}}
+        assert all(not names for names in evals.compare(same, same).values())
+
+
+class TestTheNewChecks:
+    def outcome_for(self, tmp_path, yaml_body, answer="", tools=()):
+        (tmp_path / "s.yaml").write_text(yaml_body, encoding="utf-8")
+        scenario = evals.discover(tmp_path)[0]
+        return evals.evaluate(scenario, tmp_path, answer, list(tools))
+
+    def test_tools_in_order_is_a_subsequence(self, tmp_path):
+        body = "name: x\nprompt: go\nexpect:\n  - tools_in_order: [read_file, write_file]\n"
+        assert self.outcome_for(
+            tmp_path, body, tools=["read_file", "list_dir", "write_file"]
+        ) == []
+
+    def test_tools_in_the_wrong_order_fail(self, tmp_path):
+        body = "name: x\nprompt: go\nexpect:\n  - tools_in_order: [read_file, write_file]\n"
+        assert self.outcome_for(tmp_path, body, tools=["write_file", "read_file"])
+
+    def test_steps_under_counts_tool_calls(self, tmp_path):
+        body = "name: x\nprompt: go\nexpect:\n  - steps_under: 3\n"
+        assert self.outcome_for(tmp_path, body, tools=["a", "b"]) == []
+        assert self.outcome_for(tmp_path, body, tools=["a", "b", "c"])
+
+    def test_file_matches_is_a_regex(self, tmp_path):
+        (tmp_path / "out.txt").write_text("version 2.1.4\n", encoding="utf-8")
+        body = 'name: x\nprompt: go\nexpect:\n  - file_matches:\n      out.txt: "version \\\\d+\\\\.\\\\d+"\n'
+        assert self.outcome_for(tmp_path, body) == []
+
+    def test_file_matches_fails_when_the_file_is_missing(self, tmp_path):
+        body = 'name: x\nprompt: go\nexpect:\n  - file_matches:\n      nope.txt: "x"\n'
+        assert self.outcome_for(tmp_path, body)

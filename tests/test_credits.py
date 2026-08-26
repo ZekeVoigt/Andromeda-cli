@@ -241,3 +241,56 @@ class TestTheTwoSidesAgree:
     def test_the_two_access_values_match(self):
         source = self._ts_source()
         assert '"active" | "depleted"' in source
+
+
+class TestPrecisionThatShowsMovement:
+    """A `$0.10` grant spent in fractions of a cent must not read as frozen.
+
+    Reported from a live session: "$0.10 out of $0.10" while actively using it.
+    Both figures were being rounded to the cent independently, so a real
+    deduction of three hundredths of a cent was invisible in both.
+    """
+
+    def test_equal_figures_stay_at_cents(self):
+        assert credits.format_pair(100_000, 100_000) == ("$0.10", "$0.10")
+
+    def test_places_are_added_only_when_cents_would_hide_the_difference(self):
+        assert credits.format_pair(99_700, 100_000) == ("$0.0997", "$0.1000")
+
+    def test_a_difference_cents_can_express_stays_at_cents(self):
+        assert credits.format_pair(6_124_000, 10_000_000) == ("$6.12", "$10.00")
+
+    def test_precision_escalates_as_far_as_it_needs_to(self):
+        left, right = credits.format_pair(99_999, 100_000)
+
+        assert left != right
+        assert left == "$0.099999"
+
+    def test_both_figures_are_rendered_at_one_precision(self):
+        """Two places on one and four on the other is unreadable as a ratio."""
+        left, right = credits.format_pair(99_700, 100_000)
+
+        assert left.count(".") == right.count(".")
+        assert len(left.split(".")[1]) == len(right.split(".")[1])
+
+    def test_an_unknown_figure_does_not_force_a_precision(self):
+        assert credits.format_pair(None, 100_000) == ("", "$0.10")
+
+    def test_the_summary_uses_it(self):
+        line = credits.summary(
+            credits.Balance(remaining_micros=99_700, grant_micros=100_000)
+        )
+
+        assert line.startswith("$0.0997 of $0.1000")
+
+    def test_a_top_up_is_still_in_the_denominator(self):
+        """The gauge is drawn against grant plus adjustment, at one precision."""
+        line = credits.summary(
+            credits.Balance(
+                remaining_micros=149_700,
+                grant_micros=100_000,
+                adjustment_micros=50_000,
+            )
+        )
+
+        assert "$0.1497 of $0.1500" in line

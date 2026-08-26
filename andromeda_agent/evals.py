@@ -71,6 +71,9 @@ class Outcome:
     tools_used: list[str] = field(default_factory=list)
     seconds: float = 0.0
     error: str = ""
+    # Every attempt, when the scenario was run more than once. Empty for a
+    # single run, where the outcome *is* the trial.
+    trials: list["Outcome"] = field(default_factory=list, repr=False)
 
     @property
     def status(self) -> str:
@@ -80,13 +83,37 @@ class Outcome:
             return "error"
         return "pass" if self.passed else "fail"
 
+    @property
+    def attempts(self) -> int:
+        return len(self.trials) or 1
+
+    @property
+    def passes(self) -> int:
+        if not self.trials:
+            return 1 if self.status == "pass" else 0
+        return sum(1 for trial in self.trials if trial.status == "pass")
+
+    @property
+    def pass_rate(self) -> float:
+        return self.passes / self.attempts if self.attempts else 0.0
+
+    @property
+    def flaky(self) -> bool:
+        """Passed sometimes. The most useful thing a repeated eval reports —
+        an intermittent behaviour is a real finding, and a single run reports
+        it as either fine or broken depending on the day."""
+        return bool(self.trials) and 0 < self.passes < self.attempts
+
 
 CHECK_KINDS = (
     "file_exists",
     "file_contains",
+    "file_matches",
     "answer_contains",
     "answer_matches",
     "tool_called",
+    "tools_in_order",
+    "steps_under",
 )
 
 
@@ -221,9 +248,40 @@ def _holds(check: Check, root: Path, answer: str, tools: list[str]) -> bool:
     if check.kind == "answer_matches":
         return re.search(str(check.value), answer, re.IGNORECASE | re.DOTALL) is not None
 
+    if check.kind == "file_matches":
+        if not isinstance(check.value, dict):
+            return False
+        for name, pattern in check.value.items():
+            target = root / str(name)
+            if not target.exists():
+                return False
+            body = target.read_text(encoding="utf-8", errors="replace")
+            if re.search(str(pattern), body, re.IGNORECASE | re.DOTALL) is None:
+                return False
+        return True
+
     if check.kind == "tool_called":
         wanted = check.value if isinstance(check.value, list) else [check.value]
         return all(str(w) in tools for w in wanted)
+
+    if check.kind == "tools_in_order":
+        # Subsequence, not equality: "it read the file before it wrote it" is
+        # the property worth asserting, and demanding the exact call list makes
+        # a scenario fail because the agent also checked something sensible.
+        wanted = check.value if isinstance(check.value, list) else [check.value]
+        remaining = list(tools)
+        for name in wanted:
+            if str(name) not in remaining:
+                return False
+            remaining = remaining[remaining.index(str(name)) + 1 :]
+        return True
+
+    if check.kind == "steps_under":
+        try:
+            ceiling = int(check.value)
+        except (TypeError, ValueError):
+            return False
+        return len(tools) < ceiling
 
     return False
 
@@ -265,6 +323,189 @@ def run_scenario(scenario: Scenario, config: dict[str, Any], runner) -> Outcome:
     return outcome
 
 
+def run_trials(
+    scenario: Scenario, config: dict[str, Any], runner, repeat: int = 1
+) -> Outcome:
+    """Run one scenario `repeat` times and report the aggregate.
+
+    An agent is stochastic. One run of a stochastic system is an anecdote, and
+    a suite built out of anecdotes moves for reasons nobody can attribute. The
+    aggregate is reported as a **pass rate**, and a scenario that passed some
+    of the time is called flaky rather than rounded to either answer.
+
+    The reported outcome is the first failure when there is one, so the report
+    shows what went wrong rather than the run that happened to work.
+    """
+    if repeat <= 1:
+        return run_scenario(scenario, config, runner)
+
+    trials = [run_scenario(scenario, config, runner) for _ in range(repeat)]
+
+    if trials[0].skipped:
+        # A skip is a property of the machine, not of the attempt.
+        return trials[0]
+
+    representative = next(
+        (trial for trial in trials if trial.status != "pass"), trials[0]
+    )
+    representative.trials = trials
+    representative.seconds = sum(trial.seconds for trial in trials)
+    return representative
+
+
+def run_suite(
+    scenarios: list[Scenario],
+    config: dict[str, Any],
+    runner,
+    *,
+    repeat: int = 1,
+    jobs: int = 1,
+    on_result=None,
+) -> list[Outcome]:
+    """Run every scenario, optionally several at a time.
+
+    Threads rather than processes: a run is almost entirely waiting on a model,
+    and each scenario already has its own throwaway workspace, so there is
+    nothing shared to protect. Results come back in the order the scenarios
+    were given regardless of the order they finished, because a report whose
+    order changes between runs cannot be diffed.
+    """
+    if jobs <= 1:
+        results = []
+        for scenario in scenarios:
+            outcome = run_trials(scenario, config, runner, repeat)
+            if on_result is not None:
+                on_result(outcome)
+            results.append(outcome)
+        return results
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        futures = [
+            pool.submit(run_trials, scenario, config, runner, repeat)
+            for scenario in scenarios
+        ]
+        results = []
+        for future in futures:
+            outcome = future.result()
+            if on_result is not None:
+                on_result(outcome)
+            results.append(outcome)
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Keeping the runs, so two of them can be compared
+# ---------------------------------------------------------------------------
+
+RUNS_DIRNAME = "eval-runs"
+
+
+def runs_dir(home: Path) -> Path:
+    return Path(home) / RUNS_DIRNAME
+
+
+def save_run(home: Path, outcomes: list[Outcome], model: str = "") -> Path | None:
+    """Write one run down, named for when it happened.
+
+    Kept because the interesting question is never "did it pass" but "did it
+    pass *last week*" — a model changes underneath a prompt nobody edited, and
+    without a previous run there is nothing to notice that against.
+    """
+    directory = runs_dir(home)
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    path = directory / f"{stamp}.json"
+    payload = {
+        "at": stamp,
+        "model": model,
+        "results": {
+            outcome.scenario.name: {
+                "status": outcome.status,
+                "passes": outcome.passes,
+                "attempts": outcome.attempts,
+                "seconds": round(outcome.seconds, 1),
+                "failures": outcome.failures,
+            }
+            for outcome in outcomes
+        },
+    }
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except OSError:
+        return None
+    return path
+
+
+def past_runs(home: Path, limit: int = 20) -> list[dict[str, Any]]:
+    """Saved runs, newest first."""
+    directory = runs_dir(home)
+    if not directory.is_dir():
+        return []
+    runs = []
+    for path in sorted(directory.glob("*.json"), reverse=True)[:limit]:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(data, dict) and isinstance(data.get("results"), dict):
+            data["path"] = str(path)
+            runs.append(data)
+    return runs
+
+
+def compare(before: dict[str, Any], after: dict[str, Any]) -> dict[str, list[str]]:
+    """What moved between two runs.
+
+    Four buckets, and `shakier`/`steadier` are the reason the pass rate is
+    stored rather than a boolean: a scenario going from 5/5 to 3/5 has not
+    started failing, and it is the earliest thing worth knowing.
+    """
+    old = before.get("results", {})
+    new = after.get("results", {})
+
+    moved: dict[str, list[str]] = {
+        "broke": [],
+        "fixed": [],
+        "shakier": [],
+        "steadier": [],
+        "added": [],
+        "removed": [],
+    }
+
+    for name, current in sorted(new.items()):
+        previous = old.get(name)
+        if previous is None:
+            moved["added"].append(name)
+            continue
+
+        was = _rate(previous)
+        now = _rate(current)
+
+        if previous.get("status") == "pass" and current.get("status") != "pass":
+            moved["broke"].append(name)
+        elif previous.get("status") != "pass" and current.get("status") == "pass":
+            moved["fixed"].append(name)
+        elif now < was:
+            moved["shakier"].append(f"{name} ({was:.0%} → {now:.0%})")
+        elif now > was:
+            moved["steadier"].append(f"{name} ({was:.0%} → {now:.0%})")
+
+    for name in sorted(old):
+        if name not in new:
+            moved["removed"].append(name)
+
+    return moved
+
+
+def _rate(entry: dict[str, Any]) -> float:
+    attempts = int(entry.get("attempts") or 0)
+    if attempts <= 0:
+        return 1.0 if entry.get("status") == "pass" else 0.0
+    return int(entry.get("passes") or 0) / attempts
+
+
 def report_json(outcomes: list[Outcome]) -> str:
     return json.dumps(
         {
@@ -277,6 +518,9 @@ def report_json(outcomes: list[Outcome]) -> str:
                 {
                     "name": o.scenario.name,
                     "status": o.status,
+                    "attempts": o.attempts,
+                    "passes": o.passes,
+                    "flaky": o.flaky,
                     "seconds": round(o.seconds, 1),
                     "failures": o.failures,
                     "error": o.error,

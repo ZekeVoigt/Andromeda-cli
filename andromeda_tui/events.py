@@ -239,11 +239,19 @@ def callbacks_for(post, *, ask_approval=None, before_text=None) -> Callbacks:
         )
         post(Compacted(stage=result.stage, detail=detail))
 
+    def on_retry(reason: str) -> None:
+        # A `Notice` rather than a wire event of its own: a retry is exactly
+        # "something the surface should say that is not part of the answer",
+        # and a new event kind that every client has to learn buys nothing
+        # over the one that already means this.
+        post(Notice(text=reason))
+
     return Callbacks(
         on_text=on_text,
         on_tool_start=on_tool_start,
         on_tool_result=on_tool_result,
         on_tool_denied=on_tool_denied,
         on_compaction=on_compaction,
+        on_retry=on_retry,
         ask_approval=ask_approval,
     )

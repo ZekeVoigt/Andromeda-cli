@@ -17,6 +17,7 @@ from prompt_toolkit.shortcuts import prompt as ask_line
 from prompt_toolkit.styles import Style
 
 from andromeda_agent import AgentError, ApprovalRequest, Callbacks, build_provider
+from andromeda_agent import hooks
 from andromeda_agent.approval import Answer
 from andromeda_tools import ToolResult, ToolSpec
 
@@ -27,7 +28,7 @@ from . import output
 from . import render
 from . import sessions as sessions_store
 from .state import live as live_module
-from .session import build_conversation, set_asker, set_lane_announcer
+from .session import build_conversation, ended as session_ended, set_asker, set_lane_announcer
 
 PROMPT_STYLE = Style.from_dict({"prompt": "bold cyan", "meter": "#666666"})
 
@@ -163,6 +164,7 @@ def _mention_suggestions() -> None:
 
 def _cleanup(conversation) -> None:
     """Do not leave a dev server holding a port after the session ends."""
+    session_ended(conversation)
     binding = getattr(conversation, "binding", None)
     if binding is not None:
         live_module.release(binding.record.id)
@@ -210,7 +212,8 @@ SLASH_HELP = """
   /tools     list the tools this session can use
   /skills    list the skills on this machine
   /lanes     list the delegation specialists
-  /credits   show the credit balance as of the last call
+  /credits   the account balance, as the last reply reported it
+  /usage     what this session and this week have spent, in tokens
   /model     show the model in use
   /think     show or set the thinking level (off, low, medium, high)
   /cwd       show the workspace root
@@ -267,6 +270,24 @@ def run(
     )
     if resume is not None:
         output.info(f"  resumed {record.id} · {record.turns} turns")
+
+    # What ran while nobody was here. One line, and only when there is
+    # something — a greeting that reports "0 cloud runs" every time is a line
+    # people stop reading, and then do not read on the day it says 3.
+    #
+    # Best-effort by construction: `unseen_cloud_runs` never raises, never
+    # blocks long and never prints an error of its own. Somebody opening a
+    # terminal has not asked about their cloud jobs, and a network failure must
+    # not be the first thing they see.
+    from .commands import cron as cron_cmd
+
+    unseen = cron_cmd.unseen_cloud_runs()
+    if unseen:
+        output.console.print(
+            f"  [cyan]{unseen} cloud run(s) since you were last here[/cyan] "
+            f"[dim]— `andromeda cron runs`[/dim]"
+        )
+
     from .commands import sessions as sessions_cmd
 
     sessions_cmd.announce_holder(record.id)
@@ -275,6 +296,18 @@ def run(
     )
     if drained == 1:
         output.info("  (ignored input that arrived before the prompt)")
+    from andromeda_agent import pause as pause_module
+
+    held = pause_module.describe(config_module.home())
+    if held:
+        # Your own session still works — that is the design — but somebody who
+        # paused an hour ago and forgot should be reminded by the thing they
+        # are looking at.
+        output.info(f"  {held}")
+    if getattr(conversation, "curator_note", ""):
+        # Said out loud. A skill that disappeared without a word is a bug
+        # report; the same event announced is housekeeping.
+        output.info(f"  {conversation.curator_note} · andromeda curator status")
     _mention_state_health()
     _mention_suggestions()
     output.console.print()
@@ -452,6 +485,7 @@ def _callbacks(stream: "render.AnswerStream") -> Callbacks:
             f"    [bad]declined[/bad] [muted]{spec.name} — {reason}[/muted]"
         ),
         on_compaction=_compacted,
+        on_retry=lambda reason: render.note(reason),
         ask_approval=_approve,
     )
 
@@ -463,6 +497,57 @@ def _tool_start(spec: ToolSpec, arguments: dict[str, Any]) -> None:
 def _tool_result(spec: ToolSpec, result: ToolResult) -> None:
     first = result.display.splitlines()[0] if result.display else ""
     render.tool_result(first, result.ok)
+
+
+def _show_usage(conversation) -> None:
+    """`/usage` — what this session has spent, and what the week has.
+
+    The question `/credits` cannot answer. A balance is an account-level figure
+    that lags a turn and, on the BYOK lane, does not exist at all; this is
+    counted here, from the provider's own reply, and is the same arithmetic
+    `andromeda status` reports.
+    """
+    from andromeda_agent import usage as usage_module
+
+    from .commands import status as status_cmd
+
+    session = getattr(conversation, "usage", None)
+    if session is None or session.empty:
+        output.info(
+            "Nothing counted yet. Usage is read from the provider's own reply, "
+            "so it starts at your next turn."
+        )
+    else:
+        render.console.print(
+            f"  [accent]this session[/accent]  "
+            f"{usage_module.compact(session.total)} tokens"
+            f"  [muted]{usage_module.compact(session.input)} in,"
+            f" {usage_module.compact(session.output)} out,"
+            f" {session.requests} request(s)[/muted]"
+        )
+        if session.cached:
+            share = session.cached / session.input if session.input else 0
+            render.console.print(
+                f"  [muted]{share:.0%} of input served from cache[/muted]"
+            )
+
+    # The week, from the transcripts on disk — the same source `andromeda
+    # status` reads, so the two can never disagree.
+    week = usage_module.Usage()
+    sessions = 0
+    for record in status_cmd._recent(time.time() - status_cmd.RECENT_DAYS * 86_400):
+        entry = usage_module.Usage.from_dict(record.usage)
+        if entry.empty:
+            continue
+        week.merge(entry)
+        sessions += 1
+    if not week.empty:
+        plural = "" if sessions == 1 else "s"
+        render.console.print(
+            f"  [accent]last {status_cmd.RECENT_DAYS} days[/accent]  "
+            f"{usage_module.compact(week.total)} tokens"
+            f"  [muted]{week.requests} request(s) across {sessions} session{plural}[/muted]"
+        )
 
 
 def _compacted(result) -> None:
@@ -487,6 +572,11 @@ def _approve(request: ApprovalRequest) -> Answer:
         )
         for line in request.summary.splitlines():
             render.console.print(f"    {line}", markup=False, highlight=False)
+        reason = getattr(request, "reason", None)
+        if reason:
+            # A hook sent this here. Say so, or the question looks arbitrary
+            # and gets answered without being read.
+            render.console.print(f"  [muted]a hook asked for this: {reason}[/muted]")
         hint = "  [muted]y = once · a = this session · ! = always · n = no[/muted]"
         allowlist = getattr(request, "allowlist", None)
         if allowlist is not None and allowlist.should_suggest(request.spec.name):
@@ -579,6 +669,12 @@ def _resume(conversation, arguments: list[str]) -> str:
 def _slash(command: str, conversation, checkpoints=None) -> str:
     parts = command.split()
     verb = parts[0].lower()
+    hooks.fire(
+        "pre_command",
+        surface="repl",
+        command=verb.lstrip("/"),
+        args_raw=command[len(parts[0]):].strip(),
+    )
     if verb in {"/exit", "/quit"}:
         return "exit"
     if verb == "/help":
@@ -593,6 +689,8 @@ def _slash(command: str, conversation, checkpoints=None) -> str:
             output.console.print(
                 f"  [cyan]{spec.name.ljust(14)}[/cyan] [dim]{spec.risk_tier.ljust(12)} {note}[/dim]"
             )
+    elif verb == "/usage":
+        _show_usage(conversation)
     elif verb == "/credits":
         from andromeda_agent import credits as credits_module
 
@@ -614,8 +712,20 @@ def _slash(command: str, conversation, checkpoints=None) -> str:
             if balance.used_micros is not None:
                 render.console.print(
                     f"  [muted]{credits_module.format_micros(balance.used_micros)}"
-                    " used this period[/muted]"
+                    " settled this period[/muted]"
                 )
+            # Said out loud, because the number looks stuck otherwise. The
+            # relay stamps these headers from the balance it reserved against
+            # *before* answering, and settles the charge when the reply ends —
+            # so this is the state as of the turn before last, and the turn you
+            # just watched is not in it yet.
+            render.console.print(
+                "  [muted]as of your previous turn — this one settles after"
+                " it finishes[/muted]"
+            )
+            render.console.print(
+                "  [muted]/usage for what this session has actually spent[/muted]"
+            )
     elif verb == "/rewind":
         if checkpoints is None or not len(checkpoints):
             output.info("Nothing to rewind to yet.")
@@ -681,12 +791,27 @@ def _slash(command: str, conversation, checkpoints=None) -> str:
         from andromeda_tools import skills as skills_module
 
         found = skills_module.discover(conversation.workspace.root)
-        if not found:
+        withheld = getattr(conversation, "withheld_skills", {}) or {}
+        offered = {
+            name: skill for name, skill in found.items() if name not in withheld
+        }
+        if not offered and not withheld:
             output.info("No skills found.")
-        for skill in sorted(found.values(), key=lambda item: item.name):
+        for skill in sorted(offered.values(), key=lambda item: item.name):
             state = "" if skill.available else f" [yellow]needs {', '.join(skill.missing_bins)}[/yellow]"
             output.console.print(
                 f"  [cyan]{skill.name.ljust(18)}[/cyan] [dim]{skill.description[:80]}[/dim]{state}"
+            )
+        for name, result in sorted(withheld.items()):
+            # Named, with the reason. Silently missing is how a person concludes
+            # the feature is broken.
+            output.console.print(
+                f"  [red]{name.ljust(18)}[/red] [dim]withheld — {result.summary()}[/dim]"
+            )
+        if withheld:
+            output.console.print(
+                "  [muted]andromeda skills scan <name> to read why · "
+                "skills trust <name> to use it anyway[/muted]"
             )
     elif verb == "/lanes":
         from andromeda_agent.specialists import SPECIALISTS

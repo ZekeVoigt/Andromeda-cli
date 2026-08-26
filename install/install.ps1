@@ -92,7 +92,7 @@ if ($UserPath -notlike "*$BinDir*") {
 Say ''
 Ok 'Installed.'
 Say ''
-Say '  Sign in:             andromeda auth login'
+Say '  Pair this machine:   andromeda auth login <code>'
 Say '  Or bring your own:   $env:OPENROUTER_API_KEY="..."; andromeda config set provider direct'
 Say '  Then just:           andromeda'
 Say ''

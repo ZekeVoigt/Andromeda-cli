@@ -69,6 +69,17 @@ class MCPError(RuntimeError):
     pass
 
 
+def _reason(exc: Exception) -> str:
+    """An exception as a message the person reading it can act on.
+
+    `mcp_auth` raises with a `hint` carrying the command to run. Dropping it
+    turns "sign in with this command" into "something went wrong", which sends
+    people to check their config file instead.
+    """
+    hint = getattr(exc, "hint", "")
+    return (f"{exc} {hint}".strip() if hint else str(exc))[:300]
+
+
 # ---------------------------------------------------------------------------
 # Transports
 # ---------------------------------------------------------------------------
@@ -178,11 +189,22 @@ class StdioTransport:
 
 
 class HTTPTransport:
-    """A server reached over streamable HTTP. Each request is one POST."""
+    """A server reached over streamable HTTP. Each request is one POST.
 
-    def __init__(self, url: str, headers: dict[str, str] | None) -> None:
+    `auth`, when present, owns everything about credentials: it supplies the
+    headers and it decides what a 401 means. This transport knows only that a
+    401 is worth asking about once.
+    """
+
+    def __init__(
+        self,
+        url: str,
+        headers: dict[str, str] | None,
+        auth: Any = None,
+    ) -> None:
         self.url = url
         self.headers = {"Content-Type": "application/json", **(headers or {})}
+        self.auth = auth
         self._session_id: str | None = None
         self._client = httpx.Client(timeout=httpx.Timeout(CALL_TIMEOUT))
 
@@ -190,17 +212,14 @@ class HTTPTransport:
         return None
 
     def send(self, payload: dict[str, Any], timeout: float) -> dict[str, Any] | None:
-        headers = dict(self.headers)
-        headers["Accept"] = "application/json, text/event-stream"
-        if self._session_id:
-            headers["Mcp-Session-Id"] = self._session_id
+        response = self._post(payload, timeout)
 
-        try:
-            response = self._client.post(
-                self.url, json=payload, headers=headers, timeout=timeout
-            )
-        except httpx.HTTPError as exc:
-            raise MCPError(f"request failed: {exc}") from exc
+        if response.status_code == 401 and self.auth is not None:
+            # Once, never in a loop. A server that refuses a freshly issued
+            # token will refuse the next one too, and a retry loop spends the
+            # user's authorization on a spin.
+            if self.auth.handle_unauthorized():
+                response = self._post(payload, timeout)
 
         session = response.headers.get("mcp-session-id")
         if session:
@@ -208,6 +227,11 @@ class HTTPTransport:
 
         if payload.get("id") is None:
             return None
+        if response.status_code == 401:
+            raise MCPError(
+                "the server rejected our credentials — "
+                "run `andromeda mcp login <server>` to sign in again"
+            )
         if response.status_code >= 400:
             raise MCPError(f"HTTP {response.status_code}: {response.text[:200]}")
 
@@ -224,6 +248,24 @@ class HTTPTransport:
         except json.JSONDecodeError as exc:
             raise MCPError(f"the server returned invalid JSON: {exc}") from exc
 
+    def _post(self, payload: dict[str, Any], timeout: float) -> httpx.Response:
+        headers = dict(self.headers)
+        headers["Accept"] = "application/json, text/event-stream"
+        if self._session_id:
+            headers["Mcp-Session-Id"] = self._session_id
+        if self.auth is not None:
+            # Asked for per request, not cached: this is where an expiring
+            # token gets refreshed, and a header captured at connect time would
+            # go stale in the middle of a long session.
+            headers.update(self.auth.headers())
+
+        try:
+            return self._client.post(
+                self.url, json=payload, headers=headers, timeout=timeout
+            )
+        except httpx.HTTPError as exc:
+            raise MCPError(f"request failed: {exc}") from exc
+
     def close(self) -> None:
         self._client.close()
 
@@ -237,6 +279,10 @@ class HTTPTransport:
 class MCPServer:
     name: str
     config: dict[str, Any]
+    # Where credentials live. `None` means this server was built without a home
+    # — a test, or a caller that has no business signing anything in — and OAuth
+    # is then simply not offered rather than falling back to a guessed path.
+    home: Path | None = None
     transport: Any = None
     tools: list[dict[str, Any]] = field(default_factory=list)
     error: str = ""
@@ -249,9 +295,43 @@ class MCPServer:
             self._counter += 1
             return self._counter
 
+    @property
+    def uses_oauth(self) -> bool:
+        """Whether this server is configured to authorize rather than assert.
+
+        `auth: "oauth"` is explicit, and `oauth: {...}` implies it — a config
+        that carries a scope and a client id and then does not use them is a
+        config somebody expects to work.
+        """
+        return bool(
+            str(self.config.get("auth") or "").lower() == "oauth"
+            or self.config.get("oauth")
+        )
+
+    def _authorization(self):
+        if not self.uses_oauth or self.home is None or "url" not in self.config:
+            return None
+        from . import mcp_auth
+
+        return mcp_auth.Authorization(
+            self.home,
+            self.name,
+            str(self.config["url"]),
+            self.config.get("oauth") if isinstance(self.config.get("oauth"), dict) else {},
+            # A tool call is never the place a browser opens. The model asked
+            # for a search, not for a consent screen, and a session that stops
+            # to authorize mid-turn has taken a decision that belongs to the
+            # person. `andromeda mcp login` is where that happens.
+            interactive=False,
+        )
+
     def _build_transport(self):
         if "url" in self.config:
-            return HTTPTransport(str(self.config["url"]), self.config.get("headers"))
+            return HTTPTransport(
+                str(self.config["url"]),
+                self.config.get("headers"),
+                self._authorization(),
+            )
         command = self.config.get("command")
         if not command:
             raise MCPError("needs either `command` or `url`")
@@ -308,7 +388,10 @@ class MCPServer:
             self.error = ""
             return True
         except Exception as exc:  # noqa: BLE001 - surfaced through `error`
-            self.error = str(exc)[:300]
+            # A server that needs signing in is not broken, and reporting it as
+            # broken sends people to check their config file instead of running
+            # the one command that fixes it.
+            self.error = _reason(exc)
             self.close()
             return False
 
@@ -326,11 +409,15 @@ class MCPServer:
                 },
                 CALL_TIMEOUT,
             )
-        except MCPError as exc:
-            # A dead server should not stay marked live; the next call
-            # reconnects rather than writing into a closed pipe forever.
+        except Exception as exc:  # noqa: BLE001 - a tool must never end a turn
+            # Broad on purpose. `MCPError` is the common case — and a dead
+            # server must not stay marked live, so the next call reconnects
+            # rather than writing into a closed pipe forever. But an expired
+            # authorization raises out of `mcp_auth` instead, and a tool call
+            # that propagates ends the turn rather than letting the model read
+            # what happened and move on.
             self.connected = False
-            return failure(f"{self.name}/{tool} failed: {exc}")
+            return failure(f"{self.name}/{tool} failed: {_reason(exc)}")
 
         if reply and "error" in reply:
             message = reply["error"].get("message", reply["error"])
@@ -413,7 +500,10 @@ def load_config(home: Path) -> dict[str, dict[str, Any]]:
 
 
 def build_servers(home: Path) -> list[MCPServer]:
-    return [MCPServer(name=name, config=config) for name, config in load_config(home).items()]
+    return [
+        MCPServer(name=name, config=config, home=home)
+        for name, config in load_config(home).items()
+    ]
 
 
 def specs_for(server: MCPServer) -> list[ToolSpec]:

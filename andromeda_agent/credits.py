@@ -129,15 +129,54 @@ def parse(headers: Mapping[str, Any] | None) -> Balance:
     )
 
 
-def format_micros(micros: int | None) -> str:
-    """Micros to a dollar string, at the display edge and nowhere else."""
+# The decimal places a dollar figure may be shown at, coarsest first. Two is
+# what money normally looks like; the rest exist because a small grant spent in
+# fractions of a cent is still being spent, and a display that cannot show that
+# reports a balance as frozen while it moves.
+PRECISIONS = (2, 4, 6)
+
+
+def format_micros(micros: int | None, decimals: int | None = None) -> str:
+    """Micros to a dollar string, at the display edge and nowhere else.
+
+    `decimals` is chosen for you when it is not given: two places for anything
+    a cent can express, four below that. Pass it explicitly to render several
+    figures at one precision — see `format_pair`, which is where the rule that
+    actually matters lives.
+    """
     if micros is None:
         return ""
+    if decimals is None:
+        decimals = 2 if abs(micros) >= 10_000 else 4
     negative = micros < 0
     dollars = abs(micros) / MICROS_PER_DOLLAR
-    # Sub-cent balances are real and rounding them to $0.00 reads as empty.
-    text = f"${dollars:,.2f}" if abs(micros) >= 10_000 else f"${dollars:,.4f}"
+    text = f"${dollars:,.{decimals}f}"
     return f"-{text}" if negative else text
+
+
+def format_pair(left: int | None, right: int | None) -> tuple[str, str]:
+    """Two figures at the coarsest precision that still tells them apart.
+
+    This exists because of a real report: a `$0.10` grant with three hundredths
+    of a cent spent renders as "$0.10 of $0.10" at two decimal places, and reads
+    as a balance that is not moving while the account is actively being spent.
+    Money is normally shown to the cent, so the fix is not to show six places
+    always — it is to add places only when two places would hide the
+    difference.
+
+    Figures that are genuinely equal stay at two places, because a window that
+    has just renewed should say "$0.10 of $0.10" and mean it.
+    """
+    if left is None or right is None:
+        return format_micros(left), format_micros(right)
+    for decimals in PRECISIONS:
+        rendered = (
+            format_micros(left, decimals),
+            format_micros(right, decimals),
+        )
+        if left == right or rendered[0] != rendered[1]:
+            return rendered
+    return rendered
 
 
 def summary(balance: Balance) -> str:
@@ -145,9 +184,12 @@ def summary(balance: Balance) -> str:
     if not balance.known:
         return ""
 
-    remaining = format_micros(balance.remaining_micros)
     total = balance.total_micros
-    line = f"{remaining} left" if total is None else f"{remaining} of {format_micros(total)}"
+    if total is None:
+        line = f"{format_micros(balance.remaining_micros)} left"
+    else:
+        remaining, whole = format_pair(balance.remaining_micros, total)
+        line = f"{remaining} of {whole}"
 
     renews = balance.renews_on()
     if renews:

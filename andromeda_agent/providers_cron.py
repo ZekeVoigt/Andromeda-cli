@@ -33,6 +33,48 @@ class CronProvider(Protocol):
     def describe(self) -> str: ...
 
 
+class Relay:
+    """Timing owned by the server. This provider fires nothing itself.
+
+    The safety-critical half of the hosted lane, and it is the half that has to
+    exist *first*. With a hosted trigger arming fires and a local tick loop also
+    running, both would decide the same job is due — and the `flock` that stops
+    two daemons doing this on one machine does not cross a machine boundary. A
+    job that writes a file, sends a message or posts a webhook would do it
+    twice, and the person would see one report.
+
+    So `due()` returns nothing, unconditionally. The local daemon keeps running
+    — it still owns heartbeats, `device` jobs, and the missed-run bookkeeping —
+    but with this provider selected it never *decides* a cloud job is due. The
+    only thing that starts a cloud job is a fire arriving at `cron serve`.
+
+    Selecting it is `cron_provider: relay` in config.yaml. `get()`'s existing
+    fallback covers the typo: an unrecognised name runs the built-in loop rather
+    than refusing to start, because a scheduler that stops over a misspelt
+    setting is a scheduler that silently stopped.
+
+    **Re-arming is not here yet.** `after_run` records the run and stops; the
+    call that tells the server when this job next wants firing arrives with the
+    server side of C4. That order is deliberate rather than incidental: the
+    refusal to double-fire is worth having on its own, and shipping the arming
+    half first would mean a window where two things could start the same job.
+    """
+
+    name = "relay"
+
+    def due(self, schedule: Any, now: float | None = None) -> list:
+        return []
+
+    def after_run(self, schedule: Any, job: Any, run: Any) -> None:
+        # The run is still recorded locally. The ledger and the output file are
+        # this machine's own account of what happened and do not depend on who
+        # decided it should happen.
+        schedule.record(job, run)
+
+    def describe(self) -> str:
+        return "the hosted scheduler (fires arrive at `andromeda cron serve`)"
+
+
 class BuiltIn:
     """The tick loop. Due means `next_run_at` has passed."""
 
@@ -71,3 +113,4 @@ def names() -> list[str]:
 
 
 register(BuiltIn())
+register(Relay())

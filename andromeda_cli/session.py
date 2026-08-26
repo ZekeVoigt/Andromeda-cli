@@ -21,8 +21,15 @@ from andromeda_agent.delegation import (
 from andromeda_agent.lanes import LaneRegistry
 from andromeda_agent import auxiliary as auxiliary_module
 from andromeda_agent import compaction as compaction_module
+from andromeda_agent import curator as curator_module
+from andromeda_agent import hints as hints_module
+from andromeda_agent import hooks
+from andromeda_agent import lsp as lsp_module
+from andromeda_agent import project as project_module
+from andromeda_agent import worktrees
 from andromeda_agent.models import context_window
 from andromeda_agent import soul
+from andromeda_agent import usage as usage_module
 from andromeda_agent.schedule import Schedule
 from andromeda_agent.specialists import SPECIALISTS
 from andromeda_tools import (
@@ -33,6 +40,7 @@ from andromeda_tools import (
     skills as skills_module,
 )
 from andromeda_tools import mcp as mcp_module
+from andromeda_tools import skill_scan
 from andromeda_tools.processes import ProcessRegistry
 from andromeda_tools.todo import TodoList
 
@@ -98,11 +106,43 @@ def build_conversation(
     session: "sessions_module.Session | None" = None,
     notepad: Any = None,
     job_id: str = "",
+    surface: str = "",
 ) -> tuple[Conversation, "sessions_module.Session"]:
     workspace = Workspace(workspace_root)
     todos = TodoList()
 
+    # Resolved once, here, and never re-probed: every block it produces sits in
+    # the cached prefix of every request this session sends, and re-running
+    # `git status` per turn would rewrite that prefix for a line that is stale
+    # by the time the model reads it anyway.
+    posture = project_module.resolve(
+        cwd=workspace.root, config=config, model=provider.model
+    )
+
+    # Scanned before they are offered. A skill is instructions that go into the
+    # model's context and files it may open, and the ones in a workspace
+    # arrived with whatever was cloned there — see `skill_scan`. What the scan
+    # blocks is kept in `withheld_skills` rather than dropped, so the surface
+    # can say a skill exists and is not being used.
     found_skills = skills_module.discover(workspace.root)
+
+    # A week's arithmetic over the agent's own skills, run before they are
+    # offered rather than after: sweeping afterwards would list a skill in this
+    # session's prompt and archive it out from under the same session.
+    curator_note = _curate(config, found_skills)
+    if curator_note:
+        found_skills = skills_module.discover(workspace.root)
+
+    screened = skill_scan.screen(
+        found_skills, config_module.home(), skills_module.bundled_skills_dir()
+    )
+    withheld_skills = {
+        name: screened[name]
+        for name in list(found_skills)
+        if not skill_scan.is_allowed(screened[name])
+    }
+    for name in withheld_skills:
+        found_skills.pop(name, None)
     memory = MemoryStore(
         config_module.home() / "memory", config.get("memory_backend")
     )
@@ -132,16 +172,31 @@ def build_conversation(
     allowlist = build_allowlist() if interactive else None
     policy = build_policy(config, interactive=interactive, allowlist=allowlist)
 
-    def child_registry(specialist_id: str) -> dict:
+    # Diagnostics after an edit. Built only inside a workspace: outside one
+    # there is no project root to start a server in, and starting one against
+    # `$HOME` would index the user's entire home directory the first time the
+    # model touched a Python file.
+    lsp_severities = lsp_module.parse_severities(config.get("lsp_severities"))
+    lsp_service = (
+        lsp_module.Service(posture.workspace.root, severities=lsp_severities)
+        if posture.workspace is not None and bool(config.get("lsp", True))
+        else None
+    )
+
+    def child_registry(specialist_id: str, lane_workspace: Workspace | None = None) -> dict:
         """The lane's toolbelt.
 
         Built without `delegate`, unconditionally. Every specialist has
         `can_spawn=False` and `is_session_tool` would deny it anyway — this is
         the third guard, and it is here because depth is the one limit whose
         failure mode is unbounded rather than merely wrong.
+
+        `lane_workspace` is the lane's own git worktree when isolation is on.
+        The tools are bound to it, so the confinement check is what keeps a
+        lane out of the main checkout — not a sentence in its brief.
         """
         return build_registry(
-            workspace,
+            lane_workspace or workspace,
             TodoList(),
             found_skills,
             memory,
@@ -154,6 +209,7 @@ def build_conversation(
             # turn, not the lane's. Its `clarify` refuses, and says why.
             asker=None,
             allow_private_network=bool(config["allow_private_network"]),
+            skills_home=config_module.home(),
         )
 
     def run_lane(
@@ -168,7 +224,17 @@ def build_conversation(
         lane=None,
     ) -> Delegation:
         belt = SPECIALISTS[specialist]
-        registry = child_registry(specialist)
+
+        # One working copy per lane, when the setting is on and this is a git
+        # repository. Everything about it degrades to the shared tree rather
+        # than failing: isolation is an improvement on the default, never a
+        # precondition for delegating.
+        worktree = None
+        if config.get("worktree_isolation"):
+            worktree = worktrees.create(workspace.root, lane.id if lane is not None else "")
+        lane_workspace = Workspace(worktree.path) if worktree is not None else None
+
+        registry = child_registry(specialist, lane_workspace)
 
         # Derived from the parent's policy, never constructed fresh: a lane can
         # only ever hold a subset of what this session holds. An `allowedTools`
@@ -186,7 +252,7 @@ def build_conversation(
         child = Conversation(
             provider=provider,
             policy=child_policy,
-            workspace=workspace,
+            workspace=lane_workspace or workspace,
             max_tokens=int(config["max_tokens"]),
             temperature=float(config["temperature"]),
             max_steps=belt.max_turns,
@@ -202,11 +268,61 @@ def build_conversation(
                     for spec in registry.values()
                     if child_policy.decide(spec) != "denied"
                 ],
+            )
+            + (worktrees.brief_note(worktree) if worktree is not None else ""),
+            # The lane gets the posture too, resolved against *its* tree — an
+            # isolated lane is a different checkout with a different branch and
+            # a different dirty state, and handing it the parent's snapshot
+            # would describe a directory it is not working in. Tailored to the
+            # belt, so a read-only specialist is never told to edit with
+            # `patch`, and never given the coding brief at all when its belt
+            # cannot change a file.
+            context_blocks=project_module.resolve(
+                cwd=(lane_workspace or workspace).root,
+                config=config,
+                model=provider.model,
+            ).blocks(
+                {
+                    spec.name
+                    for spec in registry.values()
+                    if child_policy.decide(spec) != "denied"
+                }
             ),
             registry=registry,
+            tool_search_mode=str(config.get("tool_search") or "auto"),
+            tool_search_listing_tokens=int(
+                config.get("tool_search_listing_tokens") or 0
+            ),
+            # A lane's tool calls are part of the parent's session, so they
+            # report the parent's id — a hook that saw a fresh id per lane
+            # could not tell a delegated call from a new conversation.
+            session_id=binding.record.id,
+            surface="lane",
             # No persistence and no rebuild hook: a lane is not a session, and
             # its transcript belongs to the parent's turn, not to the store.
         )
+        # A writing lane gets diagnostics too. Read-only belts get none: a
+        # lane that cannot edit can never introduce a diagnostic, and starting
+        # an indexer for it is pure cost.
+        #
+        # An isolated lane gets its own service, because its worktree is a
+        # different checkout on a different branch — a server rooted in the
+        # parent's tree would answer about files the lane is not editing. A
+        # lane sharing the working directory shares the parent's service, so
+        # one tree never runs two copies of the same indexer.
+        lane_lsp = None
+        if lsp_service is not None and any(
+            spec.name in lsp_module.EDIT_TOOLS
+            and child_policy.decide(spec) != "denied"
+            for spec in registry.values()
+        ):
+            lane_lsp = (
+                lsp_module.Service(worktree.path, severities=lsp_severities)
+                if worktree is not None
+                else lsp_service
+            )
+        child.lsp = lane_lsp
+
         # The brief IS the system prompt, so the first user message only has to
         # start it working.
         used: list[str] = []
@@ -217,13 +333,25 @@ def build_conversation(
             if lane is not None:
                 lanes.note_progress(lane, spec.name)
 
-        report = child.send("Begin.", Callbacks(on_tool_start=note))
+        try:
+            report = child.send("Begin.", Callbacks(on_tool_start=note))
+        finally:
+            # A service the lane owns dies with the lane. The parent's is left
+            # alone — it belongs to the session, not to this delegation.
+            if lane_lsp is not None and lane_lsp is not lsp_service:
+                lane_lsp.stop()
+            # In `finally`, because a lane that raised is exactly the one whose
+            # half-finished work must not be swept away. `finalize` prunes only
+            # on proof that there is nothing there.
+            outcome = worktrees.finalize(worktree) if worktree is not None else None
+
         return Delegation(
             specialist=belt.id,
             label=label or belt.label,
             report=report,
             turns=child.steps_taken,
             tools_used=used,
+            worktree=outcome,
         )
 
     # The scheduler this session may write to. Interactive only: a job created
@@ -239,7 +367,13 @@ def build_conversation(
             fresh_todos,
             found_skills,
             memory,
-            delegate=make_delegate_tool(run_lane, on_start=_announce, registry=lanes),
+            delegate=make_delegate_tool(
+                run_lane,
+                on_start=_announce,
+                registry=lanes,
+                session_id=binding.record.id,
+                isolated=bool(config.get("worktree_isolation")),
+            ),
             lane_tools=make_lane_tools(lanes),
             browser=browser,
             processes=processes,
@@ -247,6 +381,7 @@ def build_conversation(
             mcp_servers=mcp_servers,
             vision=vision,
             allow_private_network=bool(config["allow_private_network"]),
+            skills_home=config_module.home(),
             schedule=schedule,
             # Only a scheduled run passes these, and it passes both. The
             # notepad is bound to one job, so a registry with the tool and no
@@ -269,6 +404,10 @@ def build_conversation(
 
     def persist(messages: list[dict[str, Any]]) -> None:
         binding.record.messages = messages
+        # Written on the same schedule as the transcript, because a token count
+        # that is only saved at a clean exit is a token count that is missing
+        # from every session that crashed — which are the expensive ones.
+        binding.record.usage = conversation.usage.as_dict()
         binding.record.save()
         # Indexed on the same schedule the transcript is written, so a session
         # is searchable the moment it exists rather than after some later
@@ -292,6 +431,7 @@ def build_conversation(
         """
         record = binding.record
         record.messages = messages
+        record.usage = conversation.usage.as_dict()
         record.save()
         state.index_session(record)
         archived = state.archive_range(record.id, first, last)
@@ -299,6 +439,15 @@ def build_conversation(
         # note promising searchable turns when nothing was stored is the one
         # failure mode worth guarding here.
         return compaction_module.recall_note(record.id, archived)
+
+    # Built here rather than inline, because the coding brief has to name only
+    # the tools this session actually offers — and "offers" means the registry
+    # minus whatever the policy would refuse outright, which is the same set
+    # `Conversation.available` hands the model.
+    registry = rebuild(todos)
+    offered = {
+        name for name, spec in registry.items() if policy.decide(spec) != "denied"
+    }
 
     conversation = Conversation(
         provider=provider,
@@ -308,12 +457,39 @@ def build_conversation(
         temperature=float(config["temperature"]),
         context_window=_window(config, provider),
         todos=todos,
-        registry=rebuild(todos),
-        context_blocks=_context_blocks(found_skills, memory),
+        registry=registry,
+        context_blocks=_context_blocks(found_skills, memory, posture, offered),
         on_persist=persist,
         on_archive=archive,
         rebuild_registry=rebuild,
+        tool_search_mode=str(config.get("tool_search") or "auto"),
+        tool_search_listing_tokens=int(config.get("tool_search_listing_tokens") or 0),
+        session_id=record.id,
+        # Named for the hook payloads. Derived rather than required, so a
+        # caller that never heard of surfaces still reports something true.
+        surface=surface or ("repl" if interactive else "once"),
     )
+
+    conversation.lsp = lsp_service
+
+    # Discovers a package's own AGENTS.md when the model first reads something
+    # under it. Seeded with what the prompt already carries, or the first tool
+    # call re-delivers the file the model has been reading all session. Only
+    # inside a workspace: elsewhere there is no tree to confine it to, and an
+    # unconfined tracker is one that reads another agent's house rules out of
+    # the home directory.
+    if posture.workspace is not None and posture.mode != "off":
+        tracker = hints_module.Hints(
+            workspace.root, boundary=posture.workspace.chain_root
+        )
+        tracker.seed_from_workspace(posture.workspace)
+        conversation.hints = tracker
+
+    # So `/skills` can say what was found and not offered. A capability that
+    # vanishes with no explanation is one people work around by turning the
+    # whole feature off.
+    conversation.withheld_skills = withheld_skills
+    conversation.curator_note = curator_note
 
     # Attached so the surface can report lanes and processes still running when
     # a turn ends, and clean them up when the session does.
@@ -328,7 +504,74 @@ def build_conversation(
     if session is not None and session.messages:
         conversation.messages = list(session.messages)
 
+    # A resumed session keeps what it already spent. Starting the count again
+    # at zero would make `andromeda status` report the last sitting rather than
+    # the session, and a long-running session is exactly the one worth
+    # measuring.
+    if session is not None and session.usage:
+        conversation.usage = usage_module.Usage.from_dict(session.usage)
+
+    # Fired here rather than in each surface: every way into a conversation
+    # comes through this function, and a lifecycle event that four call sites
+    # have to remember to fire is one that three of them will forget.
+    hooks.fire(
+        "on_session_start",
+        session_id=record.id,
+        model=provider.model,
+        surface=conversation.surface,
+    )
+
     return conversation, record
+
+
+def _curate(config: dict[str, Any], found_skills: dict[str, Any]) -> str:
+    """Sweep the skill library, if it is time. Returns a line, or "".
+
+    Best-effort by contract, like every other startup check: a session that
+    could not tidy a directory is still a session, and failing to open over
+    housekeeping would be the worst possible trade.
+    """
+    try:
+        home = config_module.home()
+        settings = curator_module.Settings.from_config(config)
+        if not curator_module.due(home, settings):
+            return ""
+        result = curator_module.sweep(found_skills, home, settings)
+        if not result.changed:
+            return ""
+        return f"curated skills — {result.summary()}"
+    except Exception:  # noqa: BLE001 - housekeeping must never fail a session
+        return ""
+
+
+def ended(conversation, *, completed: bool = True) -> None:
+    """Report that a session is over, from wherever it ended.
+
+    Idempotent on purpose: a surface can reach here from its clean exit and
+    from its exception path, and a lifecycle event that fires twice is worse
+    than one that fires late — a hook counting sessions would silently
+    double-count every crash.
+    """
+    if conversation is None or getattr(conversation, "_session_ended", False):
+        return
+    conversation._session_ended = True
+    # Before the hook, not after: a shell hook is allowed to take its time, and
+    # a language server left running past the end of a session is a `pyright`
+    # somebody finds in `top` an hour later and cannot explain.
+    service = getattr(conversation, "lsp", None)
+    if service is not None:
+        try:
+            service.stop()
+        except Exception:  # noqa: BLE001 - shutdown must not raise
+            pass
+    hooks.fire(
+        "on_session_end",
+        session_id=getattr(conversation, "session_id", ""),
+        model=getattr(conversation.provider, "model", ""),
+        surface=getattr(conversation, "surface", "repl"),
+        turn_count=conversation.turn_count,
+        completed=completed,
+    )
 
 
 _announce_hook: Any = None
@@ -361,7 +604,10 @@ def _ask_user(questions):
 
 
 def _context_blocks(
-    found_skills: dict[str, skills_module.Skill], memory: MemoryStore
+    found_skills: dict[str, skills_module.Skill],
+    memory: MemoryStore,
+    posture: project_module.Posture | None = None,
+    tool_names: set[str] | None = None,
 ) -> list[str]:
     # Where the agent's own state lives. Asked often enough — "where are my
     # sessions", "what have you remembered" — and a guess is worse than a fact.
@@ -381,6 +627,15 @@ def _context_blocks(
     soul_block = soul.block(home)
     if soul_block:
         blocks.append(soul_block)
+
+    # After SOUL.md and before the skills manifest. The person's own file is
+    # the one block a human wrote by hand and it stays first; the project's
+    # conventions come next, because they are about the work rather than about
+    # the worker; the manifest and the memories are inventories, and an
+    # inventory read before the instructions is an inventory read without
+    # knowing what to look for.
+    if posture is not None:
+        blocks.extend(posture.blocks(tool_names))
 
     manifest = skills_module.manifest(found_skills)
     if manifest:

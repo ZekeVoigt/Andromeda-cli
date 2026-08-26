@@ -26,12 +26,14 @@ in full.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from andromeda_tools import ToolResult, ToolSpec
 from andromeda_tools.spec import failure
 
+from . import hooks
 from .lanes import Lane, LaneRegistry
 from .specialists import SPECIALISTS, resolve
 
@@ -78,6 +80,10 @@ class Delegation:
     # that never happened. Observed live; see `_evidence`.
     tools_used: list[str] = field(default_factory=list)
     truncated: bool = False
+    # The lane's own working copy, when `worktree_isolation` is on. Carried
+    # into the report because the parent cannot otherwise find the branch the
+    # work is on — and a lane whose commits nobody merges did the work twice.
+    worktree: Any = None
 
 
 def build_brief(
@@ -134,10 +140,28 @@ def _needs_browser(specialist_id: str) -> bool:
     return specialist_id == "browser"
 
 
+def _exclusive_surface(specialist_id: str, isolated: bool) -> str:
+    """Which surface this lane holds alone, if any.
+
+    The browser is one browser, always. The working tree is shared only when
+    lanes do not each have a copy of it — with `worktree_isolation` on, two
+    builders are genuinely independent and serialising them would throw away
+    the reason for the setting.
+    """
+    if _needs_browser(specialist_id):
+        return "browser"
+    belt = SPECIALISTS.get(specialist_id)
+    if belt is not None and belt.writes_tree and not isolated:
+        return "tree"
+    return ""
+
+
 def make_delegate_tool(
     run_lane: Callable[..., Delegation],
     on_start: Callable[[str, str], None] | None = None,
     registry: LaneRegistry | None = None,
+    session_id: str = "",
+    isolated: bool = False,
 ) -> ToolSpec:
     """The `delegate` tool, bound to something that can actually run a lane.
 
@@ -175,18 +199,24 @@ def make_delegate_tool(
                 specialist=belt.id,
                 label=label or task[:60],
                 task=task,
-                run=lambda lane: run_lane(
-                    specialist=belt.id,
+                run=lambda lane: _observed(
+                    lambda: run_lane(
+                        specialist=belt.id,
+                        task=task,
+                        context=context or "",
+                        success_criteria=successCriteria or [],
+                        expected_output=expectedOutput or "",
+                        allowed_tools=allowedTools or None,
+                        denied_tools=deniedTools or None,
+                        label=label or "",
+                        lane=lane,
+                    ),
+                    parent_session_id=session_id,
+                    specialist_id=belt.id,
+                    run_id=lane.id,
                     task=task,
-                    context=context or "",
-                    success_criteria=successCriteria or [],
-                    expected_output=expectedOutput or "",
-                    allowed_tools=allowedTools or None,
-                    denied_tools=deniedTools or None,
-                    label=label or "",
-                    lane=lane,
                 ),
-                exclusive_browser=_needs_browser(belt.id),
+                exclusive=_exclusive_surface(belt.id, isolated),
             )
             return ToolResult(
                 content=(
@@ -199,15 +229,21 @@ def make_delegate_tool(
             )
 
         try:
-            outcome = run_lane(
-                specialist=belt.id,
+            outcome = _observed(
+                lambda: run_lane(
+                    specialist=belt.id,
+                    task=task,
+                    context=context or "",
+                    success_criteria=successCriteria or [],
+                    expected_output=expectedOutput or "",
+                    allowed_tools=allowedTools or None,
+                    denied_tools=deniedTools or None,
+                    label=label or "",
+                ),
+                parent_session_id=session_id,
+                specialist_id=belt.id,
+                run_id="",
                 task=task,
-                context=context or "",
-                success_criteria=successCriteria or [],
-                expected_output=expectedOutput or "",
-                allowed_tools=allowedTools or None,
-                denied_tools=deniedTools or None,
-                label=label or "",
             )
         except Exception as exc:  # noqa: BLE001 - a failed lane is a result
             return failure(f"The {belt.label} lane failed: {exc}")
@@ -222,10 +258,19 @@ def make_delegate_tool(
             f"[{outcome.label or belt.label} · {outcome.turns} step{plural} · "
             f"{_evidence(outcome)}]"
         )
+        if outcome.worktree is not None:
+            header = f"{header}\n[{outcome.worktree.summary()}]"
+        metadata = {
+            "specialist": belt.id,
+            "turns": outcome.turns,
+            "truncated": truncated,
+        }
+        if outcome.worktree is not None:
+            metadata["worktree"] = outcome.worktree.as_dict()
         return ToolResult(
             content=f"{header}\n{report}",
             display=f"{belt.label}: {outcome.turns} step{plural}",
-            metadata={"specialist": belt.id, "turns": outcome.turns, "truncated": truncated},
+            metadata=metadata,
         )
 
     return ToolSpec(
@@ -328,6 +373,53 @@ def make_delegate_tool(
     )
 
 
+def _observed(
+    work: Callable[[], Delegation],
+    *,
+    parent_session_id: str,
+    specialist_id: str,
+    run_id: str,
+    task: str,
+) -> Delegation:
+    """Run a lane between its two lifecycle events.
+
+    Wrapped around both the blocking and the background path, so a hook counts
+    every lane rather than only the ones that happened to be waited on. A lane
+    that raises still reports a stop — with `status="error"`, because a child
+    that vanished silently is the failure mode that made lane debugging hard in
+    the first place.
+    """
+    common = {
+        "parent_session_id": parent_session_id,
+        "specialist_id": specialist_id,
+        "run_id": run_id,
+        "task": task,
+    }
+    hooks.fire("subagent_start", **common)
+    started = time.monotonic()
+    try:
+        outcome = work()
+    except BaseException as exc:
+        hooks.fire(
+            "subagent_stop",
+            **common,
+            status="error",
+            summary=f"{type(exc).__name__}: {exc}",
+            tool_call_history=[],
+            duration_ms=round((time.monotonic() - started) * 1000, 3),
+        )
+        raise
+    hooks.fire(
+        "subagent_stop",
+        **common,
+        status="completed",
+        summary=outcome.report,
+        tool_call_history=list(outcome.tools_used),
+        duration_ms=round((time.monotonic() - started) * 1000, 3),
+    )
+    return outcome
+
+
 def _evidence(outcome: Delegation) -> str:
     """What the lane actually did, from its transcript rather than its prose.
 
@@ -376,7 +468,13 @@ def _report(lane: Lane) -> str:
     evidence = _evidence(outcome) if outcome is not None else "called no tools"
     steps = getattr(outcome, "turns", 0)
     plural = "" if steps == 1 else "s"
-    return f"[{lane.id} · {lane.label} · {steps} step{plural} · {evidence}]\n{body}"
+    header = f"[{lane.id} · {lane.label} · {steps} step{plural} · {evidence}]"
+    # A background lane's work is only reachable through its branch, and this
+    # report is the only place the parent is told which one.
+    worktree = getattr(outcome, "worktree", None)
+    if worktree is not None:
+        header = f"{header}\n[{worktree.summary()}]"
+    return f"{header}\n{body}"
 
 
 def make_lane_tools(registry: LaneRegistry) -> list[ToolSpec]:
