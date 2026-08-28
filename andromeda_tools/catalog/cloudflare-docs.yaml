@@ -1,0 +1,17 @@
+manifest_version: 1
+name: cloudflare-docs
+description: Search Cloudflare's product documentation. No account needed.
+source: https://developers.cloudflare.com/agents/model-context-protocol/
+# Anonymous — verified 2026-08-27, it completes a handshake with no
+# credentials at all. Worth shipping precisely because it costs nothing to
+# connect and answers a question people otherwise open a browser for.
+transport:
+  type: http
+  url: https://docs.mcp.cloudflare.com/mcp
+auth:
+  type: none
+suggest:
+  keywords: [cloudflare, workers, dns, r2, durable object]
+  hosts: [cloudflare.com, developers.cloudflare.com]
+post_install: |
+  Nothing to sign in to. Start a new session and the tools are there.

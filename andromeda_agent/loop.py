@@ -12,6 +12,7 @@ not a paraphrase.
 
 from __future__ import annotations
 
+import logging
 import re
 import time
 from dataclasses import dataclass, field, replace
@@ -20,7 +21,7 @@ from typing import Any, Callable, Iterable, Protocol
 from andromeda_tools import ToolResult, ToolSpec, Workspace, build_registry
 from andromeda_tools.todo import TodoList
 
-from . import compaction, hooks, lsp as lsp_module, redact, resilience, tool_search
+from . import compaction, hooks, lsp as lsp_module, middleware, redact, resilience, tool_search
 from . import usage as usage_module
 from . import hints as hints_module
 from .errors import AgentError
@@ -31,6 +32,8 @@ from .providers.base import AssistantTurn, ToolCall
 # A runaway loop is a bill. Reached in practice only when the model is stuck
 # retrying a failing tool, which is exactly when stopping is right.
 MAX_STEPS = 24
+
+logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """You are Andromeda, running as a local-first agent in the user's terminal.
 
@@ -45,6 +48,17 @@ them and adjust rather than repeating the same call.
 say what you would have done and stop, do not look for another route to it.
 - Answer directly and concisely. When you do not know something about their \
 system, use a tool or say so — do not guess.
+- When the user asks about a third-party app you have no tools for, that is \
+usually a connection that has not been made yet, not a dead end. Use \
+`connect_app` to see whether it can be connected and offer to do it. Never \
+answer "I have no access to X" without checking first.
+- When you need a credential for a service, the order is: a connected app \
+first, then this workspace's own configuration, then ask the user. Never \
+search the filesystem for one. Do not grep for key names, do not read \
+env dumps, backups or another project's files looking for a secret, and \
+never reuse a key you found that way — a key sitting in one project was not \
+given to you for this one. If you cannot find a credential through a \
+connection or the workspace, say what is needed and ask.
 
 Your output is rendered as markdown in a terminal, so structure is free and \
 worth using: headings, **bold** for the thing that matters, tables for anything \
@@ -77,6 +91,14 @@ _PROMPT_REQUIRES: tuple[tuple[str, frozenset[str]], ...] = (
         frozenset({"patch", "write_file", "terminal"}),
     ),
     ("Prefer reading before writing", frozenset({"patch", "write_file"})),
+    ("When the user asks about a third-party app", frozenset({"connect_app"})),
+    ("`connect_app` to see whether", frozenset({"connect_app"})),
+    ("When you need a credential for a service", frozenset({"terminal", "read_file"})),
+    ("search the filesystem for one", frozenset({"terminal", "read_file"})),
+    ("env dumps, backups or another", frozenset({"terminal", "read_file"})),
+    ("never reuse a key you found that way", frozenset({"terminal", "read_file"})),
+    ("connection or the workspace, say what", frozenset({"terminal", "read_file"})),
+    ("answer \"I have no access to X\"", frozenset({"connect_app"})),
     ("Use `patch` for part of a file", frozenset({"patch", "write_file"})),
     (
         "Non-zero exits and missing files",
@@ -125,6 +147,60 @@ class Callbacks:
     on_retry: Callable[[str], None] | None = None
 
 
+def _approval_transport():
+    """The first plugin approval transport, or None. Never raises."""
+    try:
+        from . import plugins as plugins_module
+
+        transports = plugins_module.approval_transports()
+    except Exception:  # noqa: BLE001 - the gate must not depend on plugins
+        return None
+    for _name, present in sorted(transports.items()):
+        return present
+    return None
+
+
+def _transport_answer(present, spec: ToolSpec, arguments: dict[str, Any], summary: str) -> Answer:
+    """Ask a plugin transport, and refuse on anything unexpected.
+
+    **Fails closed, in every direction.** A transport that raises, times out,
+    or returns something that is not one of the gate's answers gets "no". This
+    is the one registration point where failing open would mean a tool running
+    because a plugin was broken, which is indistinguishable from a plugin that
+    approved it.
+    """
+    try:
+        answer = present(
+            ApprovalRequest(spec=spec, arguments=arguments, summary=summary)
+        )
+    except Exception as exc:  # noqa: BLE001 - see the docstring
+        logger.warning("approval transport raised, refusing the call: %s", exc)
+        return "no"
+    if answer not in {"yes", "no", "session", "always", "never"}:
+        logger.warning(
+            "approval transport answered %r, which is not an answer; refusing",
+            answer,
+        )
+        return "no"
+    return answer
+
+
+def _plugin_prompt_sections() -> str:
+    """The plugin block for the system prompt, or "".
+
+    Never raises: a plugin that cannot render its own section costs its
+    section, not the session. Imported inside the function because
+    `andromeda_agent.plugins` imports the hook bus, which imports this
+    package.
+    """
+    try:
+        from . import plugins as plugins_module
+
+        return plugins_module.render_prompt_sections()
+    except Exception:  # noqa: BLE001 - see the docstring
+        return ""
+
+
 @dataclass
 class Conversation:
     provider: Provider
@@ -165,6 +241,10 @@ class Conversation:
     # `turn_count`, which counts what the *user* said — a lane sends one user
     # message and may take a dozen steps answering it.
     steps_taken: int = 0
+    # Set by `reload_tools`, cleared by the step loop once it has picked the
+    # new catalogue up. A flag rather than a direct write, because `send` holds
+    # `schemas` as a local and a tool running underneath it cannot reach that.
+    _tools_changed: bool = False
     # Set by the surface when this conversation can start background lanes.
     # Typed loosely on purpose: the loop must not import the lane machinery,
     # which imports tools, which would close a cycle.
@@ -219,6 +299,13 @@ class Conversation:
         if prompt is SYSTEM_PROMPT and self.registry:
             prompt = tailor_prompt(prompt, self._offered())
         parts = [prompt, f"Workspace root: {self.workspace.root}"]
+        # Plugin sections before the caller's context blocks, and inside their
+        # own markers. They are the stable part — the same set of plugins gives
+        # the same bytes every turn — so putting them ahead of blocks that
+        # change keeps more of the cached prefix intact.
+        plugin_block = _plugin_prompt_sections()
+        if plugin_block:
+            parts.append(plugin_block)
         parts.extend(block for block in self.context_blocks if block.strip())
         return "\n\n".join(parts)
 
@@ -260,6 +347,13 @@ class Conversation:
 
         for step in range(self.max_steps):
             self._compact_if_needed(callbacks)
+            # A tool call in the previous step may have added tools — that is
+            # what `connect_app` does. Picking the catalogue back up here is
+            # what lets the model use them on the very next step instead of
+            # after a restart.
+            if self._tools_changed:
+                schemas = self.assembly.schemas
+                self._tools_changed = False
             turn = self._model_turn(schemas, callbacks, step=step, user_message=prompt)
             self.steps_taken = step + 1
             self.messages.append(turn.to_message())
@@ -454,23 +548,85 @@ class Conversation:
             request = self._request_messages(
                 step=step, user_message=user_message, model=model, nudge=nudge
             )
+            max_tokens = self.max_tokens
+            temperature = self.temperature
+            tools = schemas or None
+
+            # `llm_request` middleware. The last thing that touches a request
+            # before it leaves — after compaction, after the nudge, after the
+            # tool assembly — because a rewrite that happened earlier would be
+            # undone by any of them.
+            if middleware.has(middleware.LLM_REQUEST):
+                rewritten = middleware.apply_request(
+                    middleware.LLM_REQUEST,
+                    middleware.payload(
+                        messages=request,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        tools=tools,
+                        model=model,
+                        session_id=self.session_id,
+                        step=step,
+                        attempt=attempt,
+                    ),
+                )
+                if isinstance(rewritten.get("messages"), list):
+                    request = rewritten["messages"]
+                if isinstance(rewritten.get("max_tokens"), int):
+                    max_tokens = rewritten["max_tokens"]
+                if isinstance(rewritten.get("temperature"), (int, float)):
+                    temperature = float(rewritten["temperature"])
+                if rewritten.get("tools") is None or isinstance(rewritten.get("tools"), list):
+                    tools = rewritten.get("tools")
+
             streamed = False
-            try:
+
+            def _one_turn() -> AssistantTurn:
+                """Drive the provider's generator to completion.
+
+                Pulled out so `llm_execution` middleware can wrap it. `streamed`
+                is set from in here on purpose: `resilience.plan_retry` refuses
+                to retry once text has reached the terminal, and that has to
+                stay true across a middleware retry — the text cannot be
+                unprinted just because a wrapper decided to try again.
+                """
+                nonlocal streamed
                 generator = self.provider.stream_turn(
                     request,
-                    max_tokens=self.max_tokens,
-                    temperature=self.temperature,
-                    tools=schemas or None,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    tools=tools,
                 )
                 while True:
                     try:
                         text = next(generator)
                     except StopIteration as stop:
-                        turn = stop.value
-                        break
+                        return stop.value
                     streamed = True
                     if callbacks.on_text is not None:
                         callbacks.on_text(text)
+
+            try:
+                if middleware.has(middleware.LLM_EXECUTION):
+                    turn = middleware.apply_execution(
+                        middleware.LLM_EXECUTION,
+                        _one_turn,
+                        middleware.payload(
+                            model=model,
+                            session_id=self.session_id,
+                            step=step,
+                            attempt=attempt,
+                            message_count=len(request),
+                        ),
+                    )
+                    if not isinstance(turn, AssistantTurn):
+                        raise AgentError(
+                            f"An llm_execution middleware returned "
+                            f"{type(turn).__name__}, not an AssistantTurn.",
+                            hint="`andromeda plugins list` shows what is loaded.",
+                        )
+                else:
+                    turn = _one_turn()
             except AgentError as exc:
                 plan = resilience.plan_retry(exc, attempt, streamed=streamed)
                 if not plan:
@@ -633,6 +789,28 @@ class Conversation:
             else call.arguments
         )
 
+        # `tool_request` middleware, in the same window as a hook's `modify`
+        # and for the same reason: the approval prompt states what will
+        # actually happen, so anything that rewrites the arguments has to have
+        # finished before consent is asked. After the hooks, because a hook can
+        # block and there is no point rewriting a call that is about to be
+        # refused.
+        if middleware.has(middleware.TOOL_REQUEST):
+            rewritten = middleware.apply_request(
+                middleware.TOOL_REQUEST,
+                middleware.payload(
+                    tool_name=spec.name,
+                    args=dict(arguments) if isinstance(arguments, dict) else {},
+                    risk_tier=spec.risk_tier,
+                    session_id=self.session_id,
+                    tool_call_id=call.id,
+                    step=step,
+                ),
+            )
+            replacement = rewritten.get("args")
+            if isinstance(replacement, dict):
+                arguments = replacement
+
         if directive.action == "block":
             reason = directive.message or "A hook blocked this call."
             if callbacks.on_tool_denied is not None:
@@ -694,7 +872,36 @@ class Conversation:
         snapshot = self._baseline(spec.name, arguments)
 
         started = time.monotonic()
-        result = self._run(spec, arguments)
+        # `tool_execution` middleware wraps this, so a plugin can retry it,
+        # cache it, or answer without running it. Inside the timing, so a
+        # retry's cost shows up in `duration_ms` — a wrapper that hid its own
+        # latency would make the slow tool look fast and the loop look broken.
+        if middleware.has(middleware.TOOL_EXECUTION):
+            result = middleware.apply_execution(
+                middleware.TOOL_EXECUTION,
+                lambda: self._run(spec, arguments),
+                middleware.payload(
+                    tool_name=spec.name,
+                    args=dict(arguments) if isinstance(arguments, dict) else {},
+                    risk_tier=spec.risk_tier,
+                    session_id=self.session_id,
+                    tool_call_id=call.id,
+                    step=step,
+                ),
+            )
+            if not isinstance(result, ToolResult):
+                # A middleware that returned the wrong shape would otherwise
+                # reach the transcript as a repr. Reported to the model as an
+                # ordinary tool error, which it can recover from.
+                result = ToolResult(
+                    content=(
+                        f"Error: a tool_execution middleware returned "
+                        f"{type(result).__name__}, not a ToolResult."
+                    ),
+                    ok=False,
+                )
+        else:
+            result = self._run(spec, arguments)
         duration_ms = (time.monotonic() - started) * 1000
 
         # The one place secrets are removed. Everything downstream of this line
@@ -926,10 +1133,29 @@ class Conversation:
             session_id=self.session_id,
             surface=self.surface,
         )
-        if callbacks.ask_approval is None:
+        transport = _approval_transport()
+        if transport is not None:
+            # A plugin transport takes precedence over "nobody is watching",
+            # which is the whole point of one: it reaches a person who is not
+            # at this terminal. It does *not* take precedence over a surface
+            # that has a live prompt — someone sitting here answering is the
+            # better authority than a message sent somewhere else.
+            if callbacks.ask_approval is None:
+                answer: Answer = _transport_answer(transport, spec, arguments, summary)
+            else:
+                answer = callbacks.ask_approval(
+                    ApprovalRequest(
+                        spec=spec,
+                        arguments=arguments,
+                        summary=summary,
+                        allowlist=self.policy.allowlist,
+                        reason=directive.message if directive is not None else None,
+                    )
+                )
+        elif callbacks.ask_approval is None:
             # No one is watching. A tool that needs a person and has none is
             # refused — never auto-approved.
-            answer: Answer = "no"
+            answer = "no"
         else:
             answer = callbacks.ask_approval(
                 ApprovalRequest(
@@ -960,6 +1186,36 @@ class Conversation:
             return ToolResult(content=f"Error: {spec.name} rejected its arguments: {exc}", ok=False)
         except Exception as exc:  # noqa: BLE001 - a failing tool must not end the session
             return ToolResult(content=f"Error: {spec.name} failed: {exc}", ok=False)
+
+    def reload_tools(self) -> list[str]:
+        """Rebuild the toolset mid-session and return the names that are new.
+
+        The toolset was chosen once, at session start, which was right until
+        the agent gained the ability to *change* what tools exist. Connecting an
+        app and then telling the person to restart is the harness admitting it
+        cannot use the thing it just did — and the restart throws away the
+        conversation that led to the connection.
+
+        Keeps the transcript and the todos: this is not a reset. Only the
+        registry and the schemas derived from it are rebuilt.
+        """
+        if self.rebuild_registry is None:
+            return []
+        before = set(self.registry)
+        self.registry = self.rebuild_registry(self.todos)
+
+        # Re-assembled here rather than left to the next exchange. `send`
+        # builds the catalogue once and hands the same list to every step, so a
+        # registry that grew mid-turn would be invisible until the person spoke
+        # again — which is the restart this exists to avoid, one turn later.
+        self.assembly = tool_search.assemble(
+            self.available,
+            context_window=self.context_window,
+            mode=self.tool_search_mode,
+            listing_max_tokens=self.tool_search_listing_tokens,
+        )
+        self._tools_changed = True
+        return sorted(set(self.registry) - before)
 
     def reset(self) -> None:
         """Start over, keeping the session's bindings.

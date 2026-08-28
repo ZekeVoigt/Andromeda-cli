@@ -1,0 +1,24 @@
+manifest_version: 1
+name: hubspot
+description: Contacts, companies, deals, and tickets from HubSpot CRM.
+source: https://developers.hubspot.com/
+# HubSpot publishes OAuth resource metadata but no `registration_endpoint` —
+# verified 2026-08-27 through this client's own discovery path — so a private
+# app token is the route this client can take.
+transport:
+  type: http
+  url: https://mcp.hubspot.com/anthropic
+auth:
+  type: header
+  env:
+    - name: HUBSPOT_MCP_TOKEN
+      prompt: "HubSpot private app access token"
+      secret: true
+      header: Authorization
+      prefix: "Bearer "
+suggest:
+  keywords: [hubspot, crm, deal, contact]
+  hosts: [hubspot.com, app.hubspot.com]
+post_install: |
+  Create a private app at Settings → Integrations → Private Apps and
+  copy its access token. Then start a new session.

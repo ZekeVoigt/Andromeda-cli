@@ -105,3 +105,46 @@ def test_the_installer_can_be_re_run(name, pattern):
     assert ROOT is not None
     text = (ROOT / "cli" / "install" / name).read_text(encoding="utf-8")
     assert pattern in text, f"{name} cannot be run twice"
+
+
+def test_the_hosted_plugin_index_matches_the_bundled_seed():
+    """Same failure as the installers, one directory over.
+
+    `plugins search` fetches `https://ai-andromeda.com/plugins/index.json`, and
+    what serves it is a static file under `public/`. The bundled seed beside the
+    package is the offline fallback *and* the format reference, so the two are
+    two copies of one document — and a second copy is a thing that goes stale
+    in the worst place: the one people actually fetch.
+
+    The `install.sh` URL 404'd once for the neighbouring version of this
+    mistake. This fails before the next one can reach the website.
+    """
+    root = monorepo_root()
+    if root is None:
+        pytest.skip("not inside the monorepo")
+
+    from andromeda_agent import plugin_index
+
+    hosted = root / "public" / "plugins" / "index.json"
+    assert hosted.is_file(), f"{hosted} is missing — `plugins search` would 404"
+    assert hosted.read_bytes() == plugin_index.seed_path().read_bytes(), (
+        f"{hosted} and {plugin_index.seed_path()} have diverged. Copy one over "
+        f"the other; they are two copies of one document."
+    )
+
+
+def test_the_hosted_index_is_what_the_client_fetches():
+    """The path in the file and the path in the code are the same path."""
+    root = monorepo_root()
+    if root is None:
+        pytest.skip("not inside the monorepo")
+
+    from andromeda_agent import plugin_index
+
+    served = (root / "public").joinpath(
+        *plugin_index.DEFAULT_INDEX_URL.split("://", 1)[1].split("/")[1:]
+    )
+    assert served.is_file(), (
+        f"{plugin_index.DEFAULT_INDEX_URL} would resolve to {served}, which "
+        f"does not exist"
+    )

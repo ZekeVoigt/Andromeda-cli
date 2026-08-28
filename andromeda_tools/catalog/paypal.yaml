@@ -1,0 +1,19 @@
+manifest_version: 1
+name: paypal
+description: Payments, invoices, and subscriptions from PayPal.
+source: https://developer.paypal.com/tools/mcp-server/
+transport:
+  type: http
+  url: https://mcp.paypal.com/sse
+auth:
+  type: oauth
+suggest:
+  keywords: [paypal]
+  hosts: [developer.paypal.com, paypal.com]
+post_install: |
+  Run `andromeda mcp login paypal` to authorize in a browser,
+  then start a new session so the tools load.
+
+  This endpoint speaks server-sent events. Simple replies work; a
+  server that streams several frames will be truncated until the
+  streaming client lands.

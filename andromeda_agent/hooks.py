@@ -171,6 +171,25 @@ class HookManager:
         with self._lock:
             self._hooks.setdefault(event, []).append(callback)
 
+    def unregister(self, event: str, callback: Callable[..., Any]) -> bool:
+        """Remove one callback. Returns whether it was there.
+
+        Removes the *last* matching registration, not the first, so a callback
+        registered twice loses the newer one — which is the one an unload is
+        undoing. Order among the survivors is untouched, and order is part of
+        this bus's contract: the first directive wins and the first transform
+        wins.
+        """
+        with self._lock:
+            registered = self._hooks.get(event)
+            if not registered:
+                return False
+            for index in range(len(registered) - 1, -1, -1):
+                if registered[index] is callback:
+                    del registered[index]
+                    return True
+            return False
+
     def callbacks(self, event: str) -> tuple[Callable[..., Any], ...]:
         with self._lock:
             return tuple(self._hooks.get(event, ()))
@@ -250,6 +269,10 @@ def manager() -> HookManager:
 
 def register(event: str, callback: Callable[..., Any]) -> None:
     _manager.register(event, callback)
+
+
+def unregister(event: str, callback: Callable[..., Any]) -> bool:
+    return _manager.unregister(event, callback)
 
 
 def has_hook(event: str) -> bool:

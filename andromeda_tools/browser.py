@@ -211,6 +211,43 @@ class BrowserSession:
             self._page = None
 
 
+def build_session(headless: bool = True) -> "BrowserSession":
+    """The browser this install drives.
+
+    A plugin holding `browser.provider` answers here instead of Playwright.
+    Built through a factory rather than swapped after construction, because a
+    session that has already opened a page is a session with cookies in it —
+    handing that to a replacement mid-flight is handing over whatever it was
+    signed into.
+
+    Falls back to the built-in on any failure. A browser provider that cannot
+    start should cost the page, not the session.
+    """
+    try:
+        from andromeda_agent import plugins as plugins_module
+
+        providers = plugins_module.browser_providers()
+    except Exception:  # noqa: BLE001 - the browser must not depend on plugins
+        providers = {}
+
+    for name in sorted(providers):
+        try:
+            built = providers[name](headless=headless)
+        except Exception as exc:  # noqa: BLE001 - see the docstring
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "browser provider %s failed to start, using the built-in: %s",
+                name,
+                exc,
+            )
+            break
+        if built is not None:
+            return built
+        break
+    return BrowserSession(headless=headless)
+
+
 def _snapshot_payload(page) -> dict[str, Any]:
     return page.evaluate(SNAPSHOT_SCRIPT, REF_ATTRIBUTE)
 

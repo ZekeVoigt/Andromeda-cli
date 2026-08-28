@@ -1,0 +1,15 @@
+manifest_version: 1
+name: notion
+description: Pages and databases from your Notion workspace.
+source: https://developers.notion.com/docs/mcp
+transport:
+  type: http
+  url: https://mcp.notion.com/mcp
+auth:
+  type: oauth
+suggest:
+  keywords: [notion]
+  hosts: [notion.so, notion.site]
+post_install: |
+  Run `andromeda mcp login notion` to authorize in a browser,
+  then start a new session so the tools load.

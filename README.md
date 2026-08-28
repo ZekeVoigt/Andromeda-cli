@@ -903,6 +903,311 @@ secret scanner or a policy check wants — a gate that crashed has not granted
 permission. A hook that times out has its whole process tree taken down; one
 that finishes keeps whatever it started, so `some-daemon &` still works.
 
+## Plugins
+
+A hook runs a script at a lifecycle boundary. A **plugin** is the other half:
+Python that Andromeda imports and hands a registration object, so outside code
+can add tools, commands and skills — or take over the memory backend, the
+scheduler, the model provider or the secret resolver.
+
+```bash
+andromeda plugins list
+andromeda plugins install owner/repo
+andromeda plugins enable <name>
+andromeda plugins capabilities
+```
+
+### Two kinds
+
+```
+  A PYTHON PLUGIN                    A PORTABLE PACKAGE
+  ───────────────                    ──────────────────
+  plugin.yaml                        plugin.json
+  __init__.py  → register(ctx)       skills/<name>/SKILL.md
+                                     mcp.json
+
+  imported into this process         never imported — nothing in it runs
+  can declare capabilities           declares none, and is refused if it tries
+```
+
+The second is the interchange format from `agent-plugins.org`, so a package
+written for another harness loads here unchanged. It carries **skills and MCP
+servers and no code at all**, which makes it a strictly safer thing to install:
+its skills are text the model may read, and its servers go through the ordinary
+MCP path, tool gate and all.
+
+### What a plugin is
+
+A directory with two files.
+
+```
+my-plugin/
+├── plugin.yaml      name, version, and what it is asking for
+└── __init__.py      def register(ctx): ...
+```
+
+```yaml
+name: acme
+version: 1.0.0
+description: Talk to Acme.
+requires_env: [ACME_API_KEY]
+```
+
+```python
+def register(ctx):
+    ctx.register_tool(
+        "acme_search",
+        "Search Acme.",
+        {"type": "object", "properties": {"query": {"type": "string"}}},
+        run_search,
+        risk_tier="outbound",
+        category="read",
+    )
+    ctx.register_hook("on_session_start", lambda **kw: warm_cache())
+    ctx.register_command("acme", lambda raw: status_line())
+```
+
+The full surface, grouped by what it does:
+
+```
+ADD                              REPLACE (needs a capability)
+─────────────────────────        ────────────────────────────────
+register_tool                    register_memory_backend
+register_hook       (17 events)  register_cron_provider
+register_command    (/slash)     register_model_provider
+register_cli_command(andromeda)  register_secret_source
+register_skill                   register_browser_provider
+register_delivery                register_specialist
+register_web_search_provider     register_approval_transport
+register_lsp_server              register_auxiliary_task
+register_blueprint               register_system_prompt_section
+register_eval                    register_middleware
+register_redaction_patterns      register_tool(override=True)
+                                 register_command(override=True)
+
+REACH BACK                       TALK TO OTHER PLUGINS
+──────────────────               ─────────────────────
+ctx.state        10MB of JSON    ctx.emit("event", payload)
+ctx.get_config / set_config      ctx.subscribe("other:event", fn)
+ctx.dispatch_tool                ctx.has_plugin("other")
+ctx.call_mcp                     ctx.on_unload(fn)
+ctx.llm                          ctx.profile_name
+```
+
+`risk_tier` and `category` are the same words every built-in tool uses, so a
+plugin tool goes through the same approval gate as `terminal` does. Omit them
+and you get `outbound`/`write` — a tool that asks first, which is the right
+default for code somebody else wrote.
+
+### Where they come from
+
+```
+bundled      shipped with Andromeda
+user         ~/.andromeda-cli/plugins/
+project      ./.andromeda/plugins/      ← ignored unless you opt in
+pip          packages exposing the andromeda_cli.plugins entry point
+```
+
+Later beats earlier on a name collision, so dropping your own copy of a bundled
+plugin into `~/.andromeda-cli/plugins/` replaces it with no config change.
+
+**Project plugins are off by default.** Set
+`ANDROMEDA_ENABLE_PROJECT_PLUGINS=1` to turn them on. Without that, cloning a
+repository cannot put Python into your agent's process just because you `cd`
+into it.
+
+### Capabilities
+
+Most of what a plugin does is *additive* and needs no permission: a new tool is
+still gated by the approval policy, a new command is a new name, a new language
+server is a binary you may not even have. Twelve things are different, because
+they mean taking over something the harness already owns:
+
+| Capability | What it lets the plugin do |
+|---|---|
+| `tools.override` | Replace a built-in tool — including `terminal` |
+| `commands.override` | Replace a built-in slash command |
+| `model.provider` | Answer as the model provider |
+| `model.auxiliary` | Make side calls on your credential, outside the conversation |
+| `secrets.source` | Resolve `secrets:` references |
+| `cron.provider` | Decide when scheduled jobs are due |
+| `memory.backend` | Own where memories live |
+| `browser.provider` | Answer as the browser, cookies and all |
+| `prompt.inject` | Add text to the system prompt, every turn |
+| `lanes.specialist` | Define a delegation lane — a belt is a permission boundary |
+| `approvals.transport` | Answer approval prompts when you are not here |
+| `runtime.middleware` | Wrap every tool call and every model call |
+
+Those are declared in the manifest and refused until you grant them:
+
+```yaml
+capabilities: [tools.override]
+```
+
+`andromeda plugins enable` names each one, in a sentence about what it does to
+you, and asks once. The grant records a hash of exactly what you agreed to — so
+an update that asks for something new asks you again, and one that asks for
+less silently drops what it no longer needs.
+
+**None of this is a sandbox, and it does not pretend to be.** A plugin is
+Python running as you, in this process. It can `import os`, monkey-patch the
+loop, and ignore every gate above. What capabilities do is decide what the
+harness *hands* it, and give you an honest record of what you agreed to. The
+scan on install catches careless and obvious. It does not catch determined.
+Read what you install.
+
+### Installing
+
+```bash
+andromeda plugins search tide          # the community index
+andromeda plugins install tides        # a name from it
+andromeda plugins install owner/repo   # or a repository
+andromeda plugins install ./my-plugin  # or a directory
+andromeda plugins install owner/repo --ref v1.2.0
+```
+
+**Indexed is not audited.** An entry's *metadata* was reviewed — that the name
+is not a typosquat, that the repository is the one the description claims. Not
+its code, which changes after the review anyway. Every index entry pins a
+40-character commit, because a tag can be moved and a branch head moves by
+definition.
+
+The order matters and is fixed:
+
+```
+clone ──▶ security scan ──▶ capability consent ──▶ "enable it now?"
+              │                                          │
+        dangerous → refused,                       default is no
+        and --force does not help
+```
+
+Nothing is imported until the last step. A plugin that has been enabled has
+already run its `register()`, so asking afterwards would be asking about
+something that already happened.
+
+Enabling a plugin also switches on the tools it adds — `enabled_tools` is an
+allowlist, and a plugin tool that is not in it is a tool the model is never
+offered. `andromeda tools disable <name>` turns one back off afterwards.
+
+### Writing one
+
+```bash
+andromeda plugins new tides --description "Watches the tide."
+andromeda plugins doctor tides
+andromeda plugins install tides --enable
+```
+
+`new` writes a manifest, a `register(ctx)` with one tool and one command, and a
+README — a plugin that already loads, so the next step is editing rather than
+assembling.
+
+```bash
+andromeda plugins doctor .
+```
+
+Loads your plugin through the real runtime **with the network cut**, and
+reports what failed: a manifest typo, a missing `register`, a `register` that
+raises, a capability this version does not have, a scan finding. It also prints
+what you registered, which is how you find out that the thing you thought you
+added is not there.
+
+Two things `ctx` gives you beyond registration:
+
+```python
+ctx.state.set("cursor", 41)      # 10MB of JSON, private to this plugin
+ctx.emit("synced", {"n": 12})    # published as "<your id>:synced"
+ctx.subscribe("other:event", fn) # anyone may listen; only you may emit as you
+```
+
+### Wrapping the loop
+
+Hooks tell you what happened and can veto. **Middleware changes what happens.**
+
+```python
+def register(ctx):
+    ctx.register_middleware("tool_request", add_a_default_argument)
+    ctx.register_middleware("tool_execution", retry_once_on_timeout)
+```
+
+Four kinds. The two `_request` ones are handed a payload and return a
+replacement; the two `_execution` ones are handed the call itself and decide
+whether to run it — twice for a retry, not at all for a cache hit.
+
+```
+  tool_request     the arguments, before the tool runs
+  tool_execution   the tool call, as a callable
+  llm_request      the payload, before it reaches the provider
+  llm_execution    the provider call, as a callable
+```
+
+Execution middleware nests: the first registered is outermost, so it sees the
+others' retries as one call. All four sit behind `runtime.middleware`, because
+holding one and not the others is not a meaningful distinction.
+
+### A set of plugins as one file
+
+```bash
+andromeda plugins pack export --name writing-desk --out desk.yaml
+andromeda plugins pack show desk.yaml
+andromeda plugins pack install desk.yaml
+```
+
+```yaml
+name: writing-desk
+plugins:
+  - name: wordcount
+    ref: 4f1c2b9a8e7d6c5b4a3928170615243342516070
+config:
+  wordcount:
+    target: 800
+```
+
+Three refusals are the whole format. **Every entry must pin a 40-character
+commit** — a pack that named a tag would install different code tomorrow under
+the same description. **A pack can never grant a capability**; each plugin
+still goes through its own consent. **`config:` cannot carry a credential** —
+a pack is a file people share, and it should not be the convenient place to put
+one.
+
+### A package with no code in it
+
+```json
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "shipyard",
+  "version": "1.0.0",
+  "description": "Deployment know-how and a filesystem server."
+}
+```
+
+```
+shipyard/
+├── plugin.json
+├── skills/deploy/SKILL.md    → loadable as `shipyard:deploy`
+└── mcp.json                  → connected as `shipyard:<server>`
+```
+
+Servers are namespaced by the package, so two packages carrying a `github`
+server do not become one and neither can shadow a server you configured
+yourself. `${PLUGIN_ROOT}` and `${PLUGIN_DATA}` expand in `command`, `args`,
+`env` and `cwd` — they are the only two placeholders, both resolve to
+directories this harness owns, and a `cwd` landing outside the package is
+dropped.
+
+One broken skill is a note, not a failure: the parts are independent, and
+`andromeda plugins show <name>` tells you which one did not load rather than
+leaving you to wonder why it never appeared.
+
+### Turning it all off
+
+```bash
+andromeda --no-plugins            # this run
+ANDROMEDA_NO_PLUGINS=1            # every run
+```
+
+`andromeda plugins ...` never loads plugins, so a plugin that breaks on import
+can always be disabled — the command that fixes it is not the command it breaks.
+
 ## Stopping
 
 ```bash
@@ -1317,6 +1622,7 @@ andromeda_agent/   the turn loop, the approval gate, provider lanes, errors,
                    scripts, delivery
 andromeda_tools/   the registry, executors, skills, memory, web, browser, MCP
 andromeda_tui/     the full-screen surface: events, driver, widgets, prompts
+plugins/           the bundled plugins, resolved by walking up from the package
 tests/
 install/
 ```
@@ -1340,5 +1646,5 @@ M4 complete, plus compaction, concurrent lanes, a rendered terminal surface,
 MCP, background processes, rewind, `clarify`, learned approvals, vision,
 thinking-level control, an evals harness, the full-screen interface, and the
 autonomy layer — monitored jobs, script jobs, chaining, notepads, self-
-scheduling and a supervised scheduler. See
+scheduling and a supervised scheduler — and the plugin socket. See
 [`docs/andromeda-cli-plan.md`](../docs/andromeda-cli-plan.md) for what is next.

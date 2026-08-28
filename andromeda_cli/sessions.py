@@ -124,6 +124,34 @@ class Session:
         return self.path
 
 
+def delete(session_id: str) -> bool:
+    """Remove one transcript from disk. True if a file went.
+
+    Resolves a prefix the same way `resolve` does, so the rail and a typed
+    `/sessions rm 3f2` cannot disagree about which conversation an
+    abbreviation names.
+
+    The temporary file `save` writes is removed too. It only exists if a save
+    crashed midway, and leaving it behind would let a later `save` on a reused
+    id `replace()` a stale body over a session that no longer exists.
+    """
+    record = resolve(session_id)
+    if record is None:
+        return False
+    path = record.path
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+    try:
+        path.with_suffix(".json.tmp").unlink()
+    except OSError:
+        pass
+    return True
+
+
 @dataclass
 class Binding:
     """Which transcript a running conversation writes to.
@@ -225,3 +253,40 @@ def search(query: str, limit: int = LIST_LIMIT) -> list[tuple[Session, str]]:
         if len(results) >= limit:
             break
     return results
+
+
+# Written as the first message of a job's own transcript, so opening it cold
+# says what it is. A file full of unexplained run output is one people delete.
+JOB_HEADER = "[scheduled job {name} · its runs are collected here]"
+
+
+def for_job(name: str, workspace: str = "", created_in: str = "") -> Session:
+    """A fresh transcript that a job's runs land in, instead of somebody's chat.
+
+    Jobs used to attach to the conversation that created them. It read well in
+    the design and badly in use: a job polling every five minutes wrote a pair
+    of messages into the transcript of a *live conversation* every five
+    minutes, interleaving its output with what the person was actually saying.
+    The session that asked for the job is the one place its output must not go.
+
+    So each job gets its own. The creating conversation is told the id once, as
+    a link, and after that the two are independent — the job keeps running when
+    that chat is gone, and the chat stays readable.
+
+    `created_in` is recorded, not used for writing. It is what lets the job's
+    transcript say where it came from, which is the question somebody opening
+    it three weeks later actually has.
+    """
+    session = Session(workspace=workspace or "")
+    session.messages = [
+        {"role": "user", "content": JOB_HEADER.format(name=name or "unnamed")},
+    ]
+    if created_in:
+        session.messages.append(
+            {
+                "role": "assistant",
+                "content": f"Created from session {created_in}.",
+            }
+        )
+    session.save()
+    return session

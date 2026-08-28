@@ -34,12 +34,15 @@ you get a boundary nobody checks.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shlex
 import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Known values — pass one
@@ -169,6 +172,58 @@ def _literal_prefix(pattern: str) -> str:
 _PREFIX_SUBSTRINGS = tuple(
     sorted({literal for literal in map(_literal_prefix, _PREFIX_PATTERNS) if literal})
 )
+
+# Shapes a plugin taught us. One alternation compiled once, rather than a list
+# walked per scrub: `scrub` is on the path of every tool result, so a per-call
+# loop over N patterns is N regex passes on text that usually matches none.
+#
+# Additive only, and that is why `ctx.register_redaction_patterns` needs no
+# capability. A pattern here can make the transcript hide more; there is no
+# shape of input that makes it hide less.
+_PLUGIN_RE: "re.Pattern[str] | None" = None
+
+
+def register_plugin_patterns(patterns: "Iterable[str]") -> int:
+    """Replace the plugin pattern set. Returns how many compiled.
+
+    Replaces rather than appends: the caller is the plugin manager handing over
+    its whole current list, so appending would double every pattern on a
+    reload. An individually invalid pattern is dropped with a warning instead
+    of taking the rest of the set down with it.
+    """
+    global _PLUGIN_RE
+
+    usable: list[str] = []
+    for pattern in patterns or ():
+        if not isinstance(pattern, str) or not pattern.strip():
+            continue
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            logger.warning("ignoring invalid plugin redaction pattern %r: %s", pattern, exc)
+            continue
+        usable.append(pattern)
+
+    if not usable:
+        _PLUGIN_RE = None
+        return 0
+
+    try:
+        _PLUGIN_RE = re.compile("|".join(f"(?:{pattern})" for pattern in usable))
+    except re.error as exc:
+        # Each one compiled alone; the union did not. Rather than guess which
+        # pair conflicts, refuse the set and say so — a half-applied redaction
+        # list is a list nobody can reason about.
+        logger.warning("plugin redaction patterns do not combine: %s", exc)
+        _PLUGIN_RE = None
+        return 0
+    return len(usable)
+
+
+def clear_plugin_patterns() -> None:
+    global _PLUGIN_RE
+
+    _PLUGIN_RE = None
 
 # Control and zero-width characters that can split a token body. A secret
 # smuggled as `sk-abc\x1bdef…` is contiguous to a reader and not to a regex,
@@ -533,6 +588,14 @@ def scrub(
         return Scrubbed(text, count)
 
     token_mask = _mask_unusable if file_read else _mask_log
+
+    # Plugin-supplied shapes, before the built-in ones. A plugin knows its own
+    # vendor's token format and nothing here does; running it first means a
+    # match it recognises is masked as a whole rather than half-eaten by a
+    # general rule that happened to overlap it.
+    if _PLUGIN_RE is not None:
+        text, hits = _sub_counting(_PLUGIN_RE, lambda m: token_mask(m.group(0)), text)
+        count += hits
 
     if _has_prefix_substring(text):
         text, hits = _mask_split_tokens(text, token_mask)

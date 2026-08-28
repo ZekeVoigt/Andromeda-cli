@@ -179,6 +179,27 @@ def run(cloud: bool = False) -> int:
         + (f" · {memory.backend_note}" if memory.backend_note else ""),
     )
 
+    # Plugins, because a broken one is the only thing on this screen that is
+    # third-party code running in this process. A plugin that fails to load is
+    # reported at startup and then scrolls away; this is where it stays.
+    from andromeda_agent import plugin_store, plugins as plugins_module
+
+    if plugins_module.plugins_disabled():
+        _line(True, "plugins", f"off — {plugins_module.ENV_DISABLE} is set")
+    else:
+        discovered = plugins_module.discover()
+        enabled = {key for key in discovered if plugin_store.is_enabled(key)}
+        broken = sorted(
+            plugin_id
+            for plugin_id, entry in plugins_module.manager().loaded.items()
+            if entry.error
+        )
+        if discovered:
+            detail = f"{len(enabled)} enabled of {len(discovered)}"
+            if broken:
+                detail += f" · {', '.join(broken)} failed to load"
+            _line(not broken, "plugins", detail)
+
     named = [item for item in profiles.listing() if not item.is_default]
     if named:
         _line(
@@ -189,6 +210,38 @@ def run(cloud: bool = False) -> int:
 
     for binary in ("git", "rg"):
         _line(bool(shutil.which(binary)), binary, shutil.which(binary) or "not installed")
+
+    # Not a failure — everything works without it. But a scheduled job's
+    # notification can only be *clicked into* its conversation when this is
+    # present: macOS's own `display notification` cannot carry an action at
+    # all, so without it the notification is read-only and the session id has
+    # to be typed. Worth one line, since nobody would think to look for it.
+    if sys.platform == "darwin":
+        notifier = shutil.which("terminal-notifier")
+        _line(
+            bool(notifier),
+            "notifications",
+            notifier or "clickable job notifications need `brew install terminal-notifier`",
+        )
+
+    # Which MCP servers a hosted job can reach. Silence here was the whole
+    # failure: a cloud job reached none of them and reported it as having no
+    # tools, which is indistinguishable from the server being broken.
+    try:
+        from andromeda_agent import mcp_cloud
+        from andromeda_tools import mcp_config
+
+        local = mcp_config.servers(config_module.home())
+        if local:
+            travels = [n for n, c in local.items() if not mcp_cloud.travellable(n, c)]
+            _line(
+                True,
+                "mcp → cloud",
+                f"{len(travels)} of {len(local)} can travel"
+                + ("" if not travels else " · `andromeda mcp push` to send them"),
+            )
+    except Exception:  # noqa: BLE001 - a diagnostic must not be the thing that breaks
+        pass
 
     failures = _cloud_checks(config) if cloud else 0
 

@@ -1,0 +1,25 @@
+manifest_version: 1
+name: slack
+description: Messages, channels, and search across your Slack workspace.
+source: https://api.slack.com/
+# Slack publishes OAuth resource metadata but its authorization server has no
+# `registration_endpoint` — verified 2026-08-27 through this client's own
+# discovery path. Without dynamic client registration there is no flow this
+# client can run, so a token you create yourself is the route that works.
+transport:
+  type: http
+  url: https://mcp.slack.com/mcp
+auth:
+  type: header
+  env:
+    - name: SLACK_MCP_TOKEN
+      prompt: "Slack token (an app-level or user OAuth token with the scopes you want)"
+      secret: true
+      header: Authorization
+      prefix: "Bearer "
+suggest:
+  keywords: [slack, channel, dm, message]
+  hosts: [slack.com, app.slack.com]
+post_install: |
+  Create a token at https://api.slack.com/apps — install an app to your
+  workspace and copy its OAuth token. Then start a new session.

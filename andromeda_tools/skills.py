@@ -248,13 +248,43 @@ def manifest(skills: dict[str, Skill]) -> str:
     return "\n".join(lines)
 
 
+def _plugin_skill(name: str) -> "Skill | None":
+    """A skill a plugin registered, addressed as `<plugin id>:<name>`.
+
+    Deliberately reachable by name and absent from the manifest. A plugin whose
+    skills were listed could add lines to the system prompt on every request
+    without ever being called — `prompt.inject` is the granted capability for
+    that, and this must not be a way around it. The colon in the name is what
+    makes an explicit load possible without a listing to read it from.
+    """
+    if ":" not in (name or ""):
+        return None
+    try:
+        from andromeda_agent import plugins as plugins_module
+    except ImportError:  # pragma: no cover - half-installed package
+        return None
+
+    entry = plugins_module.plugin_skills().get(name)
+    if entry is None:
+        return None
+    parsed = parse_skill(Path(entry["path"]))
+    if parsed is None:
+        return None
+    # Renamed to the qualified form so the result the model reads names the
+    # thing it asked for, not the plugin's local shorthand.
+    parsed.name = name
+    if entry.get("description") and not parsed.description:
+        parsed.description = str(entry["description"])
+    return parsed
+
+
 def load_skill(
     skills: dict[str, Skill],
     name: str,
     resource: str | None = None,
     home: "Path | None" = None,
 ) -> ToolResult:
-    skill = skills.get(name)
+    skill = skills.get(name) or _plugin_skill(name)
     if skill is None:
         known = ", ".join(sorted(skills)) or "none"
         return failure(f"No skill named {name!r}. Available: {known}")

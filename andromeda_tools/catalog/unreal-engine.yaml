@@ -1,0 +1,15 @@
+manifest_version: 1
+name: unreal-engine
+description: Drive a running Unreal Engine editor over its local server.
+source: https://dev.epicgames.com/documentation/unreal-engine/unreal-mcp-in-unreal-editor
+transport:
+  type: http
+  url: http://127.0.0.1:8000/mcp
+auth:
+  type: none
+suggest:
+  keywords: [unreal, unreal engine]
+post_install: |
+  Nothing to sign in to — this one is local. Enable the MCP plugin in
+  the Unreal editor and leave the editor running, then start a new
+  session.

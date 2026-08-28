@@ -24,10 +24,12 @@ is not consent.
 
 from __future__ import annotations
 
+from rich.table import Table
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical
+from textual.containers import Vertical, VerticalScroll
+from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.widgets import Input, Static
 
@@ -49,6 +51,36 @@ APPROVAL_CHOICES: tuple[tuple[str, Answer, str], ...] = (
 )
 
 
+def _fit_scroller(screen, box_id: str, scroller_id: str, pinned: tuple[str, ...]) -> None:
+    """Cap one scrolling region at whatever height the pinned rows leave over.
+
+    CSS cannot say this on its own. `max-height: 100%` on the box stops it
+    outgrowing the terminal, but with an `auto` region inside, what gets
+    squeezed out is whatever sits *after* it — the input on a question, the
+    last three answers on an approval. Giving the region `1fr` instead wins the
+    space back by making the box full-height on every terminal, which is a
+    different bug.
+
+    So the leftover is measured. From the screen, not from the box, whose
+    height is the thing being decided: the box contributes only its border and
+    padding, which do not change. The pinned rows are measured rather than
+    assumed because they wrap — a question is two or three rows on a narrow
+    terminal, and a fixed reservation would push the input back off the bottom
+    on exactly the terminals that can least afford it.
+    """
+    try:
+        box = screen.query_one(box_id)
+        scroller = screen.query_one(scroller_id, VerticalScroll)
+        rows = [screen.query_one(one) for one in pinned]
+    except NoMatches:  # pragma: no cover - dismissed mid-refresh
+        return
+    chrome = box.outer_size.height - box.container_size.height
+    spare = screen.size.height - chrome - sum(row.outer_size.height for row in rows)
+    # Three rows is the floor: below that the region is a scrollbar with
+    # nothing in it, and the terminal is too short for this prompt either way.
+    scroller.styles.max_height = max(3, spare)
+
+
 class ApprovalScreen(ModalScreen[Answer]):
     """Consent for one tool call, stated before the call is made."""
 
@@ -58,6 +90,11 @@ class ApprovalScreen(ModalScreen[Answer]):
         Binding("up", "move(-1)", "up", show=False),
         Binding("down", "move(1)", "down", show=False),
         Binding("enter", "take", "choose", show=False),
+        # The detail scrolls and nothing in this screen takes focus, so
+        # without these the tail of a long command is unreadable — and a
+        # command you cannot finish reading is not one you can consent to.
+        Binding("pageup", "scroll_detail(-1)", "scroll up", show=False),
+        Binding("pagedown", "scroll_detail(1)", "scroll down", show=False),
     ]
 
     def __init__(self, body: dict) -> None:
@@ -68,16 +105,33 @@ class ApprovalScreen(ModalScreen[Answer]):
     def compose(self) -> ComposeResult:
         with Vertical(id="approval-box"):
             yield Static(self._header(), id="approval-header")
-            # `Text` built by hand, never a markup string: the summary is the
-            # command itself, and a summary containing `[dim]` or a bracketed
-            # path would otherwise be parsed as styling and shown wrong. A
-            # prompt that misrenders what it is asking about is not consent.
-            yield Static(self._summary(), id="approval-summary")
-            if self.body.get("reason"):
-                yield Static(self._reason(), id="approval-reason")
-            if self.body.get("approvals"):
-                yield Static(self._suggestion(), id="approval-suggestion")
+            # What is being asked scrolls; the header above it and the answers
+            # below it do not. A long command used to push the last three
+            # answers — including the two refusals — off the bottom of the box.
+            with VerticalScroll(id="approval-detail"):
+                # `Text` built by hand, never a markup string: the summary is
+                # the command itself, and a summary containing `[dim]` or a
+                # bracketed path would otherwise be parsed as styling and shown
+                # wrong. A prompt that misrenders what it is asking about is
+                # not consent.
+                yield Static(self._summary(), id="approval-summary")
+                if self.body.get("reason"):
+                    yield Static(self._reason(), id="approval-reason")
+                if self.body.get("approvals"):
+                    yield Static(self._suggestion(), id="approval-suggestion")
             yield Static(self._choices(), id="approval-choices")
+
+    def on_mount(self) -> None:
+        self.call_after_refresh(self._fit)
+
+    def on_resize(self) -> None:
+        self.call_after_refresh(self._fit)
+
+    def _fit(self) -> None:
+        _fit_scroller(
+            self, "#approval-box", "#approval-detail",
+            ("#approval-header", "#approval-choices"),
+        )
 
     def _header(self) -> Text:
         line = Text()
@@ -159,6 +213,10 @@ class ApprovalScreen(ModalScreen[Answer]):
 
     # ---- answering --------------------------------------------------------
 
+    def action_scroll_detail(self, delta: int) -> None:
+        detail = self.query_one("#approval-detail", VerticalScroll)
+        detail.scroll_page_down() if delta > 0 else detail.scroll_page_up()
+
     def action_move(self, delta: int) -> None:
         self.index = (self.index + delta) % len(APPROVAL_CHOICES)
         self._refresh_choices()
@@ -205,6 +263,10 @@ class ClarifyScreen(ModalScreen[list]):
     BINDINGS = [
         Binding("escape", "abandon", "skip", show=False),
         Binding("ctrl+c", "abandon", "skip", show=False),
+        # The input owns the arrow keys, so the list gets these — otherwise a
+        # capped list is one whose last options cannot be read.
+        Binding("pageup", "scroll_choices(-1)", "scroll up", show=False),
+        Binding("pagedown", "scroll_choices(1)", "scroll down", show=False),
     ]
 
     def __init__(self, body: dict) -> None:
@@ -216,11 +278,33 @@ class ClarifyScreen(ModalScreen[list]):
     def compose(self) -> ComposeResult:
         with Vertical(id="clarify-box"):
             yield Static(self._question(), id="clarify-question")
-            yield Static(self._choices(), id="clarify-choices")
+            # The choices scroll; the question above them and the input below
+            # do not. A long list on a short terminal used to grow the box past
+            # the viewport, and Textual clips an oversized box at the *top*:
+            # the question went off screen, leaving a numbered list with
+            # nothing to say what it was a list of — and with enough options,
+            # the input went off the bottom, so there was no way to answer at
+            # all. Whatever else happens, those two stay on screen.
+            with VerticalScroll(id="clarify-choices"):
+                yield Static(self._choices(), id="clarify-choices-body")
             yield Input(placeholder="type an answer, or pick a number", id="clarify-input")
 
     def on_mount(self) -> None:
         self.query_one("#clarify-input", Input).focus()
+        self.call_after_refresh(self._fit)
+
+    def on_resize(self) -> None:
+        self.call_after_refresh(self._fit)
+
+    def action_scroll_choices(self, delta: int) -> None:
+        choices = self.query_one("#clarify-choices", VerticalScroll)
+        choices.scroll_page_down() if delta > 0 else choices.scroll_page_up()
+
+    def _fit(self) -> None:
+        _fit_scroller(
+            self, "#clarify-box", "#clarify-choices",
+            ("#clarify-question", "#clarify-input"),
+        )
 
     @property
     def current(self) -> dict:
@@ -240,20 +324,26 @@ class ClarifyScreen(ModalScreen[list]):
         line.append(str(self.current.get("text", "")), style=render.ZINC_50)
         return line
 
-    def _choices(self) -> Text:
-        choices = self.current.get("choices") or []
-        line = Text()
-        for position, choice in enumerate(choices, start=1):
-            line.append(f"  {position}", style=render.ZINC_50)
-            line.append(f"  {choice}", style=render.ZINC_100)
+    def _choices(self) -> Table:
+        """A two-column grid, so a wrapped choice keeps its indent.
+
+        Built by hand as one `Text` before this, which put the second line of a
+        long option hard against the left edge — under the numbers, reading as
+        an option of its own that no number would select. The grid wraps the
+        label inside its own column instead, and the number column stays empty.
+        """
+        grid = Table.grid(padding=(0, 2))
+        grid.add_column(width=3, justify="right", no_wrap=True)
+        grid.add_column(overflow="fold")
+        for position, choice in enumerate(self.current.get("choices") or [], start=1):
+            label = Text(str(choice), style=render.ZINC_100)
             # First is the recommendation, and an empty answer takes it — which
             # is why the tool's schema insists the recommended option goes
             # first rather than being labelled.
-            line.append(
-                " (recommended)\n" if position == 1 else "\n",
-                style=f"dim {render.ZINC_200}",
-            )
-        return line
+            if position == 1:
+                label.append(" (recommended)", style=f"dim {render.ZINC_200}")
+            grid.add_row(Text(str(position), style=render.ZINC_50), label)
+        return grid
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         event.stop()
@@ -275,7 +365,12 @@ class ClarifyScreen(ModalScreen[list]):
             self.dismiss(self.answers)
             return
         self.query_one("#clarify-question", Static).update(self._question())
-        self.query_one("#clarify-choices", Static).update(self._choices())
+        self.query_one("#clarify-choices-body", Static).update(self._choices())
+        # The next question starts at its own first option, not wherever the
+        # previous one was left scrolled to.
+        self.query_one("#clarify-choices", VerticalScroll).scroll_home(animate=False)
+        # The next question may wrap to a different number of rows.
+        self.call_after_refresh(self._fit)
 
     def action_abandon(self) -> None:
         """Dismissing is silence, not a default.

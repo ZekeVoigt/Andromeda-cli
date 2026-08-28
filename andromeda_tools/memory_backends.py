@@ -278,7 +278,7 @@ def build(name: str, root: Path) -> tuple[MemoryBackend, str]:
     reason: a typo in a setting must not take away the agent's memory.
     """
     wanted = (name or DEFAULT_BACKEND).strip().lower()
-    factory = BACKENDS.get(wanted)
+    factory = BACKENDS.get(wanted) or _plugin_backends().get(wanted)
     if factory is None:
         return (
             JsonBackend(root),
@@ -292,3 +292,18 @@ def build(name: str, root: Path) -> tuple[MemoryBackend, str]:
             f" using {DEFAULT_BACKEND}",
         )
     return backend, ""
+
+
+def _plugin_backends() -> dict[str, "Callable[[Path], MemoryBackend]"]:
+    """Backends a plugin registered, or nothing.
+
+    Consulted only after the built-ins, so a plugin cannot shadow `json` or
+    `sqlite` by claiming their names — the fallback path above still ends at
+    `JsonBackend`, which means a broken plugin backend costs you the setting
+    and never the memories.
+    """
+    try:
+        from andromeda_agent import plugins as plugins_module
+    except ImportError:  # pragma: no cover - half-installed package
+        return {}
+    return plugins_module.memory_backends()

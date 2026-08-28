@@ -35,7 +35,27 @@ def build_provider(config: dict[str, Any]) -> Provider:
         return build_relay(config)
     if lane == "direct":
         return build_direct(config)
+
+    factory = _plugin_providers().get(lane)
+    if factory is not None:
+        # The model lock above has already passed, so a plugin provider cannot
+        # be used to reach a model this build refuses. What it *can* do is see
+        # every prompt and spend whichever credential this install holds, which
+        # is why `model.provider` is a granted capability rather than a config
+        # value.
+        return factory(config)
+
+    known = ", ".join(sorted({"relay", "direct", *_plugin_providers()}))
     raise AgentError(
         f"Unknown provider {lane!r}.",
-        hint="Set one of: relay, direct — `andromeda config set provider relay`",
+        hint=f"Set one of: {known} — `andromeda config set provider relay`",
     )
+
+
+def _plugin_providers() -> dict[str, Any]:
+    """Providers a plugin registered, or nothing."""
+    try:
+        from .. import plugins as plugins_module
+    except ImportError:  # pragma: no cover - half-installed package
+        return {}
+    return plugins_module.model_providers()

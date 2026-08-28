@@ -9,7 +9,7 @@ counterpart there; the hosted runtime has no user filesystem to reach.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from . import browser as browser_module, clarify as clarify_module, files
 from . import mcp as mcp_module
@@ -56,6 +56,11 @@ DEFAULT_ENABLED = (
     "browser_scroll",
     "browser_back",
     "cron",
+    # On by default, and it has to be. The whole failure it fixes is the agent
+    # not knowing an app *could* be connected — a tool the person must first
+    # discover and switch on cannot fix a discovery problem. It is still
+    # `outbound`, so it stops for approval before it does anything.
+    "connect_app",
     # `notepad` is deliberately absent: it only exists inside a scheduled run,
     # bound to that job, and `build_registry` only creates it when one is
     # passed. Listing it here would advertise a tool that no interactive
@@ -79,7 +84,10 @@ def build_registry(
     schedule: object | None = None,
     notepad: object | None = None,
     job_id: str = "",
+    session_id: str = "",
     skills_home: "Path | None" = None,
+    connect_home: "Path | None" = None,
+    on_connected: "Callable[[], list[str]] | None" = None,
 ) -> dict[str, ToolSpec]:
     """Bind the tool functions to this session's workspace and state."""
 
@@ -506,12 +514,24 @@ def build_registry(
     for server in mcp_servers or []:
         specs.extend(mcp_module.specs_for(server))
 
+    # Only where there is a person to approve it and a home to write to. A
+    # delegated lane gets neither: connecting an app writes the config that
+    # decides what *every future session* reaches, which is exactly the kind of
+    # thing a context spawned out of the person's sight must not do — the same
+    # rule that keeps `delegate` and `schedule` out of a lane.
+    if connect_home is not None:
+        from . import connect as connect_module
+
+        specs.append(connect_module.spec(connect_home, on_connected))
+
     if schedule is not None:
         # Only where there is a schedule to write to. An interactive session
         # gets one; a delegated lane does not, for the same reason it does not
         # get `delegate` — a context spawned out of the person's sight must not
         # be able to create one that outlives it.
-        specs.append(scheduling.cron_spec(schedule, str(workspace.root)))
+        specs.append(
+            scheduling.cron_spec(schedule, str(workspace.root), session_id=session_id)
+        )
 
     if notepad is not None and job_id:
         specs.append(scheduling.notepad_spec(notepad, job_id))
@@ -523,7 +543,32 @@ def build_registry(
         # view of its siblings it must not have.
         specs.extend(lane_tools or [])
 
-    return {spec.name: spec for spec in specs}
+    built = {spec.name: spec for spec in specs}
+
+    # Plugin tools last, and by assignment rather than by appending, so an
+    # override actually replaces the built-in instead of losing to it in the
+    # dict comprehension above. Whether a plugin was allowed to claim a
+    # built-in's name was already decided at registration, under the
+    # `tools.override` capability — by the time a spec reaches here the answer
+    # is yes.
+    for spec in _plugin_specs():
+        built[spec.name] = spec
+
+    return built
+
+
+def _plugin_specs() -> list[ToolSpec]:
+    """Tools registered by plugins, or nothing.
+
+    Imported inside the function on purpose. `andromeda_agent.plugins` reaches
+    back into this package for `ToolSpec` and for the built-in name list, and a
+    module-level import here would close that cycle at interpreter start.
+    """
+    try:
+        from andromeda_agent import plugins as plugins_module
+    except ImportError:  # pragma: no cover - only if the package is half-installed
+        return []
+    return plugins_module.plugin_tool_specs()
 
 
 def _browser_specs(

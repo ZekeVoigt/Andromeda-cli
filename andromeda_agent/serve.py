@@ -106,6 +106,37 @@ DRAIN_SECONDS = 25
 # tenant belongs inside it.
 _SIGNED_FIELDS = ("user_id", "job_id", "fire_at", "exp")
 
+# What "something happened" looks like on the wire.
+#
+# A fire used to mean one thing — *it is time* — and the payload said so in four
+# fields. An event fire means *this happened, here is what*, and the "what" has
+# to be covered by the signature: a caller who could swap the event body of an
+# otherwise valid fire chooses what the agent believes about the world, which is
+# most of choosing what it does.
+#
+# **The event is hashed into the payload rather than concatenated into it.** An
+# event body is arbitrary nested JSON and a signature over a joined string needs
+# every field to be unambiguous — `a|b` and `a` + `|b` must not collide. A
+# digest of the canonical encoding has no such seam, and it keeps the signed
+# string a fixed length whatever the event carries.
+#
+# **A fire with no event signs the legacy four-field string, byte for byte.**
+# This is a rollout requirement, not tidiness. The server (Convex) and the
+# runner (Modal) deploy separately, so there is always a window where one side
+# is new and the other is old — and a payload mismatch fails *closed and
+# silently*, as a machine that 401s every fire while looking perfectly healthy.
+# Because a time fire is unchanged on the wire, old and new interoperate in both
+# directions during that window. An old runner receiving a new event fire
+# verifies the four-field payload, ignores the field it does not know, and runs
+# the job without its context — degraded, never wrong.
+EVENT_FIELD = "event"
+
+# The most an event body may be. Bounded because it is attacker-influenced
+# (a source can send whatever it likes), it is hashed on a path that runs before
+# authentication finishes, and it ends up inside a model prompt where a large
+# one is a way to push everything else out of the context window.
+MAX_EVENT_BYTES = 4096
+
 
 class FireError(RuntimeError):
     """A refusal with an HTTP status attached."""
@@ -121,8 +152,42 @@ class FireError(RuntimeError):
 # ---------------------------------------------------------------------------
 
 
-def _payload(user_id: str, job_id: str, fire_at: str, exp: int) -> bytes:
-    return "|".join((user_id, job_id, fire_at, str(exp))).encode("utf-8")
+def canonical_event(event: Any) -> str:
+    """The one encoding of an event body that both ends sign.
+
+    Sorted keys, no insertion whitespace, UTF-8 kept as UTF-8. Two sides that
+    encode the same object differently produce different digests and therefore
+    a 401 that looks like a bad secret — so this is written once, exported, and
+    mirrored in `convex/cloudFire.ts` against the tests in `test_fire_endpoint`.
+
+    `ensure_ascii=False` is load-bearing: Python escapes non-ASCII to `\\uXXXX`
+    by default and `JSON.stringify` does not, so a single accented character in
+    an event body would break every signature if this were left at the default.
+    """
+    return json.dumps(event, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def event_digest(event: Any) -> str:
+    """`sha256` of the canonical encoding, or `""` for no event at all.
+
+    The empty string is what keeps a time fire byte-identical to the fires this
+    module has always signed — see `EVENT_FIELD` above for why that matters more
+    than it looks.
+    """
+    if event is None:
+        return ""
+    return hashlib.sha256(canonical_event(event).encode("utf-8")).hexdigest()
+
+
+def _payload(
+    user_id: str, job_id: str, fire_at: str, exp: int, event: Any = None
+) -> bytes:
+    base = "|".join((user_id, job_id, fire_at, str(exp)))
+    digest = event_digest(event)
+    # No event, no fifth field, not even the separator. A trailing `|` would be
+    # a different string, and a different string is a 401 on every fire from a
+    # server that has not been redeployed yet.
+    return (base if not digest else f"{base}|{digest}").encode("utf-8")
 
 
 def mint(
@@ -131,25 +196,35 @@ def mint(
     fire_at: str,
     ttl_seconds: int = 120,
     user_id: str = "",
+    event: Any = None,
 ) -> dict[str, Any]:
     """A fire, signed. The caller sends `token` as a bearer and the rest as JSON.
 
     Exposed rather than kept private because the tests and the eventual server
     side must sign exactly what this verifies, and a second implementation of
     that string is a second chance to get it wrong.
+
+    `event` is what turns "it is time" into "something happened, here is what".
+    Omit it and this produces exactly the fire it always has.
     """
     exp = int(time.time()) + ttl_seconds
-    return {
+    body: dict[str, Any] = {
         "user_id": user_id,
         "job_id": job_id,
         "fire_at": fire_at,
         "exp": exp,
-        "token": hmac.new(
-            secret.encode("utf-8"),
-            _payload(user_id, job_id, fire_at, exp),
-            hashlib.sha256,
-        ).hexdigest(),
     }
+    # Absent, not null. A `"event": null` key would be a body an old runner
+    # still ignores but a strict reader could treat as "an event was sent",
+    # and the two claims are not the same.
+    if event is not None:
+        body[EVENT_FIELD] = event
+    body["token"] = hmac.new(
+        secret.encode("utf-8"),
+        _payload(user_id, job_id, fire_at, exp, event),
+        hashlib.sha256,
+    ).hexdigest()
+    return body
 
 
 def verify_hmac(secret: str, body: dict[str, Any], token: str) -> None:
@@ -189,7 +264,15 @@ def verify_hmac(secret: str, body: dict[str, Any], token: str) -> None:
     expected = hmac.new(
         secret.encode("utf-8"),
         _payload(
-            str(body["user_id"]), str(body["job_id"]), str(body["fire_at"]), exp
+            str(body["user_id"]),
+            str(body["job_id"]),
+            str(body["fire_at"]),
+            exp,
+            # Verified as it arrived. An event present in the body but absent
+            # from the signature must not verify — otherwise the one field that
+            # tells the agent what happened in the world is the one field
+            # anybody can rewrite.
+            check_event_size(body.get(EVENT_FIELD)),
         ),
         hashlib.sha256,
     ).hexdigest()
@@ -200,6 +283,23 @@ def verify_hmac(secret: str, body: dict[str, Any], token: str) -> None:
         raise FireError(401, "bad token")
     if not hmac.compare_digest(expected, token):
         raise FireError(401, "bad token")
+
+
+def check_event_size(event: Any) -> Any:
+    """Refuse an oversized event before it is hashed, and pass it through.
+
+    Ordered before the signature check on purpose. The digest is computed over
+    attacker-influenced bytes, so the bound has to apply to what an unauthorised
+    caller can make this process do, not only to what a valid one sends.
+    """
+    if event is None:
+        return None
+    encoded = canonical_event(event).encode("utf-8")
+    if len(encoded) > MAX_EVENT_BYTES:
+        raise FireError(
+            400, f"event is larger than {MAX_EVENT_BYTES} bytes"
+        )
+    return event
 
 
 def verify_ed25519(public_key: str, body: dict[str, Any], token: str) -> None:
@@ -253,7 +353,15 @@ def verify_ed25519(public_key: str, body: dict[str, Any], token: str) -> None:
         key.verify(
             bytes.fromhex(token),
             _payload(
-                str(body["user_id"]), str(body["job_id"]), str(body["fire_at"]), exp
+                str(body["user_id"]),
+                str(body["job_id"]),
+                str(body["fire_at"]),
+                exp,
+                # Covered here too. A verifier that checked everything except
+                # the event would be a verifier that lets anyone rewrite what
+                # the agent thinks happened — and the whole reason this scheme
+                # exists is that the runner is not trusted to forge fires.
+                check_event_size(body.get(EVENT_FIELD)),
             ),
         )
     except (InvalidSignature, ValueError):
@@ -310,7 +418,11 @@ class Runner:
         self,
         fires: Fires,
         resolve: Callable[[str], Any],
-        execute: Callable[[Any, str], None],
+        # `(job, fire_at, event)`. The third argument is what happened, or
+        # `None` for a fire that only means "it is time". Required rather than
+        # optional so a callable that forgot it fails loudly at the call site
+        # instead of silently running every event job with no context.
+        execute: Callable[[Any, str, Any], None],
         max_concurrent: int = 0,
     ) -> None:
         self.fires = fires
@@ -324,8 +436,17 @@ class Runner:
         self._idle = threading.Event()
         self._idle.set()
 
-    def accept(self, job_id: str, fire_at: str) -> tuple[int, dict[str, Any]]:
-        """Decide, claim and start. Returns the response, before the work."""
+    def accept(
+        self, job_id: str, fire_at: str, event: Any = None
+    ) -> tuple[int, dict[str, Any]]:
+        """Decide, claim and start. Returns the response, before the work.
+
+        `event` is what happened, when this fire is an event rather than a time.
+        It is carried, never consulted: **every refusal above is unchanged by
+        it.** `I-TRIGGER-2` — a job woken by an event has exactly the consent,
+        belt and ceiling it had when created — is satisfied structurally here,
+        by the event having no say in any of the decisions below it.
+        """
         # First, and before the job is even looked up. A kill switch that only
         # applies to jobs it can resolve is a kill switch with exceptions.
         if cloud_is_off():
@@ -400,7 +521,7 @@ class Runner:
             return 202, {"status": "duplicate", "job_id": job_id}
 
         thread = threading.Thread(
-            target=self._work, args=(job, job_id, fire_at), daemon=False
+            target=self._work, args=(job, job_id, fire_at, event), daemon=False
         )
         with self._counter:
             self.in_flight += 1
@@ -408,10 +529,10 @@ class Runner:
         thread.start()
         return 202, {"status": "accepted", "job_id": job_id}
 
-    def _work(self, job: Any, job_id: str, fire_at: str) -> None:
+    def _work(self, job: Any, job_id: str, fire_at: str, event: Any = None) -> None:
         ok = False
         try:
-            self.execute(job, fire_at)
+            self.execute(job, fire_at, event)
             ok = True
         except BaseException:
             # A failed job must not stop the server, and must still settle:
@@ -509,8 +630,13 @@ def handler_for(runner: Runner, secret: str, scheme: str = "hmac"):
 
             try:
                 verify(secret, body, token)
+                # Read only after `verify` has returned. The event is signed,
+                # so until the signature checks out it is not an event — it is
+                # bytes somebody sent.
                 status, payload = runner.accept(
-                    str(body["job_id"]), str(body["fire_at"])
+                    str(body["job_id"]),
+                    str(body["fire_at"]),
+                    body.get(EVENT_FIELD),
                 )
             except FireError as exc:
                 self._respond(exc.status, {"error": exc.reason})

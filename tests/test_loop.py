@@ -282,10 +282,22 @@ def test_a_read_only_session_is_not_told_how_to_edit(tmp_path) -> None:
 def test_a_full_session_keeps_the_whole_prompt() -> None:
     tailored = loop_module.tailor_prompt(
         loop_module.SYSTEM_PROMPT,
-        {"read_file", "patch", "write_file", "terminal"},
+        {"read_file", "patch", "write_file", "terminal", "connect_app"},
     )
 
     assert tailored == loop_module.SYSTEM_PROMPT
+
+
+def test_a_session_without_connect_app_is_not_told_to_use_it() -> None:
+    """A lane has no `connect_app` — connecting an app writes config that
+    outlives the lane. Telling it to offer one would be an instruction it
+    spends a turn discovering it cannot follow."""
+    tailored = loop_module.tailor_prompt(
+        loop_module.SYSTEM_PROMPT, {"read_file", "terminal"}
+    )
+
+    assert "connect_app" not in tailored
+    assert "third-party app" not in tailored
 
 
 def test_no_tool_list_means_no_tailoring() -> None:

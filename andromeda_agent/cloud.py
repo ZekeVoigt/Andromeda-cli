@@ -46,7 +46,18 @@ from typing import Iterable, Mapping
 from andromeda_tools import RiskTier
 
 # Where the loop executes.
-RUN_LOCATIONS = ("device", "cloud")
+# `auto` is the default and the one most jobs should carry. The other two are
+# a person overriding it.
+#
+# The device/cloud split was a question asked at creation time, and it was the
+# wrong question: somebody scheduling "watch my deploys" does not know or care
+# where it runs, they care that it runs. Worse, the answer was permanent — a
+# job created on a Tuesday afternoon ran on the laptop forever, including every
+# night the lid was shut, which is precisely when a watcher earns its keep.
+#
+# `auto` moves the decision from creation time to fire time. See
+# `resolve_placement`.
+RUN_LOCATIONS = ("device", "cloud", "auto")
 
 # What the job may touch.
 #
@@ -146,8 +157,41 @@ def narrow_tools(names: Iterable[str], runs_on: str, workspace_kind: str) -> lis
 
 
 def max_tier_for(runs_on: str) -> RiskTier | None:
-    """The tier ceiling this location imposes, or None for no extra clamp."""
-    return CLOUD_MAX_TIER if runs_on == "cloud" else None
+    """The tier ceiling this location imposes, or None for no extra clamp.
+
+    `auto` takes the cloud ceiling, not the device one. A job that *may* run
+    unattended is bounded by the stricter of the two places it might land —
+    working out the ceiling per fire would mean a job whose permissions change
+    depending on whether a laptop happened to be awake, which is not something
+    anybody could reason about or consent to.
+    """
+    return CLOUD_MAX_TIER if runs_on in {"cloud", "auto"} else None
+
+
+def resolve_placement(
+    runs_on: str, workspace_kind: str, cloud_available: bool = True
+) -> str:
+    """Where this fire actually happens. Always `device` or `cloud`.
+
+    `device` and `cloud` are honoured as written — a person who said where it
+    runs meant it.
+
+    `auto` decides here, and the workspace decides for it. A job whose
+    workspace is a directory on this machine cannot run anywhere else; the
+    container has no such directory, and pretending otherwise produces a job
+    that reports success having looked at nothing. Everything else prefers the
+    cloud, because the whole value of a scheduled job is the hours nobody is at
+    the keyboard.
+
+    `cloud_available` is the escape hatch for the one case the workspace rule
+    gets wrong: no runner is reachable, because the account has no cloud or the
+    server is down. Running late on the laptop beats not running at all.
+    """
+    if runs_on in {"device", "cloud"}:
+        return runs_on
+    if workspace_kind == "device":
+        return "device"
+    return "cloud" if cloud_available else "device"
 
 
 # ---------------------------------------------------------------------------
@@ -198,10 +242,10 @@ def agent_origin_refusal(runs_on: str) -> str:
     """
     if runs_on == "cloud":
         return (
-            "A job you create cannot run in the cloud. Create it here, tell the "
-            "user what it is for, and let them run `andromeda cron approve <id> "
-            "--run-on cloud` if they agree — a hosted runner spends their credit "
-            "on a schedule with nobody watching, which is theirs to grant."
+            "A job you create cannot be pinned to the cloud. Leave it on `auto` "
+            "— the person grants the unattended half when they approve the "
+            "call, and it then runs wherever makes sense per fire. Pinning is "
+            "theirs: `andromeda cron approve <id> --run-on cloud`."
         )
     return ""
 

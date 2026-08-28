@@ -19,6 +19,13 @@ said out loud to be believed.
 
 **Money is integer micros until the moment it is displayed.** Floats lose cents
 at these magnitudes, and a formatted string invites parsing it back.
+
+**Nothing here ever renders a currency.** The wire is micros of USD because
+that is what the meter charges in, and the screen is Andromeda Credits because
+that is what the person bought. Those are not the same unit and the conversion
+is deliberately one-way: a plan's dollar ceiling is a commercial fact about
+margin, and putting it on a status bar publishes it to every user. `to_credits`
+is the only bridge, and it points outward only.
 """
 
 from __future__ import annotations
@@ -36,7 +43,10 @@ HEADER_ADJUSTMENT = f"{PREFIX}adjustment-micros"
 HEADER_USED = f"{PREFIX}used-micros"
 HEADER_WINDOW_ENDS = f"{PREFIX}window-ends"
 
-MICROS_PER_DOLLAR = 1_000_000
+#: USD micros in one Andromeda Credit. Mirrors `USD_MICROS_PER_CREDIT` in
+#: `shared/billing/catalog.ts`, which is the definition; this is a copy because
+#: the CLI does not import the web app's TypeScript. A test pins them together.
+MICROS_PER_CREDIT = 1_000
 
 
 def _int(headers: Mapping[str, Any], name: str) -> int | None:
@@ -129,50 +139,70 @@ def parse(headers: Mapping[str, Any] | None) -> Balance:
     )
 
 
-# The decimal places a dollar figure may be shown at, coarsest first. Two is
-# what money normally looks like; the rest exist because a small grant spent in
-# fractions of a cent is still being spent, and a display that cannot show that
-# reports a balance as frozen while it moves.
-PRECISIONS = (2, 4, 6)
+# The decimal places a credit figure may be shown at, coarsest first.
+#
+# Whole credits are the normal case and the one people reason in. The finer
+# steps exist because a credit is a thousand micros, so a cheap turn moves the
+# balance by a fraction of one — and a display that could only show whole
+# credits would report a balance as frozen while it is actively being spent.
+# Three is the floor because it is exactly one micro; asking for more would
+# render precision the wire does not carry.
+PRECISIONS = (0, 1, 3)
 
 
-def format_micros(micros: int | None, decimals: int | None = None) -> str:
-    """Micros to a dollar string, at the display edge and nowhere else.
+def to_credits(micros: int | None) -> float | None:
+    """USD micros to Andromeda Credits. The only bridge between the units.
 
-    `decimals` is chosen for you when it is not given: two places for anything
-    a cent can express, four below that. Pass it explicitly to render several
-    figures at one precision — see `format_pair`, which is where the rule that
-    actually matters lives.
+    One-way on purpose. Credits are what a person holds and what a plan is sold
+    in; the dollar figure underneath is a fact about margin, and no surface
+    that a user can see is allowed to derive it back.
+    """
+    if micros is None:
+        return None
+    return micros / MICROS_PER_CREDIT
+
+
+def format_credits(micros: int | None, decimals: int | None = None) -> str:
+    """Micros to a credit string, at the display edge and nowhere else.
+
+    `decimals` is chosen for you when it is not given: whole credits once there
+    is at least one to show, finer below that so a small balance still visibly
+    moves. Pass it explicitly to render several figures at one precision — see
+    `format_pair`, which is where the rule that actually matters lives.
+
+    No unit suffix. The caller decides whether this figure sits beside the word
+    "credits" or inside a phrase that already said it, and baking it in here
+    produced "1,000 credits of 12,000 credits".
     """
     if micros is None:
         return ""
     if decimals is None:
-        decimals = 2 if abs(micros) >= 10_000 else 4
+        decimals = 0 if abs(micros) >= MICROS_PER_CREDIT else 3
     negative = micros < 0
-    dollars = abs(micros) / MICROS_PER_DOLLAR
-    text = f"${dollars:,.{decimals}f}"
+    credits = abs(micros) / MICROS_PER_CREDIT
+    text = f"{credits:,.{decimals}f}"
     return f"-{text}" if negative else text
 
 
 def format_pair(left: int | None, right: int | None) -> tuple[str, str]:
     """Two figures at the coarsest precision that still tells them apart.
 
-    This exists because of a real report: a `$0.10` grant with three hundredths
-    of a cent spent renders as "$0.10 of $0.10" at two decimal places, and reads
-    as a balance that is not moving while the account is actively being spent.
-    Money is normally shown to the cent, so the fix is not to show six places
-    always — it is to add places only when two places would hide the
-    difference.
+    This exists because of a real report: a 100-credit grant with three
+    thousandths of a credit spent renders as "100 of 100" at whole-credit
+    precision, and reads as a balance that is not moving while the account is
+    actively being spent. Credits are normally whole, so the fix is not to show
+    three places always — it is to add places only when whole ones would hide
+    the difference.
 
-    Figures that are genuinely equal stay at two places, because a window that
-    has just renewed should say "$0.10 of $0.10" and mean it.
+    Figures that are genuinely equal stay whole, because a window that has just
+    renewed should say "12,000 of 12,000" and mean it.
     """
     if left is None or right is None:
-        return format_micros(left), format_micros(right)
+        return format_credits(left), format_credits(right)
     for decimals in PRECISIONS:
         rendered = (
-            format_micros(left, decimals),
-            format_micros(right, decimals),
+            format_credits(left, decimals),
+            format_credits(right, decimals),
         )
         if left == right or rendered[0] != rendered[1]:
             return rendered
@@ -180,16 +210,21 @@ def format_pair(left: int | None, right: int | None) -> tuple[str, str]:
 
 
 def summary(balance: Balance) -> str:
-    """One line for a status bar. Empty when there is nothing honest to say."""
+    """One line for a status bar. Empty when there is nothing honest to say.
+
+    The denominator is whatever the server said this window's grant is, never a
+    number this file knows — which is what makes it adapt on its own the moment
+    a plan changes, with no release and no local cache to go stale.
+    """
     if not balance.known:
         return ""
 
     total = balance.total_micros
     if total is None:
-        line = f"{format_micros(balance.remaining_micros)} left"
+        line = f"{format_credits(balance.remaining_micros)} credits left"
     else:
         remaining, whole = format_pair(balance.remaining_micros, total)
-        line = f"{remaining} of {whole}"
+        line = f"{remaining} of {whole} credits"
 
     renews = balance.renews_on()
     if renews:

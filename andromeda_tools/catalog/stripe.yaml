@@ -1,0 +1,15 @@
+manifest_version: 1
+name: stripe
+description: Payments, customers, and invoices from Stripe.
+source: https://docs.stripe.com/mcp
+transport:
+  type: http
+  url: https://mcp.stripe.com
+auth:
+  type: oauth
+suggest:
+  keywords: [stripe]
+  hosts: [dashboard.stripe.com, stripe.com]
+post_install: |
+  Run `andromeda mcp login stripe` to authorize in a browser,
+  then start a new session so the tools load.

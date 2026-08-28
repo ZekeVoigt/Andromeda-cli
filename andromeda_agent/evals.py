@@ -177,13 +177,41 @@ def _reject_yaml_booleans(path: Path, kind: str, value: Any) -> None:
 
 
 def discover(root: Path) -> list[Scenario]:
-    if not root.is_dir():
-        return []
-    scenarios = []
-    for path in sorted(root.glob("*.yaml")) + sorted(root.glob("*.yml")):
-        scenarios.append(load_scenario(path))
+    """Every scenario: the files under `root`, then the ones plugins added.
+
+    Files first, so a plugin cannot shadow a scenario the user wrote — an eval
+    that silently stopped testing what its name says is worse than a missing
+    one, because the suite still goes green.
+    """
+    scenarios: list[Scenario] = []
+    if root.is_dir():
+        for path in sorted(root.glob("*.yaml")) + sorted(root.glob("*.yml")):
+            scenarios.append(load_scenario(path))
+
+    seen = {item.name for item in scenarios}
+    for scenario in _plugin_scenarios():
+        if scenario.name not in seen:
+            scenarios.append(scenario)
+            seen.add(scenario.name)
     return scenarios
 
+
+def _plugin_scenarios() -> list[Scenario]:
+    """Scenarios a plugin registered.
+
+    Ungated: an eval runs only when somebody types the command, and one that
+    is wrong fails its own check rather than anybody else's.
+    """
+    try:
+        from . import plugins as plugins_module
+
+        return [
+            scenario
+            for scenario in plugins_module.evals()
+            if isinstance(scenario, Scenario)
+        ]
+    except Exception:  # noqa: BLE001 - evals must not depend on plugins loading
+        return []
 
 def missing_requirements(scenario: Scenario) -> list[str]:
     """Requirements this machine cannot satisfy.

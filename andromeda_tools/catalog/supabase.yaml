@@ -1,0 +1,15 @@
+manifest_version: 1
+name: supabase
+description: Database, auth, and storage from your Supabase projects.
+source: https://supabase.com/docs/guides/ai-tools/mcp
+transport:
+  type: http
+  url: https://mcp.supabase.com/mcp
+auth:
+  type: oauth
+suggest:
+  keywords: [supabase]
+  hosts: [supabase.com, supabase.co]
+post_install: |
+  Run `andromeda mcp login supabase` to authorize in a browser,
+  then start a new session so the tools load.

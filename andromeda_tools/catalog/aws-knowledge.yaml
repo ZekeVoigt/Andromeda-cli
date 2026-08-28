@@ -1,0 +1,15 @@
+manifest_version: 1
+name: aws-knowledge
+description: Search AWS documentation, API references, and architecture guidance.
+source: https://awslabs.github.io/mcp/
+# Anonymous — verified 2026-08-27.
+transport:
+  type: http
+  url: https://knowledge-mcp.global.api.aws
+auth:
+  type: none
+suggest:
+  keywords: [aws, s3, lambda, iam, cloudformation]
+  hosts: [aws.amazon.com, docs.aws.amazon.com]
+post_install: |
+  Nothing to sign in to. Start a new session and the tools are there.

@@ -467,6 +467,68 @@ def safe_reference(reference: str) -> str:
     return redact.scrub(reference, code_file=False, force=True).text
 
 
+@dataclass(frozen=True)
+class _PluginResolver(Resolver):
+    """A secret source a plugin registered.
+
+    Overrides `available` for one reason: the inherited check asks whether
+    `binary` is on the PATH, and a plugin source has no binary — it is Python
+    that is already imported into this process. Left inherited, every plugin
+    source would report "not installed" and never be called.
+    """
+
+    def available(self) -> bool:
+        return True
+
+
+def _resolver_for(scheme: str) -> "Resolver | None":
+    """The resolver for a scheme, built-in first, then plugins.
+
+    Built-in first is not a preference, it is a guard: a plugin that could
+    claim `env://` or `keychain://` would be handed every secret this install
+    resolves, and it would be handed them without the user ever choosing it —
+    references are already written in their config.
+    """
+    found = RESOLVERS.get(scheme)
+    if found is not None:
+        return found
+    return _plugin_resolvers().get(scheme)
+
+
+def _plugin_resolvers() -> dict[str, "Resolver"]:
+    """Secret sources a plugin registered, wrapped as resolvers.
+
+    `cloud_refusal` is set for all of them, and it is not a placeholder. The
+    hosted runner's image is built from this repository and installs no user
+    plugins, so a `repo` or `detached` job whose config names a plugin scheme
+    would fail at fire time as a missing environment variable, at 3am, in a log
+    nobody is reading. Refusing at creation is the same rule the workspace
+    trichotomy already follows.
+    """
+    try:
+        from . import plugins as plugins_module
+    except ImportError:  # pragma: no cover - half-installed package
+        return {}
+
+    built: dict[str, Resolver] = {}
+    for scheme, resolve_fn in plugins_module.secret_sources().items():
+        if scheme in RESOLVERS:
+            # Refused rather than shadowed. See `_resolver_for`.
+            continue
+        built[scheme] = _PluginResolver(
+            scheme=scheme,
+            label=f"the {scheme} plugin source",
+            binary="",
+            install="provided by a plugin — `andromeda plugins list`",
+            resolve=resolve_fn,
+            cloud_refusal=(
+                f"`{scheme}://` comes from a plugin, and the hosted runner "
+                f"installs no plugins"
+            ),
+        )
+    return built
+
+
 def scheme_of(reference: str) -> str:
     found = REFERENCE.match(reference or "")
     return found.group("scheme").lower() if found else ""
@@ -479,7 +541,7 @@ def is_reference(value: object) -> bool:
     `https://example.com/key` means a URL, and treating it as a reference would
     fail with a message about vaults.
     """
-    return isinstance(value, str) and scheme_of(value) in RESOLVERS
+    return isinstance(value, str) and _resolver_for(scheme_of(value)) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -534,7 +596,7 @@ def resolve(name: str, reference: str, *, use_cache: bool = True) -> Resolution:
             detail="a reference looks like `scheme://…`",
         )
 
-    resolver = RESOLVERS.get(found.group("scheme").lower())
+    resolver = _resolver_for(found.group("scheme").lower())
     if resolver is None:
         return Resolution(
             name=name,

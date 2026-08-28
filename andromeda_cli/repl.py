@@ -12,9 +12,12 @@ from pathlib import Path
 from typing import Any
 
 from prompt_toolkit import PromptSession
+from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.shortcuts import CompleteStyle
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.shortcuts import prompt as ask_line
 from prompt_toolkit.styles import Style
+from rich.markup import escape
 
 from andromeda_agent import AgentError, ApprovalRequest, Callbacks, build_provider
 from andromeda_agent import hooks
@@ -27,6 +30,7 @@ from . import config as config_module
 from . import output
 from . import render
 from . import sessions as sessions_store
+from . import vocabulary
 from .state import live as live_module
 from .session import build_conversation, ended as session_ended, set_asker, set_lane_announcer
 
@@ -200,25 +204,38 @@ def _report_running_lanes(conversation) -> None:
             + " — ask me to wait for them"
         )
 
-SLASH_HELP = """
-  /help      show this
-  /new       start a fresh conversation
-  /rewind    undo the last exchange (/rewind N for a numbered checkpoint)
-  /history   list the checkpoints you can rewind to
-  /ps        background processes started this session
-  /recap     what has happened so far, without asking the model
-  /sessions  search past sessions (/sessions <text>)
-  /resume    switch to another session (/resume lists them)
-  /tools     list the tools this session can use
-  /skills    list the skills on this machine
-  /lanes     list the delegation specialists
-  /credits   the account balance, as the last reply reported it
-  /usage     what this session and this week have spent, in tokens
-  /model     show the model in use
-  /think     show or set the thinking level (off, low, medium, high)
-  /cwd       show the workspace root
-  /exit      leave (Ctrl-D also works)
-"""
+# Kept as a name because two surfaces and a test import it. The content is
+# generated now — a hand-maintained list was wrong about the twenty commands it
+# had and silent about the thirty it did not.
+def slash_help() -> str:
+    return vocabulary.help_text()
+
+
+class SlashCompleter(Completer):
+    """The command palette: `/` lists everything, and typing narrows it.
+
+    Only on a line that begins with `/`, and only while it is still one word.
+    A message that happens to contain a slash is a message, and popping a menu
+    over somebody writing `and/or` would make the field feel broken. Once there
+    is a space the command has been chosen and the rest is its arguments, which
+    this knows nothing about.
+    """
+
+    def get_completions(self, document, complete_event):
+        text = document.text_before_cursor
+        if not text.startswith("/") or " " in text or "\n" in text:
+            return
+
+        for command in vocabulary.matching(text):
+            yield Completion(
+                command.display,
+                start_position=-len(text),
+                display=command.display,
+                # Shown beside the name, so the list answers "what is this"
+                # rather than only "what is it called". A palette of twenty
+                # bare words is a palette you still have to go and look up.
+                display_meta=command.summary,
+            )
 
 
 def _history_file() -> FileHistory:
@@ -268,6 +285,10 @@ def run(
         f"  {len(conversation.available)} tools · approval: {conversation.policy.mode}"
         f" · thinking: {provider.thinking}"
     )
+    # The one line that makes everything else findable. Without it the palette
+    # is a feature you have to already know about in order to discover the
+    # features you do not know about.
+    output.console.print("  [dim]/ for commands[/dim]")
     if resume is not None:
         output.info(f"  resumed {record.id} · {record.turns} turns")
 
@@ -323,7 +344,21 @@ def run(
         resume.checkpoints if resume is not None else None
     )
 
-    session: PromptSession[str] = PromptSession(history=_history_file())
+    session: PromptSession[str] = PromptSession(
+        history=_history_file(),
+        completer=SlashCompleter(),
+        # The list appears as soon as `/` is typed rather than waiting for Tab.
+        # Waiting for Tab is what a shell does, and it works there because you
+        # already know the command exists and are only saving keystrokes. Here
+        # the list *is* the feature: nobody presses Tab to find out whether
+        # there is something they have never heard of.
+        complete_while_typing=True,
+        # Two columns — the name and what it does. `COLUMN` shows names only,
+        # which turns "what is /lanes" into a question you have to leave to
+        # answer.
+        complete_style=CompleteStyle.MULTI_COLUMN,
+        reserve_space_for_menu=8,
+    )
 
     session_started = time.monotonic()
     clock = _TypingClock(session)
@@ -432,7 +467,12 @@ def _make_asker():
             render.console.print()
             for index, question in enumerate(questions, start=1):
                 prefix = f"[muted]{index}/{len(questions)}[/muted] " if len(questions) > 1 else ""
-                render.console.print(f"  {prefix}[accent]{question.text}[/accent]")
+                # Escaped, not interpolated: the question is model output, and
+                # a `[` in it is markup to rich — `[staging]` would vanish and
+                # an unclosed tag would take the rest of the line with it.
+                render.console.print(
+                    f"  {prefix}[accent]{escape(question.text)}[/accent]"
+                )
                 answers.append(_answer(question))
             render.console.print()
         return answers
@@ -449,7 +489,9 @@ def _answer(question) -> str:
 
     for index, choice in enumerate(question.choices, start=1):
         label = " [muted](recommended)[/muted]" if index == 1 else ""
-        render.console.print(f"    [accent]{index}[/accent]  {choice}{label}")
+        render.console.print(
+            f"    [accent]{index}[/accent]  {escape(choice)}{label}"
+        )
     render.console.print("    [muted]pick a number, or type your own answer[/muted]")
 
     while True:
@@ -675,10 +717,18 @@ def _slash(command: str, conversation, checkpoints=None) -> str:
         command=verb.lstrip("/"),
         args_raw=command[len(parts[0]):].strip(),
     )
+    override = _plugin_override(verb)
+    if override is not None:
+        # A granted `commands.override` replaces the built-in, so it is checked
+        # before the built-in chain rather than after it. Without this the
+        # capability would be grantable and inert.
+        _run_plugin_command(override, command[len(parts[0]):].strip())
+        return "continue"
+
     if verb in {"/exit", "/quit"}:
         return "exit"
     if verb == "/help":
-        output.console.print(SLASH_HELP)
+        output.console.print(slash_help())
     elif verb == "/new":
         conversation.reset()
         output.ok("New conversation.")
@@ -689,6 +739,17 @@ def _slash(command: str, conversation, checkpoints=None) -> str:
             output.console.print(
                 f"  [cyan]{spec.name.ljust(14)}[/cyan] [dim]{spec.risk_tier.ljust(12)} {note}[/dim]"
             )
+    elif verb == "/upgrade":
+        from andromeda_cli.commands import auth as auth_module
+
+        url, opened = auth_module.open_upgrade()
+        output.info(
+            "Opened your browser to change your plan."
+            if opened
+            else "Open this to change your plan:"
+        )
+        output.info(f"  {url}")
+        output.info("  your new balance appears on the next reply")
     elif verb == "/usage":
         _show_usage(conversation)
     elif verb == "/credits":
@@ -711,8 +772,8 @@ def _slash(command: str, conversation, checkpoints=None) -> str:
             render.console.print(f"  [accent]{line}[/accent]")
             if balance.used_micros is not None:
                 render.console.print(
-                    f"  [muted]{credits_module.format_micros(balance.used_micros)}"
-                    " settled this period[/muted]"
+                    f"  [muted]{credits_module.format_credits(balance.used_micros)}"
+                    " credits settled this period[/muted]"
                 )
             # Said out loud, because the number looks stuck otherwise. The
             # relay stamps these headers from the balance it reserved against
@@ -787,6 +848,26 @@ def _slash(command: str, conversation, checkpoints=None) -> str:
         render.console.print("  [muted]/resume <id> to switch to one[/muted]")
     elif verb == "/resume":
         return _resume(conversation, parts[1:])
+    elif verb == "/jobs":
+        # The same verbs the full-screen surface offers. Two views of one
+        # product whose slash vocabularies disagree is the bug the shared help
+        # text exists to prevent, and a test asserts they match.
+        from .commands import cron as cron_cmd
+
+        cron_cmd.show_list()
+    elif verb == "/approve":
+        from .commands import cron as cron_cmd
+
+        if len(parts) < 2:
+            output.fail(
+                "/approve <job id>",
+                "Lets that job change files and run commands. /jobs lists them.",
+            )
+        else:
+            # `--run-on cloud` is deliberately unreachable from a slash
+            # command: moving a job onto hardware the person does not hold is a
+            # larger grant and deserves the refusal matrix, not a shortcut.
+            cron_cmd.approve(parts[1].strip(), approval="auto")
     elif verb == "/skills":
         from andromeda_tools import skills as skills_module
 
@@ -844,6 +925,52 @@ def _slash(command: str, conversation, checkpoints=None) -> str:
         output.info(f"{conversation.provider.label} · {conversation.provider.model}")
     elif verb == "/cwd":
         output.console.print(str(conversation.workspace.root), soft_wrap=True)
+    elif _plugin_command(verb, command[len(parts[0]):].strip()):
+        pass
+    elif vocabulary.is_verb(verb):
+        # Last, after every built-in and every plugin, so a verb can never
+        # shadow `/new` or `/exit` by happening to share a name.
+        vocabulary.run_verb(verb, command[len(parts[0]):].strip())
     else:
-        output.fail(f"Unknown command {verb}", "/help lists them.")
+        output.fail(f"Unknown command {verb}", "Type / to see them all.")
+        near = vocabulary.matching(verb)[:4]
+        if near:
+            output.info("  " + "  ".join(row.display for row in near))
     return "continue"
+
+
+def _plugin_override(verb: str):
+    """A plugin registration that was granted the right to replace a built-in."""
+    from andromeda_agent import plugins as plugins_module
+
+    registration = plugins_module.plugin_commands().get(verb.lstrip("/"))
+    if registration is None or not registration.override:
+        return None
+    return registration
+
+
+def _run_plugin_command(registration, raw_args: str) -> None:
+    try:
+        result = registration.handler(raw_args)
+    except Exception as exc:  # noqa: BLE001 - a plugin must not end the session
+        output.fail(f"/{registration.name} failed: {exc}")
+        return
+    if result:
+        output.console.print(str(result))
+
+
+def _plugin_command(verb: str, raw_args: str) -> bool:
+    """Run a plugin-registered slash command. Returns whether one handled it.
+
+    Last in the chain, after every built-in has had its turn, so a plugin
+    cannot take over `/exit` or `/new` by registering the name. Overriding a
+    built-in is a separate, granted thing — see `commands.override` — and it
+    replaces the built-in at registration rather than racing it here.
+    """
+    from andromeda_agent import plugins as plugins_module
+
+    registration = plugins_module.plugin_commands().get(verb.lstrip("/"))
+    if registration is None:
+        return False
+    _run_plugin_command(registration, raw_args)
+    return True

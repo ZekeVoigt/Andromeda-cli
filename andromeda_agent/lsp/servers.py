@@ -95,7 +95,7 @@ class Server:
 
 # Ordered. The first entry that handles an extension wins, so a more specific
 # server (a `.vue` server) has to come before a general one that also claims it.
-SERVERS: tuple[Server, ...] = (
+BUILTIN_SERVERS: tuple[Server, ...] = (
     Server(
         id="pyright",
         binaries=("pyright-langserver", "basedpyright-langserver"),
@@ -368,3 +368,52 @@ __all__ = [
     "relevant",
     "survey",
 ]
+
+
+def all_servers() -> tuple[Server, ...]:
+    """Every server this install knows, built-in first.
+
+    Built-in first because the list is ordered and the first entry that handles
+    an extension wins — a plugin appended after cannot quietly take `.py` away
+    from pyright, only claim an extension nobody had.
+    """
+    try:
+        from andromeda_agent import plugins as plugins_module
+
+        extra = tuple(
+            server
+            for server in plugins_module.lsp_servers()
+            if getattr(server, "id", "") not in {item.id for item in BUILTIN_SERVERS}
+        )
+    except Exception:  # noqa: BLE001 - diagnostics are never worth a crash
+        extra = ()
+    return BUILTIN_SERVERS + extra
+
+
+class _ServersProxy(tuple):
+    """`SERVERS` kept as a name, resolving through `all_servers()`.
+
+    Every existing reader iterates `SERVERS` at call time, so making it a live
+    view is what lets a plugin's server be seen without editing each of them.
+    """
+
+    def __new__(cls):
+        return super().__new__(cls, ())
+
+    def __iter__(self):
+        return iter(all_servers())
+
+    def __len__(self):
+        return len(all_servers())
+
+    def __getitem__(self, index):
+        return all_servers()[index]
+
+    def __contains__(self, item):
+        return item in all_servers()
+
+    def __repr__(self):
+        return repr(all_servers())
+
+
+SERVERS = _ServersProxy()

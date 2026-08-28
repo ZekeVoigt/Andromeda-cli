@@ -7,6 +7,7 @@ from andromeda_agent.delegation import make_delegate_tool, make_lane_tools
 from andromeda_agent.lanes import LaneRegistry
 from andromeda_agent.schedule import Schedule
 from andromeda_tools import BrowserSession, MemoryStore, Workspace, build_registry
+from andromeda_tools import browser as browser_module
 from andromeda_tools import mcp as mcp_module
 from andromeda_tools.processes import ProcessRegistry
 from andromeda_tools import skills as skills_module
@@ -36,7 +37,7 @@ def _registry():
         MemoryStore(config_module.home() / "memory"),
         delegate=make_delegate_tool(unused),
         lane_tools=make_lane_tools(LaneRegistry()),
-        browser=BrowserSession(),
+        browser=browser_module.build_session(),
         processes=ProcessRegistry(),
         mcp_servers=_connected_mcp(),
         # A placeholder, so the listing shows the tool the session will have.
@@ -47,6 +48,10 @@ def _registry():
         # — `test_the_tools_listing_matches_a_real_session` — is what catches a
         # binding added to one and not the other.
         schedule=Schedule(session_module.schedule_path()),
+        # An interactive session gets `connect_app`, so the listing has to show
+        # it. A lane does not, which is why this is a parameter rather than
+        # something the registry decides for itself.
+        connect_home=config_module.home(),
     )
 
 

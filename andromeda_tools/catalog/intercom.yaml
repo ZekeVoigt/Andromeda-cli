@@ -1,0 +1,15 @@
+manifest_version: 1
+name: intercom
+description: Conversations, tickets, and customer data from Intercom.
+source: https://developers.intercom.com/docs/guides/mcp
+transport:
+  type: http
+  url: https://mcp.intercom.com/mcp
+auth:
+  type: oauth
+suggest:
+  keywords: [intercom]
+  hosts: [intercom.com, intercom.io]
+post_install: |
+  Run `andromeda mcp login intercom` to authorize in a browser,
+  then start a new session so the tools load.

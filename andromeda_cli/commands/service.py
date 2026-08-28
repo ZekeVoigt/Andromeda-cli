@@ -183,6 +183,86 @@ def _warn_about_secrets(environment: dict[str, str]) -> None:
         output.info("  Use the hosted lane (`andromeda auth login`) to avoid that.")
 
 
+#: Set to any non-empty value to stop job creation from arming the scheduler.
+#: For people who supervise it themselves, and for anything that must not leave
+#: a service behind on the machine that ran it.
+NO_AUTO_ENV = "ANDROMEDA_NO_AUTO_SCHEDULER"
+
+
+def auto_install_allowed() -> bool:
+    """Whether creating a job may install a background service.
+
+    Two refusals, and the second is the one that matters most in this file.
+
+    The supervisor's path is fixed by the operating system —
+    `~/Library/LaunchAgents` on macOS, `~/.config/systemd/user` on Linux — and
+    is reached through `Path.home()`, which `ANDROMEDA_HOME` does not redirect.
+    So a test that creates a job would install a **real** launch agent on the
+    developer's machine, pointing at a temporary directory that is deleted
+    moments later: a live supervisor restarting a scheduler whose home no
+    longer exists, left behind by a green test run. That happened once, during
+    the change that added this function, which is why the guard is here rather
+    than in the test helper where it could be forgotten.
+    """
+    if os.environ.get(NO_AUTO_ENV, "").strip():
+        return False
+    # Under a test runner, never. Nothing about a test grants permission to
+    # write into the user's login services.
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        return False
+    return True
+
+
+def is_installed() -> bool:
+    """Whether a supervisor file exists for the scheduler on this machine."""
+    system = platform.system()
+    if system == "Darwin":
+        return _plist_path().exists()
+    if system == "Linux":
+        return _unit_path().exists()
+    return False
+
+
+def ensure_installed() -> bool:
+    """Arm the scheduler if a job now needs it. Returns True if it just did.
+
+    Creating a scheduled job *is* the request for a scheduler. Making somebody
+    type a second command afterwards produced the worst possible outcome: a job
+    that reads as scheduled, sits in `cron list` looking healthy, and never
+    fires — and the person finds out days later by noticing they were never
+    told anything.
+
+    Idempotent and quiet. Called on every job creation, so the common case is
+    an existing file and an immediate `False`.
+
+    **Deliberately not a consent gate.** Installing a supervisor grants no
+    capability a job did not already have: the job's own approval mode is what
+    decides what it may touch, and an unapproved job stays read-only whether it
+    fires or not. What this decides is whether the thing runs at all, which is
+    the one part the person already asked for.
+    """
+    if is_installed():
+        return False
+    if platform.system() not in {"Darwin", "Linux"}:
+        return False
+    if not auto_install_allowed():
+        return False
+    try:
+        # Silenced. `install` reports its paths and warns about secrets, which
+        # is right when a person typed the command and wrong here: this runs
+        # underneath a job creation, and on the full-screen surface Textual
+        # owns the terminal — anything written straight to stdout paints over
+        # the interface and stays there.
+        import contextlib
+        import io
+
+        sink = io.StringIO()
+        with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+            return install() == 0
+    except Exception:  # noqa: BLE001 - a job is still valid on an unmanaged box
+        return False
+
+
 def install() -> int:
     system = platform.system()
     if system == "Darwin":

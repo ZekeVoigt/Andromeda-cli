@@ -1,0 +1,15 @@
+manifest_version: 1
+name: huggingface
+description: Models, datasets, Spaces, and papers from the Hugging Face Hub.
+source: https://huggingface.co/docs/hub/agents-mcp
+transport:
+  type: http
+  url: https://huggingface.co/mcp
+auth:
+  type: oauth
+suggest:
+  keywords: [hugging face, huggingface]
+  hosts: [huggingface.co, hf.co]
+post_install: |
+  Run `andromeda mcp login huggingface` to authorize in a browser,
+  then start a new session so the tools load.

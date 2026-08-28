@@ -202,7 +202,25 @@ def configured_provider(env: dict[str, str] | None = None) -> str | None:
     for name, spec in PROVIDERS.items():
         if source.get(spec["env"], "").strip():
             return name
+    # A plugin provider answers only when no built-in key is set. It is a
+    # fallback rather than a takeover, which is why registering one needs no
+    # capability: it is reached exactly where the answer would otherwise be
+    # "no search provider is configured".
+    for name in sorted(_plugin_providers()):
+        return name
     return None
+
+
+def _plugin_providers() -> dict[str, "Callable[..., ToolResult]"]:
+    try:
+        from andromeda_agent import plugins as plugins_module
+    except ImportError:  # pragma: no cover - half-installed package
+        return {}
+    return {
+        name: search
+        for name, search in plugins_module.web_search_providers().items()
+        if name not in PROVIDERS
+    }
 
 
 def search(query: str, limit: int = DEFAULT_RESULTS) -> ToolResult:
@@ -215,6 +233,13 @@ def search(query: str, limit: int = DEFAULT_RESULTS) -> ToolResult:
     if provider is None:
         keys = ", ".join(spec["env"] for spec in PROVIDERS.values())
         return failure(f"No search provider is configured. Set one of: {keys}")
+
+    plugin_search = _plugin_providers().get(provider)
+    if plugin_search is not None:
+        try:
+            return plugin_search(query, limit)
+        except Exception as exc:  # noqa: BLE001 - a plugin must not end the turn
+            return failure(f"The {provider} search provider failed: {exc}")
 
     try:
         results = _brave(query, limit) if provider == "brave" else _tavily(query, limit)

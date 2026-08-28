@@ -1,0 +1,13 @@
+name: git-context
+version: 1.0.0
+kind: standalone
+description: >-
+  Tells the model which git branch you are on and whether the tree is dirty,
+  once per turn. Also adds `git_status`, so it can ask again after it commits.
+author: Andromeda
+license: MIT
+api_version: 1
+tags: [git, context]
+
+# No `capabilities:` — this plugin only adds. Nothing here replaces a seam the
+# harness already owns, so there is nothing to consent to beyond enabling it.

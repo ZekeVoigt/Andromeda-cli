@@ -1,0 +1,15 @@
+manifest_version: 1
+name: shortcut
+description: Stories, epics, and iterations from Shortcut.
+source: https://developer.shortcut.com/
+transport:
+  type: http
+  url: https://mcp.shortcut.com/mcp
+auth:
+  type: oauth
+suggest:
+  keywords: [shortcut, story, epic, sprint]
+  hosts: [app.shortcut.com, shortcut.com]
+post_install: |
+  Run `andromeda mcp login shortcut` to authorize in a browser,
+  then start a new session so the tools load.

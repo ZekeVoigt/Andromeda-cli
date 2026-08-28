@@ -1,0 +1,15 @@
+manifest_version: 1
+name: canva
+description: Designs, folders, and brand assets from your Canva account.
+source: https://www.canva.dev/docs/apps/mcp-server/
+transport:
+  type: http
+  url: https://mcp.canva.com/mcp
+auth:
+  type: oauth
+suggest:
+  keywords: [canva, design, presentation]
+  hosts: [canva.com]
+post_install: |
+  Run `andromeda mcp login canva` to authorize in a browser,
+  then start a new session so the tools load.

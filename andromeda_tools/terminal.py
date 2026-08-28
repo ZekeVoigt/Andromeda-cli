@@ -61,6 +61,16 @@ def run_command(
     if not command:
         return ToolResult(content="Error: no command given.", ok=False)
 
+    # Before anything runs, including in the background. A credential sweep is
+    # refused rather than approved, because the approval prompt is the wrong
+    # instrument here: it shows one shell command, and what needs consenting to
+    # is the whole sequence — find a stranger's key, use it, copy it somewhere
+    # new. See `credential_guard` for the session this comes from.
+    from .credential_guard import REFUSAL, sweeps_for_credentials
+
+    if sweeps_for_credentials(command):
+        return ToolResult(content=REFUSAL, display=f"$ {command}"[:80], ok=False)
+
     if background:
         if processes is None:
             return ToolResult(

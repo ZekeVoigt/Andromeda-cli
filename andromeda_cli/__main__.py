@@ -50,6 +50,7 @@ from .commands import (  # noqa: E402
     sessions as sessions_cmd,
     tools,
     update as update_cmd,
+    plugins_cmd,
 )
 from . import sessions as sessions_store  # noqa: E402
 
@@ -65,6 +66,7 @@ COMMANDS = (
     "completion",
     "curator",
     "hooks",
+    "plugins",
     "skills",
     "lsp",
     "status",
@@ -86,6 +88,25 @@ COMMANDS = (
     "update",
     "doctor",
 )
+
+PLUGINS_HELP = """Code that extends this harness.
+
+A plugin is a directory with a plugin.yaml and an __init__.py defining
+register(ctx). Once enabled it is imported into this process, where it can add
+tools, hooks, commands and skills — or take over the memory backend, the
+scheduler, the model provider or the secret resolver.
+
+Those last four are capabilities: they are refused until you grant them, and
+`andromeda plugins capabilities` says what each one means.
+
+None of this is a sandbox. A plugin is Python running as you, and it can ignore
+every gate here. The scan on install catches careless and obvious; it does not
+catch determined. Read what you install.
+
+Plugins found in ./.andromeda/plugins/ are ignored unless
+ANDROMEDA_ENABLE_PROJECT_PLUGINS is set, so cloning a repository cannot put
+code in your agent. ANDROMEDA_NO_PLUGINS=1 turns the whole system off.
+"""
 
 HOOKS_HELP = """Shell scripts run at lifecycle events.
 
@@ -181,9 +202,15 @@ commands:
   andromeda eval                     run the behavioural evaluations
   andromeda eval list
   andromeda mcp                      configured MCP servers and their tools
-  andromeda mcp example              print a starter mcp.json
+  andromeda mcp catalog [word]       servers that install with one command
+  andromeda mcp install <name>       install one of them
+  andromeda mcp add <name> --url …   add any server, catalog or not
+  andromeda mcp test <name>          connect to one and report what happened
+  andromeda mcp remove <name>
   andromeda mcp login <server>       sign in to an MCP server that needs OAuth
   andromeda mcp logout <server>
+  andromeda mcp push [server]         let cloud jobs use these MCP servers
+  andromeda mcp example              print a starter mcp.json
   andromeda secrets                  vault references, and whether they resolve
   andromeda secrets get <NAME> | schemes | example
   andromeda approvals                tools you have stopped being asked about
@@ -196,12 +223,30 @@ commands:
 """
 
 
+def _plugin_epilog() -> str:
+    """The verbs plugins added, appended to `--help`.
+
+    `EPILOG` is a hand-written listing, so a plugin's verb is otherwise
+    reachable and undiscoverable — it works if you already know it exists,
+    which is not what a help screen is for.
+    """
+    from andromeda_agent import plugins as plugins_module
+
+    registrations = plugins_module.plugin_cli_commands()
+    if not registrations:
+        return ""
+    lines = ["", "from plugins:"]
+    for name, registration in sorted(registrations.items()):
+        lines.append(f"  andromeda {name:<24} {registration.help}")
+    return "\n".join(lines) + "\n"
+
+
 def build_parser() -> argparse.ArgumentParser:
     """The chat form: a bare prompt plus per-invocation overrides."""
     parser = argparse.ArgumentParser(
         prog="andromeda",
         description="Andromeda — a local-first agent harness for the terminal.",
-        epilog=EPILOG,
+        epilog=EPILOG + _plugin_epilog(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
@@ -253,6 +298,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--accept-hooks",
         action="store_true",
         help="Approve the shell hooks in your config without a prompt, this run.",
+    )
+    parser.add_argument(
+        "--no-plugins",
+        action="store_true",
+        help="Start without loading any plugin, this run.",
     )
     resume = parser.add_mutually_exclusive_group()
     resume.add_argument("--resume", metavar="ID", help="Resume a saved session by id.")
@@ -650,6 +700,127 @@ def build_command_parser() -> argparse.ArgumentParser:
     )
     hooks_sub.add_parser("doctor", help="Check every configured hook.")
 
+    plugins_parser = sub.add_parser(
+        "plugins",
+        help="Code that extends this harness.",
+        description=PLUGINS_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    plugins_sub = plugins_parser.add_subparsers(dest="plugins_command")
+
+    plugins_sub.add_parser("list", help="Every plugin, and whether it is on.")
+
+    plugins_show = plugins_sub.add_parser("show", help="One plugin, in full.")
+    plugins_show.add_argument("name", help="The plugin id.")
+
+    plugins_install = plugins_sub.add_parser(
+        "install", help="Install from a repository or a local directory."
+    )
+    plugins_install.add_argument(
+        "source", help="owner/repo, a git URL, or a path to a plugin directory."
+    )
+    plugins_install.add_argument(
+        "--ref", default=None, help="Tag, branch or commit to install."
+    )
+    plugins_install.add_argument(
+        "--force",
+        action="store_true",
+        help="Replace an existing install, and accept a caution scan. Never "
+        "overrides a dangerous one.",
+    )
+    plugins_install.add_argument(
+        "--enable",
+        dest="enable",
+        action="store_true",
+        default=None,
+        help="Enable it without asking.",
+    )
+    plugins_install.add_argument(
+        "--no-enable",
+        dest="enable",
+        action="store_false",
+        help="Install it turned off.",
+    )
+    plugins_install.add_argument(
+        "--yes", action="store_true", help="Grant declared capabilities without asking."
+    )
+
+    plugins_update = plugins_sub.add_parser(
+        "update", help="Reinstall from where it came from."
+    )
+    plugins_update.add_argument("name", help="The plugin id.")
+    plugins_update.add_argument("--ref", default=None, help="Tag, branch or commit.")
+    plugins_update.add_argument("--yes", action="store_true", help="Re-grant without asking.")
+
+    plugins_remove = plugins_sub.add_parser("remove", help="Delete an installed plugin.")
+    plugins_remove.add_argument("name", help="The plugin id.")
+
+    plugins_enable = plugins_sub.add_parser(
+        "enable", help="Grant its capabilities and turn it on."
+    )
+    plugins_enable.add_argument("name", help="The plugin id.")
+    plugins_enable.add_argument(
+        "--yes", action="store_true", help="Grant without asking."
+    )
+
+    plugins_disable = plugins_sub.add_parser("disable", help="Turn one off, keeping its grants.")
+    plugins_disable.add_argument("name", help="The plugin id.")
+
+    plugins_revoke = plugins_sub.add_parser(
+        "revoke", help="Withdraw its capabilities and turn it off."
+    )
+    plugins_revoke.add_argument("name", help="The plugin id.")
+
+    plugins_caps = plugins_sub.add_parser(
+        "capabilities", help="What the capabilities mean, or what one plugin holds."
+    )
+    plugins_caps.add_argument("name", nargs="?", help="A plugin id, for just its own.")
+
+    plugins_search = plugins_sub.add_parser(
+        "search", help="Find a plugin in the community index."
+    )
+    plugins_search.add_argument("query", nargs="?", default="", help="Name or words.")
+    plugins_search.add_argument(
+        "--limit", type=int, default=20, help="How many to show."
+    )
+
+    plugins_pack = plugins_sub.add_parser(
+        "pack", help="A set of plugins as one file."
+    )
+    pack_sub = plugins_pack.add_subparsers(dest="pack_command")
+
+    pack_install = pack_sub.add_parser("install", help="Install every plugin in a pack.")
+    pack_install.add_argument("file", help="Path to the pack YAML.")
+    pack_install.add_argument("--force", action="store_true", help="Replace existing installs.")
+    pack_install.add_argument(
+        "--yes", action="store_true", help="Grant declared capabilities without asking."
+    )
+
+    pack_show = pack_sub.add_parser("show", help="What a pack contains.")
+    pack_show.add_argument("file", help="Path to the pack YAML.")
+
+    pack_export = pack_sub.add_parser("export", help="Write a pack for what is enabled here.")
+    pack_export.add_argument("--name", default="my-plugins", help="The pack's name.")
+    pack_export.add_argument("--description", default="", help="One line about it.")
+    pack_export.add_argument("--out", default="", help="Write to a file instead of stdout.")
+
+    plugins_new = plugins_sub.add_parser(
+        "new", help="Write a working plugin to start from."
+    )
+    plugins_new.add_argument("name", help="The plugin id.")
+    plugins_new.add_argument("--description", default="", help="One line about it.")
+    plugins_new.add_argument("--into", default=".", help="Where to write it.")
+
+    plugins_doctor = plugins_sub.add_parser(
+        "doctor", help="Check a plugin you are writing."
+    )
+    plugins_doctor.add_argument(
+        "path", nargs="?", default=".", help="The plugin directory. Defaults to here."
+    )
+    plugins_doctor.add_argument(
+        "--verbose", action="store_true", help="Print every scan finding."
+    )
+
     sub.add_parser(
         "acp",
         help="Speak the Agent Client Protocol on stdin/stdout, for an editor.",
@@ -894,13 +1065,86 @@ def build_command_parser() -> argparse.ArgumentParser:
     secrets_sub.add_parser("schemes", help="What this build can read from.")
     secrets_sub.add_parser("example", help="Print a starter `secrets:` block.")
 
-    mcp_parser = sub.add_parser("mcp", help="Configured MCP servers.")
+    mcp_parser = sub.add_parser("mcp", help="Connect and manage MCP servers.")
     mcp_sub = mcp_parser.add_subparsers(dest="mcp_command")
     mcp_sub.add_parser("example", help="Print a starter mcp.json.")
+
+    mcp_catalog_p = mcp_sub.add_parser(
+        "catalog", help="Servers that install with one command."
+    )
+    mcp_catalog_p.add_argument(
+        "search", nargs="?", default="", help="Narrow the list to a word."
+    )
+
+    mcp_install = mcp_sub.add_parser("install", help="Install a catalog server.")
+    mcp_install.add_argument("name", help="A name from `andromeda mcp catalog`.")
+    mcp_install.add_argument(
+        "--force", action="store_true", help="Replace it without asking."
+    )
+
+    mcp_add = mcp_sub.add_parser("add", help="Add any MCP server by URL or command.")
+    mcp_add.add_argument("name", help="What to call it. Tools are named after it.")
+    mcp_add.add_argument("--url", default="", help="A remote server's endpoint.")
+    # The dest is renamed on purpose. argparse would otherwise derive
+    # `dest="command"` from the flag name and write it onto the same namespace
+    # attribute the top-level subparser uses to decide which command ran —
+    # so `andromeda mcp add x --command npx` would dispatch to a command called
+    # `npx`, and omitting the flag would set it to None and dispatch to nothing.
+    mcp_add.add_argument(
+        "--command",
+        dest="command_",
+        default="",
+        help="A local server's executable, e.g. npx.",
+    )
+    # REMAINDER, so `--args -y @scope/pkg --flag` reaches the server rather than
+    # being read as this parser's own options. It has to be last on the line.
+    mcp_add.add_argument(
+        "--args",
+        nargs=argparse.REMAINDER,
+        default=[],
+        help="Arguments for --command. Must come last.",
+    )
+    mcp_add.add_argument(
+        "--auth", choices=["oauth"], default="", help="Sign in rather than assert."
+    )
+    mcp_add.add_argument(
+        "--env",
+        nargs="*",
+        default=[],
+        metavar="K=V",
+        help="Environment for a --command server. A bare name passes yours through.",
+    )
+    mcp_add.add_argument(
+        "--header",
+        dest="headers",
+        nargs="*",
+        default=[],
+        metavar="K=V",
+        help="Headers for a --url server, e.g. Authorization='Bearer …'.",
+    )
+    mcp_add.add_argument(
+        "--force", action="store_true", help="Replace an existing entry without asking."
+    )
+
+    mcp_remove = mcp_sub.add_parser(
+        "remove", aliases=["rm"], help="Drop a server and forget its credentials."
+    )
+    mcp_remove.add_argument("name", help="The name from mcp.json.")
+
+    mcp_test = mcp_sub.add_parser("test", help="Connect to one server and report.")
+    mcp_test.add_argument("name", help="The name from mcp.json.")
+
     mcp_login = mcp_sub.add_parser("login", help="Authorize an OAuth MCP server.")
     mcp_login.add_argument("server", help="The name from mcp.json.")
     mcp_logout = mcp_sub.add_parser("logout", help="Forget an MCP server's tokens.")
     mcp_logout.add_argument("server", help="The name from mcp.json.")
+    mcp_push = mcp_sub.add_parser(
+        "push", help="Make these servers reachable from cloud jobs."
+    )
+    mcp_push.add_argument(
+        "server", nargs="?", default="", help="One server, or all of them."
+    )
+    mcp_sub.add_parser("unpush", help="Stop cloud jobs reaching these servers.")
 
     browser_parser = sub.add_parser("browser", help="The browser tools.")
     browser_sub = browser_parser.add_subparsers(dest="browser_command")
@@ -1045,7 +1289,34 @@ def build_command_parser() -> argparse.ArgumentParser:
     profile_sub.add_parser("list", help="Every profile on this machine.")
     profile_sub.add_parser("current", help="Which profile this command is using.")
 
+    _add_plugin_commands(sub)
+
     return parser
+
+
+def _add_plugin_commands(sub: "argparse._SubParsersAction") -> None:
+    """Give every plugin-registered CLI command its own subparser.
+
+    Last, so a plugin cannot shadow a built-in verb: `add_parser` on a name
+    that already exists raises, and the built-in is the one that was added
+    first. Caught rather than propagated — a name collision is a reason for one
+    plugin's command to be unavailable, not a reason for `andromeda --help` to
+    traceback.
+    """
+    from andromeda_agent import plugins as plugins_module
+
+    for name, registration in sorted(plugins_module.plugin_cli_commands().items()):
+        try:
+            plugin_parser = sub.add_parser(
+                name,
+                help=registration.help or f"Provided by the {registration.plugin_id} plugin.",
+            )
+            registration.setup(plugin_parser)
+        except Exception as exc:  # noqa: BLE001 - see the docstring
+            output.fail(
+                f"plugin {registration.plugin_id} could not add `andromeda "
+                f"{name}`: {exc}"
+            )
 
 
 def _config(args: argparse.Namespace) -> dict:
@@ -1099,6 +1370,46 @@ def _run_command(argv: list[str]) -> int:
         if args.hooks_command == "doctor":
             return hooks_cmd.doctor()
         return hooks_cmd.show_list()
+
+    plugin_cli = _plugin_cli_registration(args.command)
+    if plugin_cli is not None:
+        try:
+            return int(plugin_cli.handler(args) or 0)
+        except Exception as exc:  # noqa: BLE001 - a plugin must not traceback at the user
+            output.fail(f"plugin {plugin_cli.plugin_id} failed: {exc}")
+            return 1
+
+    if args.command == "plugins":
+        verb = args.plugins_command or "list"
+        handlers = {
+            "list": plugins_cmd.cmd_list,
+            "show": plugins_cmd.cmd_show,
+            "install": plugins_cmd.cmd_install,
+            "update": plugins_cmd.cmd_update,
+            "remove": plugins_cmd.cmd_remove,
+            "enable": plugins_cmd.cmd_enable,
+            "disable": plugins_cmd.cmd_disable,
+            "revoke": plugins_cmd.cmd_revoke,
+            "capabilities": plugins_cmd.cmd_capabilities,
+            "doctor": plugins_cmd.cmd_doctor,
+            "search": plugins_cmd.cmd_search,
+            "new": plugins_cmd.cmd_new,
+        }
+        if verb == "pack":
+            pack_handlers = {
+                "install": plugins_cmd.cmd_pack_install,
+                "show": plugins_cmd.cmd_pack_show,
+                "export": plugins_cmd.cmd_pack_export,
+            }
+            pack_verb = getattr(args, "pack_command", None)
+            if pack_verb not in pack_handlers:
+                output.fail(
+                    "`plugins pack` needs one of: install, show, export.",
+                    "andromeda plugins pack export --name my-plugins",
+                )
+                return 2
+            return pack_handlers[pack_verb](args)
+        return handlers[verb](args)
 
     if args.command == "batch":
         if args.show:
@@ -1349,10 +1660,39 @@ def _run_command(argv: list[str]) -> int:
     if args.command == "mcp":
         if args.mcp_command == "example":
             return mcp_cmd.example()
+        if args.mcp_command == "catalog":
+            return mcp_cmd.catalog(args.search)
+        if args.mcp_command == "install":
+            return mcp_cmd.install(args.name, force=args.force)
+        if args.mcp_command == "add":
+            # `--args` is REMAINDER, so a `--` the user typed to end the option
+            # list arrives as its first element. Dropping it is what makes
+            # `--args -- -y pkg` and `--args -y pkg` mean the same thing.
+            extra = list(args.args)
+            if extra and extra[0] == "--":
+                extra = extra[1:]
+            return mcp_cmd.add(
+                args.name,
+                url=args.url,
+                command=args.command_,
+                args=extra,
+                auth=args.auth,
+                env=args.env,
+                headers=args.headers,
+                force=args.force,
+            )
+        if args.mcp_command in {"remove", "rm"}:
+            return mcp_cmd.remove(args.name)
+        if args.mcp_command == "test":
+            return mcp_cmd.test(args.name)
         if args.mcp_command == "login":
             return mcp_cmd.login(args.server)
         if args.mcp_command == "logout":
             return mcp_cmd.logout(args.server)
+        if args.mcp_command == "push":
+            return mcp_cmd.push(args.server)
+        if args.mcp_command == "unpush":
+            return mcp_cmd.unpush()
         return mcp_cmd.status()
 
     if args.command == "browser":
@@ -1462,6 +1802,30 @@ def _read_pipe(prompt: str | None) -> str | None:
     return f"{prompt}\n\n{piped}" if prompt else piped
 
 
+def _take_no_plugins(argv: list[str]) -> list[str]:
+    """Pull `--no-plugins` out of argv before anything reads it.
+
+    Handled here rather than as an ordinary argparse flag for the same reason
+    `-p` is: plugins are loaded before the verb dispatch, which is before any
+    parser runs, so a flag argparse learns about arrives too late to prevent
+    the thing it exists to prevent. Accepted anywhere in the line, because
+    `andromeda --no-plugins doctor` is exactly when someone reaches for it.
+
+    It stays declared on the parser so `--help` still lists it; by the time
+    argparse runs, this has already removed it.
+    """
+    if "--no-plugins" not in argv:
+        return argv
+
+    from andromeda_agent import plugins as plugins_module
+
+    # Set in the environment rather than passed down, because the loader is
+    # also reached from the daemon and from `cron run`, neither of which parses
+    # this flag. One switch, read everywhere.
+    os.environ[plugins_module.ENV_DISABLE] = "1"
+    return [token for token in argv if token != "--no-plugins"]
+
+
 def _take_profile(argv: list[str]) -> tuple[list[str], str]:
     """Pull `-p NAME` / `--profile NAME` out of argv before anything reads it.
 
@@ -1542,9 +1906,46 @@ def _apply_secrets(*, warn_literals: bool = True) -> None:
         )
 
 
+def _plugin_cli_registration(command: str | None):
+    """The plugin that owns `andromeda <command>`, or None.
+
+    Checked after every built-in verb has had its turn, so a plugin can never
+    take one over by registering its name.
+    """
+    if not command:
+        return None
+    from andromeda_agent import plugins as plugins_module
+
+    return plugins_module.plugin_cli_commands().get(command)
+
+
+def _load_plugins() -> None:
+    """Import every enabled plugin. Never raises.
+
+    A failure here is reported and stepped over. The plugin system is a
+    convenience; the agent starting is not, and no third-party package gets to
+    decide that this program will not run.
+    """
+    from andromeda_agent import plugins as plugins_module
+
+    try:
+        plugins_module.load()
+    except Exception as exc:  # noqa: BLE001 - see the docstring
+        output.fail(
+            f"The plugin system failed to start: {exc}",
+            "Set ANDROMEDA_NO_PLUGINS=1 to run without it while you look.",
+        )
+        return
+
+    for plugin_id, entry in plugins_module.manager().loaded.items():
+        if entry.error:
+            output.fail(f"plugin {plugin_id}: {entry.error}")
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
 
+    argv = _take_no_plugins(argv)
     argv, profile_name = _take_profile(argv)
     if profile_name:
         from . import profiles
@@ -1575,7 +1976,23 @@ def main(argv: list[str] | None = None) -> int:
     # live in the agent package, which already imports this one.
     _apply_secrets(warn_literals=not (argv and argv[0] == "secrets"))
 
-    if argv and argv[0] in COMMANDS:
+    # Plugins, after the profile is resolved (they live under the profile home
+    # and their ledger is per-profile) and after secrets are in the
+    # environment (a plugin's `requires_env` is checked against it).
+    #
+    # `andromeda plugins ...` is deliberately excluded. A plugin that breaks on
+    # import must not be able to break the only command that can turn it off —
+    # otherwise the fix is "edit JSON by hand", which is the fix people write a
+    # bug report about instead of finding.
+    if not (argv and argv[0] == "plugins"):
+        _load_plugins()
+
+
+    # A plugin's verb has to route here too. `COMMANDS` is a literal tuple, so
+    # without this `andromeda greet` falls through to the flag-form parser and
+    # is read as a *prompt* — the subcommand is built, the dispatch exists, and
+    # the only path to either is never taken.
+    if argv and (argv[0] in COMMANDS or _plugin_cli_registration(argv[0])):
         try:
             return _run_command(argv)
         except config_module.ConfigError as exc:

@@ -1,0 +1,19 @@
+manifest_version: 1
+name: square
+description: Catalog, orders, and payments from Square.
+source: https://developer.squareup.com/docs/mcp
+transport:
+  type: http
+  url: https://mcp.squareup.com/sse
+auth:
+  type: oauth
+suggest:
+  keywords: [square, squareup]
+  hosts: [squareup.com]
+post_install: |
+  Run `andromeda mcp login square` to authorize in a browser,
+  then start a new session so the tools load.
+
+  This endpoint speaks server-sent events. Simple replies work; a
+  server that streams several frames will be truncated until the
+  streaming client lands.

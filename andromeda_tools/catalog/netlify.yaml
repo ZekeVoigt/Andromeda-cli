@@ -1,0 +1,15 @@
+manifest_version: 1
+name: netlify
+description: Sites, deploys, and environment variables from Netlify.
+source: https://docs.netlify.com/build/build-with-ai/agent-setup-guides/agent-setup-overview/
+transport:
+  type: http
+  url: https://netlify-mcp.netlify.app/mcp
+auth:
+  type: oauth
+suggest:
+  keywords: [netlify]
+  hosts: [netlify.com, netlify.app]
+post_install: |
+  Run `andromeda mcp login netlify` to authorize in a browser,
+  then start a new session so the tools load.

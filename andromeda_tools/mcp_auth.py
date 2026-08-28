@@ -104,8 +104,17 @@ class NeedsBrowser(OAuthError):
 # ---------------------------------------------------------------------------
 
 
+#: Overrides where tokens live, for a runner that must not put them on a
+#: persistent volume. See `andromeda_agent.mcp_cloud`: a hosted job materialises
+#: credentials onto the container's own throwaway disk, because `secrets.py`'s
+#: standing rule is that a value somebody moved into a vault does not get
+#: written back into a file that outlives the run.
+TOKEN_DIR_ENV = "ANDROMEDA_MCP_TOKEN_DIR"
+
+
 def token_dir(home: Path) -> Path:
-    return home / "mcp-auth"
+    override = os.environ.get(TOKEN_DIR_ENV, "").strip()
+    return Path(override) if override else home / "mcp-auth"
 
 
 def token_path(home: Path, server: str) -> Path:
@@ -299,10 +308,47 @@ def resource_metadata_url(response: httpx.Response, server_url: str) -> str:
     found = re.search(r'resource_metadata="([^"]+)"', header)
     if found:
         return found.group(1)
+    return metadata_fallbacks(server_url)[0]
+
+
+def metadata_fallbacks(server_url: str) -> list[str]:
+    """Where to look when the 401 carries no pointer, best guess first.
+
+    RFC 9728 inserts the resource's own path *into* the well-known path: a
+    server at `https://host/mcp` publishes at
+    `https://host/.well-known/oauth-protected-resource/mcp`, and the bare root
+    form is only correct for a resource at `/`.
+
+    This tried the root and nothing else, which is wrong for every server
+    mounted under a path — the majority of them. GitHub is the case that
+    exposed it: the document is there, at the path-aware location, and we
+    looked in one place that was never going to have it and concluded the
+    server did not support discovery.
+
+    Both are returned because plenty of servers do publish at the root, and a
+    fallback list costs one extra request on the rarer branch.
+    """
     parts = urllib.parse.urlsplit(server_url)
-    return urllib.parse.urlunsplit(
-        (parts.scheme, parts.netloc, "/.well-known/oauth-protected-resource", "", "")
+    path = parts.path.rstrip("/")
+    candidates = []
+    if path:
+        candidates.append(
+            urllib.parse.urlunsplit(
+                (
+                    parts.scheme,
+                    parts.netloc,
+                    f"/.well-known/oauth-protected-resource{path}",
+                    "",
+                    "",
+                )
+            )
+        )
+    candidates.append(
+        urllib.parse.urlunsplit(
+            (parts.scheme, parts.netloc, "/.well-known/oauth-protected-resource", "", "")
+        )
     )
+    return candidates
 
 
 def _get_json(client: httpx.Client, url: str) -> dict[str, Any] | None:
@@ -327,6 +373,17 @@ def discover_issuer(client: httpx.Client, metadata_url: str, server_url: str) ->
     definition able to issue a token for this resource.
     """
     document = _get_json(client, metadata_url)
+    if document is None:
+        # The pointer we were given did not resolve. Try the other well-known
+        # shapes before concluding the server publishes nothing — a 404 at one
+        # location is not evidence about the other, and treating it as evidence
+        # is what made GitHub look like it had no discovery at all.
+        for candidate in metadata_fallbacks(server_url):
+            if candidate == metadata_url:
+                continue
+            document = _get_json(client, candidate)
+            if document is not None:
+                break
     servers = (document or {}).get("authorization_servers")
     if isinstance(servers, list) and servers:
         return str(servers[0]).rstrip("/")

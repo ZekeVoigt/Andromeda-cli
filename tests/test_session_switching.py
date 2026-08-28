@@ -167,20 +167,13 @@ class TestTheOtherNewVerbs:
 
 
 class TestSurfaceParity:
-    def test_the_tui_handles_every_verb_the_repl_documents(self):
-        """Two surfaces of one product whose slash vocabularies disagree is
-        the same class of bug as a tool gated differently by caller."""
-        import re
+    def test_the_two_surfaces_cannot_disagree(self):
+        """They read one registry, so this is now true by construction rather
+        than by two people remembering to edit two strings."""
+        from andromeda_tui import app
 
-        from andromeda_tui.app import SLASH_HELP
+        assert repl.slash_help() == app.slash_help()
 
-        repl_verbs = set(re.findall(r"^\s*(/\w+)", repl.SLASH_HELP, re.MULTILINE))
-        tui_verbs = set(re.findall(r"^\s*(/\w+)", SLASH_HELP, re.MULTILINE))
-        assert repl_verbs <= tui_verbs
-
-    def test_the_new_verbs_are_documented_on_both(self):
-        from andromeda_tui.app import SLASH_HELP
-
+    def test_the_new_verbs_are_documented(self):
         for verb in ("/recap", "/sessions", "/resume"):
-            assert verb in repl.SLASH_HELP
-            assert verb in SLASH_HELP
+            assert verb in repl.slash_help()

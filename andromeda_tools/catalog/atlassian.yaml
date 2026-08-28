@@ -1,0 +1,19 @@
+manifest_version: 1
+name: atlassian
+description: Jira issues and Confluence pages from Atlassian's hosted server.
+source: https://support.atlassian.com/rovo/docs/getting-started-with-the-atlassian-remote-mcp-server/
+transport:
+  type: http
+  url: https://mcp.atlassian.com/v1/sse
+auth:
+  type: oauth
+suggest:
+  keywords: [jira, confluence, atlassian, bitbucket]
+  hosts: [atlassian.net, atlassian.com, jira.com]
+post_install: |
+  Run `andromeda mcp login atlassian` to authorize in a browser,
+  then start a new session so the tools load.
+
+  This endpoint speaks server-sent events. Simple replies work; a
+  server that streams several frames will be truncated until the
+  streaming client lands.

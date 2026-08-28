@@ -1,0 +1,15 @@
+manifest_version: 1
+name: neon
+description: Postgres branches, queries, and projects on Neon.
+source: https://neon.tech/docs/ai/neon-mcp-server
+transport:
+  type: http
+  url: https://mcp.neon.tech/mcp
+auth:
+  type: oauth
+suggest:
+  keywords: [neon, postgres, database branch]
+  hosts: [neon.tech, console.neon.tech]
+post_install: |
+  Run `andromeda mcp login neon` to authorize in a browser,
+  then start a new session so the tools load.

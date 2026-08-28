@@ -1,0 +1,15 @@
+manifest_version: 1
+name: wix
+description: Sites, collections, and business data from your Wix account.
+source: https://dev.wix.com/docs
+transport:
+  type: http
+  url: https://mcp.wix.com/mcp
+auth:
+  type: oauth
+suggest:
+  keywords: [wix, site, storefront]
+  hosts: [wix.com, editorx.com]
+post_install: |
+  Run `andromeda mcp login wix` to authorize in a browser,
+  then start a new session so the tools load.

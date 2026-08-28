@@ -1,0 +1,6 @@
+{
+  "$comment": "The bundled seed. Two jobs: the offline fallback when the remote index is unreachable, and the machine-readable format reference for anyone opening a pull request against it. Every `ref` is a 40-character commit SHA — a tag can be moved and a branch head moves by definition, so an index that resolved to either would resolve to different code tomorrow with the same words in it. Inclusion is a review of an entry's metadata, never of its code; install still scans and still asks for capability consent.",
+  "version": 1,
+  "updated": "2026-08-26",
+  "plugins": []
+}

@@ -37,20 +37,48 @@ ZINC_50 = "#fafafa"
 ZINC_100 = "#f4f4f5"
 ZINC_200 = "#e4e4e7"
 
+# The four hues, and the whole of the colour budget.
+#
+# The monochrome rule above is kept for *prose* — an answer is still three
+# greys, because colouring a paragraph tells you nothing about it. What earns
+# hue is structure: whose turn this is, whether a tool worked, and whether the
+# thing on screen was asked for by a person or by the clock. Those are the
+# distinctions a reader is actually scanning for, and they are exactly the ones
+# a palette of near-identical greys could not carry.
+#
+# One hue per meaning, never two for the same one:
+YOU = "#67e8f9"          # the person's turn — cyan
+AGENT = "#a5b4fc"        # the agent's frame — indigo
+AUTONOMOUS = "#fbbf24"   # nobody asked for this; the clock did — amber
+GOOD = "#4ade80"         # a tool that did what it said
+BAD = "#f87171"          # a tool that did not
+
 THEME = Theme(
     {
         "accent": ZINC_50,
         "lane": ZINC_100,
         "muted": f"dim {ZINC_200}",
-        "ok": ZINC_50,
-        "warn": f"bold {ZINC_50}",
-        "bad": f"bold {ZINC_50}",
+        # `ok` / `warn` / `bad` were three names for near-white, because the
+        # palette had nothing else to give them. They now resolve to the hues
+        # they always meant. Kept as separate names from `good`/`bad` below
+        # because callers across the CLI already use them.
+        "ok": GOOD,
+        "warn": f"bold {AUTONOMOUS}",
         # An all-caps, wide-tracked label. The site's eyebrows —
         # EXPRESSIVE INTELLIGENCE, HUMAN / SYSTEM / ORBIT — are the strongest
         # single piece of its visual language and they cost nothing here.
         "eyebrow": f"bold {ZINC_200}",
         "figure": f"dim {ZINC_200}",
         "rule": f"dim {ZINC_200}",
+        # The structural hues. Named for what they mean, not what they are, so
+        # a later palette change is one edit here rather than a grep for a hex.
+        "you": f"bold {YOU}",
+        "agent": AGENT,
+        "agent.rule": f"dim {AGENT}",
+        "autonomous": f"bold {AUTONOMOUS}",
+        "autonomous.rule": f"dim {AUTONOMOUS}",
+        "good": GOOD,
+        "bad": BAD,
         # Markdown elements. Restrained on purpose: rich's defaults colour
         # headings and code aggressively, which fights the prose.
         "markdown.h1": "bold",

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -30,6 +31,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
 MAX_NOTIFICATION = 240
 HEADER = "# {name}\n\n*{when} · {status}*\n\n"
@@ -72,7 +74,12 @@ def write_output(path: Path, name: str, status: str, body: str, when: float) -> 
 
 
 def deliver(
-    mode: str, name: str, body: str, ok: bool = True, target: str = ""
+    mode: str,
+    name: str,
+    body: str,
+    ok: bool = True,
+    target: str = "",
+    session: str = "",
 ) -> str:
     """Announce a run. Returns what was done, for the run record."""
     if mode == "webhook":
@@ -87,24 +94,97 @@ def deliver(
         return "stdout"
 
     if mode == "notify":
-        return "notified" if _notify(name, body, ok) else "notify unavailable"
+        return "notified" if _notify(name, body, ok, session) else "notify unavailable"
+
+    sender = _plugin_modes().get(mode)
+    if sender is not None:
+        # Best-effort, exactly like `notify`. The output file is already
+        # written by the time this runs, so a plugin that cannot reach its
+        # service costs the announcement and never the work — and a raising
+        # sender must not turn a successful run into a failed one in the
+        # history.
+        try:
+            delivered = bool(sender(name=name, body=body, ok=ok, target=target))
+        except Exception as exc:  # noqa: BLE001 - see above
+            return f"{mode} failed: {exc}"
+        return mode if delivered else f"{mode} failed"
 
     return ""
 
 
-def _notify(title: str, body: str, ok: bool) -> bool:
+def _plugin_modes() -> dict[str, "Callable[..., bool]"]:
+    """Delivery modes a plugin registered, or nothing.
+
+    Consulted after the built-ins so `webhook`, `stdout` and `notify` cannot be
+    shadowed — a plugin quietly taking over `notify` would be a plugin reading
+    the output of every scheduled job the user thought was going to the desktop.
+    """
+    try:
+        from . import plugins as plugins_module
+    except ImportError:  # pragma: no cover - half-installed package
+        return {}
+    return plugins_module.delivery_modes()
+
+
+def resume_command(session: str) -> str:
+    """The command that opens a run's own conversation.
+
+    One definition, used by the clickable notification, by the fallback text
+    inside an unclickable one, and by anything else that needs to hand somebody
+    the way back. A notification that says a job finished and gives no route to
+    what it said is a notification people learn to swipe away.
+    """
+    return f"andromeda --resume {session}" if session else ""
+
+
+def _notify(title: str, body: str, ok: bool, session: str = "") -> bool:
     summary = " ".join((body or "").split())[:MAX_NOTIFICATION] or "(no output)"
     prefix = "" if ok else "failed — "
+    resume = resume_command(session)
 
     if sys.platform == "darwin":
+        # `terminal-notifier` first, and only for its one irreplaceable
+        # property: `-execute` makes the notification *clickable*, opening the
+        # conversation the run actually happened in. `osascript`'s
+        # `display notification` cannot carry an action at all — clicking it
+        # does nothing, which is the complaint.
+        notifier = shutil.which("terminal-notifier")
+        if notifier and resume:
+            # Through Terminal rather than executed directly: the point is to
+            # land the person in an interactive session they can type into, and
+            # a bare `-execute` would run it with no terminal attached.
+            script = (
+                'tell application "Terminal" to do script '
+                f'{_applescript(resume)}\ntell application "Terminal" to activate'
+            )
+            return _run(
+                [
+                    notifier,
+                    "-title",
+                    f"Andromeda · {title}",
+                    "-message",
+                    prefix + summary,
+                    "-execute",
+                    f"osascript -e {shlex.quote(script)}",
+                ]
+            )
+
+        # No notifier, or no session to open. Say the command in the body so it
+        # can at least be read and typed.
+        message = prefix + summary
+        if resume:
+            message = f"{message}  ·  {resume}"
         script = (
-            f'display notification {_applescript(prefix + summary)} '
+            f'display notification {_applescript(message)} '
             f'with title {_applescript("Andromeda · " + title)}'
         )
         return _run(["osascript", "-e", script])
 
     if shutil.which("notify-send"):
-        return _run(["notify-send", f"Andromeda · {title}", prefix + summary])
+        message = prefix + summary
+        if resume:
+            message = f"{message}\n{resume}"
+        return _run(["notify-send", f"Andromeda · {title}", message])
 
     return False
 

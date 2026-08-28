@@ -46,8 +46,15 @@ MAX_RESULT_CHARS = 40_000
 SAFE_NAME = re.compile(r"[^a-z0-9_]+")
 
 
+#: Overrides where the server list is read from, for the same reason
+#: `mcp_auth.TOKEN_DIR_ENV` exists — a hosted runner assembles one on its own
+#: disk from the account's secret store rather than keeping one on the volume.
+CONFIG_PATH_ENV = "ANDROMEDA_MCP_CONFIG"
+
+
 def config_path(home: Path) -> Path:
-    return home / "mcp.json"
+    override = os.environ.get(CONFIG_PATH_ENV, "").strip()
+    return Path(override) if override else home / "mcp.json"
 
 
 def sanitize(name: str) -> str:
@@ -329,7 +336,7 @@ class MCPServer:
         if "url" in self.config:
             return HTTPTransport(
                 str(self.config["url"]),
-                self.config.get("headers"),
+                _resolve_secrets(self.config.get("headers"), self.name),
                 self._authorization(),
             )
         command = self.config.get("command")
@@ -338,7 +345,7 @@ class MCPServer:
         return StdioTransport(
             str(command),
             [str(a) for a in (self.config.get("args") or [])],
-            {str(k): str(v) for k, v in (self.config.get("env") or {}).items()},
+            _resolve_secrets(self.config.get("env"), self.name),
         )
 
     def connect(self) -> bool:
@@ -444,6 +451,45 @@ class MCPServer:
         self.connected = False
 
 
+def _resolve_secrets(block: Any, server: str) -> dict[str, str]:
+    """An `env` or `headers` block with any secret references resolved.
+
+    Before this, connecting a server that needs an API key meant writing the key
+    into `mcp.json` in plain text. Now the same value can be
+    `keychain://andromeda/notion` or `op://vault/item/field`, and it is fetched
+    at connect time — which also registers it for redaction, so a key that
+    reaches a server this way is masked in transcripts for the rest of the
+    session.
+
+    A reference that fails to resolve is left out rather than passed through
+    literally. Handing a server the string `op://…` as its API key produces an
+    authentication error three layers away from the cause; an absent variable
+    produces the server's own "no credentials" message, which is the one worth
+    reading. The reason is printed once, here, where it is actionable.
+    """
+    if not isinstance(block, dict):
+        return {}
+
+    from andromeda_agent import secrets as secrets_module
+
+    out: dict[str, str] = {}
+    for key, value in block.items():
+        name, text = str(key), str(value)
+        if not secrets_module.is_reference(text):
+            out[name] = text
+            continue
+        resolution = secrets_module.resolve(name, text)
+        if not resolution.ok:
+            print(
+                f"  {server}: `{name}` could not be resolved from "
+                f"{secrets_module.safe_reference(text)} — "
+                f"{resolution.detail or resolution.remedy}"
+            )
+            continue
+        out[name] = resolution.value
+    return out
+
+
 def _flatten(result: dict[str, Any]) -> str:
     """MCP content blocks, as text.
 
@@ -492,18 +538,54 @@ def load_config(home: Path) -> dict[str, dict[str, Any]]:
     servers = raw.get("mcpServers") or raw.get("mcp_servers") or {}
     if not isinstance(servers, dict):
         return {}
-    return {
-        str(name): config
-        for name, config in servers.items()
-        if isinstance(config, dict) and not config.get("disabled")
-    }
+
+    from . import mcp_security
+
+    out: dict[str, dict[str, Any]] = {}
+    for name, config in servers.items():
+        if not isinstance(config, dict) or config.get("disabled"):
+            continue
+        # Screened here and not only where it was written. This file can be
+        # edited by hand, restored from a backup, synced from another machine
+        # or planted outright, and a server that arrives by any of those routes
+        # gets spawned by the same code as one somebody typed. Trusting it
+        # because of how it got here is the assumption the shapes in
+        # `mcp_security` were built to exploit.
+        issues = mcp_security.screen(str(name), config)
+        if issues:
+            print(f"  refusing MCP server `{name}`: {issues[0]}")
+            continue
+        out[str(name)] = config
+    return out
 
 
 def build_servers(home: Path) -> list[MCPServer]:
+    """Every configured server: the user's own, then any a plugin carries.
+
+    The user's `mcp.json` is read first and wins a name collision, so a
+    portable package cannot quietly replace a server somebody configured
+    themselves. Package servers are already namespaced `<package>:<server>`,
+    which makes a collision unlikely — this is the belt for the case where a
+    user happened to name one the same way.
+    """
+    configured = load_config(home)
+    combined = dict(configured)
+    for name, config in _plugin_servers().items():
+        if name not in combined:
+            combined[name] = config
     return [
         MCPServer(name=name, config=config, home=home)
-        for name, config in load_config(home).items()
+        for name, config in combined.items()
     ]
+
+
+def _plugin_servers() -> dict[str, dict]:
+    """Servers a portable package carries, or nothing."""
+    try:
+        from andromeda_agent import plugins as plugins_module
+    except ImportError:  # pragma: no cover - half-installed package
+        return {}
+    return plugins_module.mcp_servers()
 
 
 def specs_for(server: MCPServer) -> list[ToolSpec]:

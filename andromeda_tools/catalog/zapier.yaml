@@ -1,0 +1,21 @@
+manifest_version: 1
+name: zapier
+description: Reach 8,000+ apps through Zapier's actions, as MCP tools.
+source: https://zapier.com/mcp
+# Full OAuth with dynamic client registration — verified 2026-08-27 against
+# https://mcp.zapier.com/api/v1/oauth/register. An earlier version of this
+# manifest asked for a bearer token, from a probe that only looked for
+# resource metadata at the domain root; Zapier publishes it under the path,
+# which is what RFC 9728 actually specifies.
+transport:
+  type: http
+  url: https://mcp.zapier.com/api/mcp/mcp
+auth:
+  type: oauth
+suggest:
+  keywords: [zapier, zap, automation, integration, gmail, calendar]
+  hosts: [zapier.com, mcp.zapier.com]
+post_install: |
+  Run `andromeda mcp login zapier` to authorize in a browser.
+  Choose which actions the server may take at https://mcp.zapier.com/
+  then start a new session so the tools load.

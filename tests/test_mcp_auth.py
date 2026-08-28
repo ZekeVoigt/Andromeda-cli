@@ -408,10 +408,16 @@ def test_the_resource_metadata_url_comes_from_the_challenge(provider):
 
 
 def test_a_bare_401_falls_back_to_the_well_known_path():
-    """Common enough that refusing it would be refusing real servers."""
+    """Common enough that refusing it would be refusing real servers.
+
+    The path-aware form first, per RFC 9728 — the resource's own path goes
+    *inside* the well-known path, and the bare root is only correct for a
+    resource mounted at `/`. This asserted the root, which is why a server that
+    published its document correctly looked like it had no discovery at all.
+    """
     response = httpx.Response(401)
     assert mcp_auth.resource_metadata_url(response, "https://x.test/deep/mcp") == (
-        "https://x.test/.well-known/oauth-protected-resource"
+        "https://x.test/.well-known/oauth-protected-resource/deep/mcp"
     )
 
 
@@ -593,3 +599,59 @@ def test_an_expired_authorization_mid_call_is_a_tool_error_not_a_dead_turn(tmp_p
     assert not result.ok
     assert "andromeda mcp login pocket" in result.content
     assert not server.connected, "a refused server must not stay marked live"
+
+
+class TestPathAwareMetadataDiscovery:
+    """RFC 9728 puts the resource's own path *inside* the well-known path: a
+    server at `https://host/mcp` publishes at
+    `https://host/.well-known/oauth-protected-resource/mcp`.
+
+    This looked at the root and nowhere else, which is wrong for every server
+    mounted under a path — most of them. GitHub is the case that exposed it:
+    the document is there, and we concluded the server had no discovery.
+    """
+
+    def test_the_path_aware_form_is_tried_first(self):
+        assert mcp_auth.metadata_fallbacks("https://api.githubcopilot.com/mcp/")[0] == (
+            "https://api.githubcopilot.com/.well-known/oauth-protected-resource/mcp"
+        )
+
+    def test_the_root_form_is_still_offered(self):
+        found = mcp_auth.metadata_fallbacks("https://host/mcp")
+        assert found[-1] == "https://host/.well-known/oauth-protected-resource"
+
+    def test_a_root_mounted_server_offers_only_the_root(self):
+        assert mcp_auth.metadata_fallbacks("https://mcp.stripe.com") == [
+            "https://mcp.stripe.com/.well-known/oauth-protected-resource"
+        ]
+
+    def test_a_header_pointer_still_wins(self):
+        """The 401's own answer is authoritative and needs no guessing."""
+        response = httpx.Response(
+            401,
+            headers={
+                "www-authenticate": 'Bearer resource_metadata="https://host/somewhere-else"'
+            },
+            request=httpx.Request("POST", "https://host/mcp"),
+        )
+        assert (
+            mcp_auth.resource_metadata_url(response, "https://host/mcp")
+            == "https://host/somewhere-else"
+        )
+
+    def test_a_404_at_one_location_is_not_evidence_about_the_other(self, respx_mock):
+        """Treating it as evidence is what made a working server look broken."""
+        respx_mock.get(
+            "https://host/.well-known/oauth-protected-resource/mcp"
+        ).respond(404)
+        respx_mock.get("https://host/.well-known/oauth-protected-resource").respond(
+            200, json={"authorization_servers": ["https://issuer.example"]}
+        )
+
+        with httpx.Client() as client:
+            issuer = mcp_auth.discover_issuer(
+                client,
+                "https://host/.well-known/oauth-protected-resource/mcp",
+                "https://host/mcp",
+            )
+        assert issuer == "https://issuer.example"

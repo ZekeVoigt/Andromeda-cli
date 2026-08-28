@@ -20,6 +20,7 @@ from andromeda_agent.delegation import (
 )
 from andromeda_agent.lanes import LaneRegistry
 from andromeda_agent import auxiliary as auxiliary_module
+from andromeda_agent import plugins as plugins_module
 from andromeda_agent import compaction as compaction_module
 from andromeda_agent import curator as curator_module
 from andromeda_agent import hints as hints_module
@@ -39,6 +40,7 @@ from andromeda_tools import (
     build_registry,
     skills as skills_module,
 )
+from andromeda_tools import browser as browser_module
 from andromeda_tools import mcp as mcp_module
 from andromeda_tools import skill_scan
 from andromeda_tools.processes import ProcessRegistry
@@ -148,7 +150,7 @@ def build_conversation(
     )
     # One browser for the session, shared with every lane. It is not started
     # until something navigates, so a session that never browses pays nothing.
-    browser = BrowserSession()
+    browser = browser_module.build_session()
     lanes = LaneRegistry()
     processes = ProcessRegistry()
     # Connected eagerly at session start rather than on first use: a tool the
@@ -361,6 +363,29 @@ def build_conversation(
     # one that outlives it.
     schedule = Schedule(schedule_path()) if interactive else None
 
+    # Filled in once the conversation exists — `rebuild` is defined before it,
+    # and the reload needs to reach back into it. A one-element list rather
+    # than a `nonlocal`, so the closure below reads the *current* value rather
+    # than the one bound at definition.
+    live: list = []
+
+    def reconnect_mcp() -> list[str]:
+        """Pick up servers connected since this session started.
+
+        Mutates `mcp_servers` in place rather than rebinding it: that list is
+        what `rebuild` closes over, and a fresh list would leave the rebuild
+        still looking at the old one.
+        """
+        known = {server.name for server in mcp_servers}
+        for server in mcp_module.build_servers(config_module.home()):
+            if server.name in known:
+                continue
+            server.connect()
+            mcp_servers.append(server)
+        if not live:
+            return []
+        return live[0].reload_tools()
+
     def rebuild(fresh_todos: TodoList):
         return build_registry(
             workspace,
@@ -382,7 +407,13 @@ def build_conversation(
             vision=vision,
             allow_private_network=bool(config["allow_private_network"]),
             skills_home=config_module.home(),
+            connect_home=config_module.home(),
+            on_connected=reconnect_mcp,
             schedule=schedule,
+            # Which conversation this is, so a job the agent creates is bound
+            # to it and reports back into it. Interactive only, by the same
+            # rule as `schedule` above.
+            session_id=binding.record.id if interactive else "",
             # Only a scheduled run passes these, and it passes both. The
             # notepad is bound to one job, so a registry with the tool and no
             # job to write to would be a tool that always errors.
@@ -496,6 +527,9 @@ def build_conversation(
     conversation.lane_registry = lanes
     conversation.process_registry = processes
     conversation.mcp_servers = mcp_servers
+    # Closes the loop for `reconnect_mcp` above, which cannot name the
+    # conversation because it is defined before there is one.
+    live.append(conversation)
     conversation.binding = binding
 
     # A resumed session replaces the transcript wholesale, including its
@@ -510,6 +544,13 @@ def build_conversation(
     # measuring.
     if session is not None and session.usage:
         conversation.usage = usage_module.Usage.from_dict(session.usage)
+
+    # Lent to the plugins before the session-start hook fires, so a plugin
+    # that reaches for `ctx.dispatch_tool` from `on_session_start` finds a
+    # registry rather than the honest refusal it would otherwise get. Here for
+    # the same reason the hook is: every way into a conversation comes through
+    # this function.
+    plugins_module.bind_session(conversation.registry, vision)
 
     # Fired here rather than in each surface: every way into a conversation
     # comes through this function, and a lifecycle event that four call sites

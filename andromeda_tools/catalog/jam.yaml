@@ -1,0 +1,15 @@
+manifest_version: 1
+name: jam
+description: Bug reports with console logs, network traces, and repro steps from Jam.
+source: https://jam.dev/docs
+transport:
+  type: http
+  url: https://mcp.jam.dev/mcp
+auth:
+  type: oauth
+suggest:
+  keywords: [jam, bug report, repro, screen recording]
+  hosts: [jam.dev]
+post_install: |
+  Run `andromeda mcp login jam` to authorize in a browser,
+  then start a new session so the tools load.

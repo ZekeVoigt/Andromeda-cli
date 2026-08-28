@@ -12,6 +12,7 @@ as dead prose the user cannot pick.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Callable
 
 from .spec import ToolResult, failure
@@ -88,10 +89,83 @@ PARAMETERS: dict[str, Any] = {
 }
 
 
+# Escape sequences and the C0/C1 control characters, which every surface that
+# renders a question writes straight to a terminal.
+#
+# This is not tidying. The question text and the choices are model output, and
+# a terminal reads a stray `\r`, `\b` or `\x1b[` as a *cursor instruction*
+# rather than as characters: one carriage return inside a choice moves the rest
+# of that row to column zero, outside the box the prompt is drawn in, over
+# whatever was there. The row that moves is the row somebody is trying to pick.
+# A tab does the same thing more quietly, jumping to the next multiple of eight.
+#
+# So the cursor stays where the layout put it: escapes are dropped, controls
+# become spaces, and runs of whitespace — newlines included, since every one of
+# these surfaces lays a question out as one line and wraps it itself — collapse
+# to one.
+_ESCAPES = re.compile(
+    r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[@-Z\\-_])"
+)
+_CONTROLS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def plain(raw: Any) -> str:
+    """One line of text that cannot move the cursor."""
+    text = raw if isinstance(raw, str) else str(raw)
+    return " ".join(_CONTROLS.sub(" ", _ESCAPES.sub("", text)).split())
+
+
+# Keys a model reaches for when it wraps a choice in an object instead of
+# writing the string. Ordered: the first one present wins.
+_CHOICE_LABELS = ("label", "text", "name", "title", "choice", "option", "value")
+
+
+def choice_text(raw: Any) -> str:
+    """One choice as the line a person reads.
+
+    `str(raw)` was doing this, and on the day a model passed an object instead
+    of a string it put a Python dict repr on screen —
+    ``{'question': 'auth', 'choices': [...]}`` — inside the prompt asking
+    somebody to choose. Unreadable, and unanswerable.
+
+    So: strings pass through, objects are asked for a label, and anything with
+    no readable label becomes empty and is dropped by the caller rather than
+    rendered as its repr. A choice nobody can read is worse than one fewer
+    choice.
+    """
+    if isinstance(raw, str):
+        return plain(raw)
+    if isinstance(raw, dict):
+        for key in _CHOICE_LABELS:
+            value = raw.get(key)
+            if isinstance(value, str) and plain(value):
+                return plain(value)
+        return ""
+    if isinstance(raw, (int, float, bool)):
+        return str(raw)
+    return ""
+
+
+def _looks_like_a_question(raw: Any) -> bool:
+    """Whether a `choices` entry is really a whole question.
+
+    The two shapes are next to each other in the schema and models mix them up:
+    the batch form gets passed as `choices` instead of `questions`. Recognising
+    it is much better than dropping it — the person still gets asked, rather
+    than seeing a question with no options at all.
+    """
+    return (
+        isinstance(raw, dict)
+        and isinstance(raw.get("choices"), list)
+        and not any(isinstance(raw.get(key), str) for key in _CHOICE_LABELS)
+    )
+
+
 class Question:
     def __init__(self, text: str, choices: list[str] | None = None, key: str = "") -> None:
-        self.text = (text or "").strip()
-        self.choices = [str(c).strip() for c in (choices or []) if str(c).strip()][:MAX_CHOICES]
+        self.text = plain(text or "")
+        cleaned = [choice_text(c) for c in (choices or [])]
+        self.choices = [c for c in cleaned if c][:MAX_CHOICES]
         self.key = key or self.text[:40]
 
 
@@ -125,7 +199,26 @@ def ask(asker: Asker | None, question: str = "", choices: list[str] | None = Non
     else:
         if not (question or "").strip():
             return failure("A question is required.")
-        batch = [Question(question, choices)]
+        # A batch passed in the wrong field. Unwrapped rather than refused: the
+        # model asked something sensible, it just used the neighbouring
+        # parameter, and refusing costs the person a whole turn to find out.
+        nested = [c for c in (choices or []) if _looks_like_a_question(c)]
+        plain = [c for c in (choices or []) if not _looks_like_a_question(c)]
+        if len(nested) == 1 and not plain:
+            # The overwhelmingly common shape: the prose question is at the top
+            # level and its options got wrapped in one object. Merged rather
+            # than split, because splitting asks the person the same thing
+            # twice — once with no options, then again under whatever short
+            # label the model used for it.
+            batch = [Question(question, nested[0].get("choices"))]
+        elif nested:
+            batch = [Question(question, plain)]
+            for raw in nested[: MAX_QUESTIONS - 1]:
+                text = str(raw.get("question") or "").strip()
+                if text:
+                    batch.append(Question(text, raw.get("choices")))
+        else:
+            batch = [Question(question, choices)]
 
     try:
         answers = asker(batch)

@@ -18,6 +18,23 @@ def isolated_home(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def plugin_environment(monkeypatch):
+    """Neither plugin switch survives a test.
+
+    Both are read from the process environment rather than passed down, which
+    is right for a switch the daemon and `cron run` also have to honour and
+    wrong for a suite: one test that turns plugins off turns them off for every
+    test after it, and the symptom is a `KeyError` in an unrelated file. That
+    is not hypothetical — it happened the first time both were exercised in one
+    run.
+    """
+    from andromeda_agent import plugins as plugins_module
+
+    monkeypatch.delenv(plugins_module.ENV_DISABLE, raising=False)
+    monkeypatch.delenv(plugins_module.ENV_PROJECT_PLUGINS, raising=False)
+
+
+@pytest.fixture(autouse=True)
 def wide_console():
     """Stop rich from wrapping console output during tests.
 

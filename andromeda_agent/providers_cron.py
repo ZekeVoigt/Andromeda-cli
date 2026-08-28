@@ -53,11 +53,11 @@ class Relay:
     than refusing to start, because a scheduler that stops over a misspelt
     setting is a scheduler that silently stopped.
 
-    **Re-arming is not here yet.** `after_run` records the run and stops; the
-    call that tells the server when this job next wants firing arrives with the
-    server side of C4. That order is deliberate rather than incidental: the
-    refusal to double-fire is worth having on its own, and shipping the arming
-    half first would mean a window where two things could start the same job.
+    **Re-arming is not here yet.** The call that tells the server when this job
+    next wants firing arrives with the server side of C4. That order is
+    deliberate rather than incidental: the refusal to double-fire is worth
+    having on its own, and shipping the arming half first would mean a window
+    where two things could start the same job.
     """
 
     name = "relay"
@@ -66,10 +66,11 @@ class Relay:
         return []
 
     def after_run(self, schedule: Any, job: Any, run: Any) -> None:
-        # The run is still recorded locally. The ledger and the output file are
-        # this machine's own account of what happened and do not depend on who
-        # decided it should happen.
-        schedule.record(job, run)
+        # Nothing. The run is still recorded locally — `cron.execute` does it,
+        # on every path out, for every caller. It moved there because the two
+        # hosted callers did not have a provider to call and so recorded
+        # nothing, which left `next_run_at` on the fire that had just happened.
+        return None
 
     def describe(self) -> str:
         return "the hosted scheduler (fires arrive at `andromeda cron serve`)"
@@ -84,7 +85,9 @@ class BuiltIn:
         return schedule.due(now)
 
     def after_run(self, schedule: Any, job: Any, run: Any) -> None:
-        schedule.record(job, run)
+        # Also nothing, and for the same reason: recording is `cron.execute`'s,
+        # so that a path which never reaches a provider still advances cadence.
+        return None
 
     def describe(self) -> str:
         return "the built-in tick loop (andromeda cron daemon)"
@@ -105,11 +108,31 @@ def get(name: str = "") -> CronProvider:
     built-in loop, not stop running them. A scheduler that refuses to start
     because of a typo in a setting is a scheduler that silently stopped.
     """
-    return _PROVIDERS.get((name or "").strip().lower(), _PROVIDERS["built-in"])
+    wanted = (name or "").strip().lower()
+    found = _PROVIDERS.get(wanted)
+    if found is None:
+        found = _plugin_providers().get(wanted)
+    return found if found is not None else _PROVIDERS["built-in"]
 
 
 def names() -> list[str]:
-    return sorted(_PROVIDERS)
+    return sorted(set(_PROVIDERS) | set(_plugin_providers()))
+
+
+def _plugin_providers() -> dict[str, CronProvider]:
+    """Providers a plugin registered, or nothing.
+
+    After the built-ins, so `built-in` and `relay` cannot be shadowed, and the
+    unknown-name fallback still lands on `built-in`. The whole point of that
+    fallback is that a scheduler never silently stops, and a plugin is one more
+    way for a name to go missing — an uninstalled plugin is exactly the typo
+    case with a different cause.
+    """
+    try:
+        from . import plugins as plugins_module
+    except ImportError:  # pragma: no cover - half-installed package
+        return {}
+    return plugins_module.cron_providers()
 
 
 register(BuiltIn())

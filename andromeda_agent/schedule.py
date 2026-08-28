@@ -65,6 +65,22 @@ APPROVAL_MODES = ("ask", "auto", "deny")
 # losing a job's output to a delivery setting is a bug nobody would ever guess at.
 DELIVERY_MODES = ("none", "notify", "stdout", "webhook")
 
+
+def delivery_modes() -> tuple[str, ...]:
+    """Every mode a job may name, built-in and plugin.
+
+    A function rather than a constant because a plugin's mode arrives after
+    this module is imported, and validation that read a frozen tuple would
+    refuse the mode the plugin just added.
+    """
+    try:
+        from . import plugins as plugins_module
+
+        extra = tuple(sorted(plugins_module.delivery_modes()))
+    except ImportError:  # pragma: no cover - half-installed package
+        extra = ()
+    return DELIVERY_MODES + tuple(item for item in extra if item not in DELIVERY_MODES)
+
 # Who asked for this job to exist. Load-bearing, not bookkeeping: an agent may
 # propose autonomy, and only a person may grant the unattended kind. See
 # `Schedule.add`.
@@ -327,6 +343,16 @@ class Job:
     # A session id this job's output is appended to, so a scheduled run shows
     # up in `andromeda --resume` next to the conversation it came from.
     attach_to: str = ""
+    # The conversation that asked for this job. Recorded so its own transcript
+    # and `cron show` can point back at it — never written to. Runs go to
+    # `attach_to`, which is the job's own session; writing into the creating
+    # chat is the interleaving this pair of fields exists to end.
+    created_in: str = ""
+    # Where the most recent fire actually happened, for an `auto` job whose
+    # answer changes run to run. Written by the runner, read by the rail's
+    # badge — so a session shows where it *is*, not where somebody guessed it
+    # would be when they created it.
+    last_placement: str = ""
 
     # Who created it. An agent may propose autonomy; only a person grants the
     # unattended kind — see `Schedule.add`.
@@ -336,7 +362,9 @@ class Job:
     # flag because the useful combinations are not the diagonal — `cloud.py`
     # has the table. Both default to `device`, so every job that existed before
     # this shipped loads unchanged and behaves identically.
-    runs_on: str = "device"
+    # `auto` by default: where a job runs is a fire-time question, not a
+    # creation-time one. See `cloud.resolve_placement`.
+    runs_on: str = "auto"
     workspace_kind: str = "device"
 
     # For `workspace_kind: repo`. The remote is stored and the branch is not:
@@ -386,6 +414,21 @@ class Job:
     @property
     def is_monitored(self) -> bool:
         return bool(self.monitor_kind and self.monitor_source)
+
+    def placement(self, cloud_available: bool = True) -> str:
+        """Where the next fire goes. Always `device` or `cloud`."""
+        return cloud_module.resolve_placement(
+            self.runs_on, self.workspace_kind, cloud_available
+        )
+
+    def where_now(self) -> str:
+        """Where this job *is*, for a badge.
+
+        The last real fire, falling back to where the next one would go. A job
+        that has never run has no history to report, and showing nothing there
+        would leave a fresh `auto` job unlabelled in the rail.
+        """
+        return self.last_placement or self.placement()
 
     def due(self, now: float | None = None) -> bool:
         now = time.time() if now is None else now
@@ -465,6 +508,8 @@ class Job:
             "enabledTools": list(self.enabled_tools),
             "skills": list(self.skills),
             "attachTo": self.attach_to,
+            "createdIn": self.created_in,
+            "lastPlacement": self.last_placement,
             "origin": self.origin,
             "runsOn": self.runs_on,
             "workspaceKind": self.workspace_kind,
@@ -494,6 +539,21 @@ class Job:
         kind = str(raw.get("monitorKind") or "")
         deliver = str(raw.get("deliver") or "none")
         origin = str(raw.get("origin") or "user")
+        # **Absent means `device`, not `auto`.** Two different reasons, both
+        # load-bearing:
+        #
+        # A job written before `auto` existed was created under a promise that
+        # it runs on this machine. Reading it back as `auto` would silently
+        # move somebody's existing jobs onto a hosted runner — spending their
+        # credit, on a schedule, while they sleep — which is the exact grant
+        # this module refuses to take without being asked.
+        #
+        # And a *corrupt* value falls through to the same place, keeping the
+        # existing rule for `approvalMode` and `origin`: a damaged field must
+        # never widen what a job may do.
+        #
+        # New jobs get `auto` from the dataclass default, which is where the
+        # new behaviour belongs — at creation, not at load.
         runs_on = str(raw.get("runsOn") or "device")
         workspace_kind = str(raw.get("workspaceKind") or "device")
         return cls(
@@ -510,7 +570,7 @@ class Job:
             next_run_at=float(raw.get("nextRunAt") or 0),
             repeat=max(0, int(raw.get("repeat") or 0)),
             runs_done=max(0, int(raw.get("runsDone") or 0)),
-            deliver=deliver if deliver in DELIVERY_MODES else "none",
+            deliver=deliver if deliver in delivery_modes() else "none",
             script=str(raw.get("script") or ""),
             no_agent=bool(raw.get("noAgent")),
             # An unrecognised monitor kind disables monitoring rather than
@@ -527,6 +587,8 @@ class Job:
             enabled_tools=[str(i) for i in (raw.get("enabledTools") or []) if str(i).strip()],
             skills=[str(i) for i in (raw.get("skills") or []) if str(i).strip()],
             attach_to=str(raw.get("attachTo") or ""),
+            created_in=str(raw.get("createdIn") or ""),
+            last_placement=str(raw.get("lastPlacement") or ""),
             # Same rule as the approval mode, in the same direction: unknown
             # provenance reads as `agent`, the one that may not be widened
             # without a person saying so.
@@ -687,8 +749,9 @@ class Schedule:
         enabled_tools: list[str] | None = None,
         skills: list[str] | None = None,
         attach_to: str = "",
+        created_in: str = "",
         origin: str = "user",
-        runs_on: str = "device",
+        runs_on: str = "auto",
         workspace_kind: str = "device",
         repo_url: str = "",
         repo_ref: str = "",
@@ -698,8 +761,10 @@ class Schedule:
         prompt = (prompt or "").strip()
         if approval_mode not in APPROVAL_MODES:
             raise ScheduleError(f"approval must be one of {', '.join(APPROVAL_MODES)}.")
-        if deliver not in DELIVERY_MODES:
-            raise ScheduleError(f"deliver must be one of {', '.join(DELIVERY_MODES)}.")
+        if deliver not in delivery_modes():
+            raise ScheduleError(
+                f"deliver must be one of {', '.join(delivery_modes())}."
+            )
         if origin not in ORIGINS:
             raise ScheduleError(f"origin must be one of {', '.join(ORIGINS)}.")
 
@@ -827,6 +892,7 @@ class Schedule:
             enabled_tools=[i for i in (enabled_tools or []) if i],
             skills=[i for i in (skills or []) if i],
             attach_to=attach_to,
+            created_in=created_in,
             origin=origin,
             runs_on=runs_on,
             workspace_kind=workspace_kind,
@@ -934,11 +1000,85 @@ class Schedule:
         return sorted(self._jobs.values(), key=lambda job: job.created_at)
 
     def due(self, now: float | None = None) -> list[Job]:
-        return [job for job in self.all() if job.due(now)]
+        """What *this machine* should run now.
 
-    def record(self, job: Job, run: Run) -> None:
+        **A cloud job is never due here.** It is fired by the server, and the
+        `flock` that stops two daemons doing this on one machine does not cross
+        a machine boundary — so a job the hosted runner is also firing runs
+        twice, once in a container and once on the laptop, and the person is
+        shown one report. Seen live: a `--cloud` job ran on Modal at 18:21:18
+        and again on this laptop at 18:21:19, and the two disagreed, because the
+        laptop's copy had no clock and made a date up.
+
+        The `Relay` provider was built to prevent exactly this by returning
+        nothing from `due`, but it is opt-in — `cron_provider: relay` in
+        config.yaml — and the fallback for an unset or misspelt value is the
+        built-in tick loop. Double-firing must not depend on a setting the
+        person has to know to write down.
+
+        `runs_on == "cloud"` is the precise complement of what the server knows
+        about: `_arm` and `cron push` upload exactly those jobs and no others.
+        An `auto` job is not excluded, and must not be — it was never pushed, so
+        nothing else is firing it, and skipping it here would mean it never runs
+        at all.
+        """
+        return [job for job in self.all() if job.runs_on != "cloud" and job.due(now)]
+
+    def session_kinds(self) -> dict[str, str]:
+        """Which sessions spawned a job, and where that job runs.
+
+        Maps a session id to ``"cloud"`` or ``"local"``. Derived from
+        ``attach_to`` on every live job rather than stored on the session,
+        which is the whole reason it cannot drift: deleting a job, moving one
+        between locations, or restoring a store from a backup all change this
+        answer immediately, and a flag written onto a session at creation time
+        would go on claiming the old one forever.
+
+        **Where it is now, not where it was declared.** An `auto` job answers
+        this per fire, so the badge reads `last_placement` and falls back to
+        where the next fire would go. A session that says `⌂` when the job has
+        been running in the cloud all week is worse than no badge.
+
+        **Cloud wins a tie.** A session that spawned both kinds is listed under
+        cloud, because cloud is the surprising one — a person scanning for
+        "what is running while I am away" must not have it hidden behind the
+        ordinary case.
+
+        Retired and paused jobs still count. The session is being labelled by
+        what it *produced*, and a job somebody paused this morning is still the
+        reason that conversation is worth finding.
+        """
+        kinds: dict[str, str] = {}
+        for job in self.all():
+            session_id = (job.attach_to or "").strip()
+            if not session_id:
+                continue
+            where = job.where_now()
+            if where == "cloud" or kinds.get(session_id) == "cloud":
+                kinds[session_id] = "cloud"
+            else:
+                kinds[session_id] = "local"
+        return kinds
+
+    def record(self, job: Job, run: Run, advance: bool = True) -> None:
+        """Write the run down, and move the clock on — unless it was not a clock.
+
+        `advance=False` is for a run an **event** caused. The run is real and is
+        recorded in full: it counts toward `repeat`, it resets or increments the
+        failure streak, it goes in the history. What it must not do is move
+        `next_run_at`, because that field answers "when does this job next want
+        running on its own" and an event has no opinion on that.
+
+        Letting an event advance it means the outside world quietly reschedules
+        work it was only supposed to trigger: an `every 12h` job nudged a few
+        minutes later by every message that arrives, and a `0 9 * * *` job whose
+        idea of nine o'clock is computed from whenever a webhook last fired. Seen
+        as a four-minute drift the first time an event ran a real job, which is
+        small enough to have shipped unnoticed and would not have stayed small.
+        """
         job.record(run)
-        job.schedule_next()
+        if advance:
+            job.schedule_next()
         self.save()
 
     def pause(self, identifier: str, reason: str) -> Job | None:

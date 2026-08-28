@@ -123,7 +123,7 @@ def test_an_agent_cannot_create_a_cloud_job_at_any_approval_mode(schedule):
                 workspace_kind="detached",
                 workspace="",
             )
-        assert "cannot run in the cloud" in str(caught.value)
+        assert "cannot be pinned to the cloud" in str(caught.value)
         assert "andromeda cron approve" in str(caught.value)
 
 
@@ -177,7 +177,7 @@ def test_moving_an_existing_job_re_applies_every_creation_refusal(schedule):
         schedule.set_location(job.id, runs_on="cloud")
     assert "cannot see it" in str(caught.value)
     # And nothing was written on the way to refusing.
-    assert schedule.resolve(job.id).runs_on == "device"
+    assert schedule.resolve(job.id).runs_on == job.runs_on
 
 
 def test_moving_a_job_whose_belt_the_cloud_forbids_is_refused_not_trimmed(schedule):
@@ -193,7 +193,7 @@ def test_moving_a_job_whose_belt_the_cloud_forbids_is_refused_not_trimmed(schedu
     message = str(caught.value)
     assert "terminal" in message
     assert "unattended shell" in message
-    assert schedule.resolve(job.id).runs_on == "device"
+    assert schedule.resolve(job.id).runs_on == job.runs_on
 
 
 def test_a_belt_the_location_forbids_is_refused_at_creation(schedule):
@@ -461,10 +461,52 @@ def test_an_unrecognised_provider_falls_back_rather_than_stopping():
     assert providers_cron.get("").name == "built-in"
 
 
-def test_the_relay_provider_still_records_the_run():
-    """It owns timing and nothing else. The ledger and the output file are this
-    machine's own account of what happened and do not depend on who decided it
-    should happen."""
+def test_the_local_tick_loop_never_claims_a_cloud_job():
+    """The double-fire, closed without depending on a config setting.
+
+    A cloud job is fired by the server, and the `flock` that stops two daemons
+    doing this on one machine does not cross a machine boundary. `Relay` exists
+    to return nothing from `due` — but it is opt-in, and an unset or misspelt
+    `cron_provider` falls back to the built-in tick loop, which used to hand the
+    daemon every due job regardless of where it runs.
+
+    Seen live before this was fixed: one `--cloud` job ran on the hosted runner
+    at 18:21:18 and again on the laptop at 18:21:19, and the two disagreed.
+    """
+    import time
+
+    from andromeda_agent import providers_cron
+    from andromeda_agent.schedule import Schedule
+
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as tmp:
+        schedule = Schedule(Path(tmp) / "cron.json")
+        hosted = schedule.add("every 3m", "x", "/tmp", runs_on="cloud",
+                              workspace_kind="detached")
+        mine = schedule.add("every 3m", "y", "/tmp", runs_on="device")
+        # Both due right now.
+        for job in (hosted, mine):
+            job.next_run_at = time.time() - 1
+
+        assert schedule.due() == [mine]
+        # And through the provider the daemon actually uses when nobody has
+        # selected one — the fallback is what shipped, so it is what is tested.
+        assert providers_cron.get("").due(schedule) == [mine]
+        assert providers_cron.get("relay").due(schedule) == []
+
+
+def test_no_provider_records_the_run_because_execute_does():
+    """A provider owns timing and nothing else — recording included.
+
+    It used to record, and that was the bug: recording lived with the callers,
+    and the two *hosted* callers (`cron serve`'s fire handler and the Modal
+    runner) have no provider to call. They recorded nothing, so `next_run_at`
+    stayed on the fire that had just happened and the job re-fired one spent
+    moment for ever. `cron.execute` records now, on every path out, which is
+    the only place all four callers pass through.
+    """
     from andromeda_agent import providers_cron
 
     recorded = []
@@ -473,8 +515,9 @@ def test_the_relay_provider_still_records_the_run():
         def record(self, job, run):
             recorded.append((job, run))
 
-    providers_cron.get("relay").after_run(_Schedule(), "job", "run")
-    assert recorded == [("job", "run")]
+    for name in ("relay", "built-in"):
+        providers_cron.get(name).after_run(_Schedule(), "job", "run")
+    assert recorded == []
 
 
 # ---------------------------------------------------------------------------
@@ -526,23 +569,172 @@ def test_an_unparseable_schedule_does_not_raise_here():
     assert cloud.wake_cost_note("") == ""
 
 
-def test_the_tool_tells_the_agent_how_to_hand_the_cloud_over():
-    """Barred is not the same as unable to help.
+# ---------------------------------------------------------------------------
+# `auto` — placement as a fire-time question
+# ---------------------------------------------------------------------------
 
-    The tool has no cloud parameter and must not grow one. But with nothing in
-    its description mentioning the hosted lane at all, the model answered "I
-    have no agent cloud capability" and stopped — which is true about the
-    parameter and false about the product. It can make the job; the user grants
-    the location. Both halves have to be in front of it.
+
+class TestHybridPlacement:
+    """Where a job runs was a creation-time question, and it was the wrong
+    question: somebody scheduling "watch my deploys" does not know or care
+    where it runs. Worse, the answer was permanent — a job made on a Tuesday
+    afternoon ran on the laptop forever, including every night the lid was
+    shut, which is exactly when a watcher earns its keep."""
+
+    def test_a_job_that_needs_local_files_cannot_leave_the_machine(self):
+        from andromeda_agent import cloud
+
+        assert cloud.resolve_placement("auto", "device") == "device"
+
+    def test_everything_else_prefers_the_cloud(self):
+        from andromeda_agent import cloud
+
+        assert cloud.resolve_placement("auto", "detached") == "cloud"
+        assert cloud.resolve_placement("auto", "repo") == "cloud"
+
+    def test_an_explicit_choice_is_honoured_as_written(self):
+        from andromeda_agent import cloud
+
+        assert cloud.resolve_placement("device", "detached") == "device"
+        assert cloud.resolve_placement("cloud", "detached") == "cloud"
+
+    def test_it_falls_back_to_the_laptop_with_no_runner(self):
+        """Running late on the laptop beats not running."""
+        from andromeda_agent import cloud
+
+        assert cloud.resolve_placement("auto", "detached", False) == "device"
+
+    def test_auto_takes_the_stricter_of_the_two_ceilings(self):
+        """A job whose permissions changed depending on whether a laptop
+        happened to be awake is not something anybody could consent to."""
+        from andromeda_agent import cloud
+
+        assert cloud.max_tier_for("auto") == cloud.max_tier_for("cloud")
+
+    def test_an_agent_may_create_auto_but_still_not_pin_to_cloud(self):
+        from andromeda_agent import cloud
+
+        assert cloud.agent_origin_refusal("auto") == ""
+        assert "cannot be pinned" in cloud.agent_origin_refusal("cloud")
+
+    def test_an_existing_job_is_not_silently_moved_to_the_cloud(self):
+        """A job written before `auto` existed was created under a promise
+        that it runs here. Reading it back as `auto` would move somebody's
+        jobs onto a hosted runner without being asked."""
+        loaded = Job.from_json(
+            {
+                "id": "job_old",
+                "name": "old",
+                "schedule": "every 1h",
+                "prompt": "p",
+                "workspace": "/Users/someone/project",
+            }
+        )
+        assert loaded is not None
+        assert loaded.runs_on == "device"
+
+    def test_a_new_job_gets_auto(self):
+        job = Job(
+            id="j", name="n", schedule="every 1h", prompt="p", workspace="/tmp"
+        )
+        assert job.runs_on == "auto"
+
+    def test_where_now_reports_the_last_real_fire(self):
+        """A session badge that says ⌂ when the job has been running in the
+        cloud all week is worse than no badge."""
+        job = Job(
+            id="j", name="n", schedule="every 1h", prompt="p",
+            workspace="", workspace_kind="detached",
+        )
+        assert job.where_now() == "cloud"
+        job.last_placement = "device"
+        assert job.where_now() == "device"
+        assert Job.from_json(job.to_json()).last_placement == "device"
+
+
+def test_exactly_one_thing_can_decide_any_job_is_due():
+    """`I-TRIGGER-7`, as a property of the whole matrix rather than one case.
+
+    "Exactly one component decides that anything is due. Any code path where a
+    second component can reach the same conclusion is a bug, whatever locking it
+    has." There are two possible deciders — the server's scheduler and this
+    machine's tick loop — and the rule is that no job may be reachable by both.
+
+    The two filters have to stay exact complements:
+
+      * the server knows a job only if `_arm` / `cron push` uploaded it, and
+        both upload exactly `runs_on == "cloud"`
+      * `Schedule.due` hands the tick loop everything *except* `runs_on ==
+        "cloud"`
+
+    Written as a table because the bug this replaces was invisible in any single
+    case: every cloud job was running twice — once in a container and once on
+    the laptop, disagreeing — and it looked fine from either side alone.
     """
-    from andromeda_tools import scheduling
+    import tempfile
+    import time
+    from pathlib import Path
 
-    spec = scheduling.cron_spec(schedule=None, workspace_root="/tmp")
-    description = spec.description
+    from andromeda_agent.schedule import Schedule
 
-    assert "cron approve <id> --run-on cloud" in description
-    assert "cannot put a job on a hosted runner yourself" in description
-    # And the boundary is still stated as a grant, not as an incapacity.
-    assert "theirs to grant" in description
-    # The schema is unchanged — this is prose, not a new argument.
-    assert "cloud" not in spec.parameters["properties"]
+    with tempfile.TemporaryDirectory() as tmp:
+        schedule = Schedule(Path(tmp) / "cron.json")
+        jobs = [
+            schedule.add("every 1m", "x", "/tmp", runs_on="device"),
+            schedule.add("every 1m", "x", "/tmp", runs_on="cloud",
+                         workspace_kind="detached"),
+            schedule.add("every 1m", "x", "/tmp", runs_on="auto",
+                         workspace_kind="detached"),
+            schedule.add("every 1m", "x", "/tmp", runs_on="auto",
+                         workspace_kind="device"),
+        ]
+        # Everything overdue, so nothing is excluded merely by timing.
+        for job in jobs:
+            job.next_run_at = time.time() - 1
+        locally_due = {job.id for job in schedule.due()}
+
+        for job in jobs:
+            # What `_arm` and `cron push` both filter on. Kept as a literal
+            # rather than imported so that widening the upload filter without
+            # widening `due`'s exclusion fails here.
+            armed_remotely = job.runs_on == "cloud"
+            assert armed_remotely != (job.id in locally_due), (
+                f"a {job.runs_on}/{job.workspace_kind} job is decidable by "
+                f"{'both' if armed_remotely else 'neither'} — armed_remotely="
+                f"{armed_remotely}, locally_due={job.id in locally_due}"
+            )
+
+
+def test_an_auto_job_that_prefers_the_cloud_still_runs_on_this_machine():
+    """A gap, pinned so it is a decision rather than a surprise.
+
+    `placement()` resolves `auto` + a detached workspace to `"cloud"` — that is
+    what the user asked for, and the ceiling and the badge both read it. But
+    nothing uploads an `auto` job, because `_arm` and `cron push` upload only an
+    explicit `runs_on == "cloud"`. So the server never hears about it and this
+    machine runs it.
+
+    That is *safe* — exactly one thing decides it is due, which is the invariant
+    that matters — and it is *wrong*, because the job says one place and runs in
+    another. Closing it is D15: the cloud arms everything and the laptop becomes
+    a pure executor. That change makes arming require the network, so it is its
+    own piece of work rather than a line added here.
+
+    This test exists so that whoever does it deletes an assertion on purpose
+    instead of discovering the behaviour by accident.
+    """
+    import tempfile
+    import time
+    from pathlib import Path
+
+    from andromeda_agent.schedule import Schedule
+
+    with tempfile.TemporaryDirectory() as tmp:
+        schedule = Schedule(Path(tmp) / "cron.json")
+        job = schedule.add("every 1m", "x", "/tmp", runs_on="auto",
+                           workspace_kind="detached")
+        job.next_run_at = time.time() - 1
+
+        assert job.placement() == "cloud"
+        assert job.runs_on != "cloud"          # so nothing uploads it
+        assert job in schedule.due()            # so this machine runs it

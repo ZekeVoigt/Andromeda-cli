@@ -163,8 +163,14 @@ def _home_for(user_id: str) -> Path:
     # holding a container open between fires and a bill to pay for it.
     scaledown_window=60,
 )
-def run_fire(user_id: str, job_id: str, fire_at: str) -> dict:
-    """One fire, start to finish. Called by `fire()` after it has answered."""
+def run_fire(user_id: str, job_id: str, fire_at: str, event: dict | None = None) -> dict:
+    """One fire, start to finish. Called by `fire()` after it has answered.
+
+    `event` is what happened, for a fire that means "something happened, here is
+    what" rather than "it is time". It arrives already verified — the signature
+    covers it — and is carried into the job's prompt, never into any of the
+    refusals above it (`I-TRIGGER-2`).
+    """
     import sys
 
     sys.path.insert(0, "/opt/andromeda")
@@ -255,10 +261,21 @@ def run_fire(user_id: str, job_id: str, fire_at: str) -> dict:
     # name gives them the file back and takes away the revocation.
     try:
         values, unopenable = cloud_client.resolve_secrets(base, token, device)
+        # Before the export loop, so the two reserved MCP names are consumed
+        # rather than exported: an OAuth access token does not belong in the
+        # process environment of a job that never asked for one.
+        #
+        # Written to the container's own disk, never the shared volume — the
+        # same rule as everything else here.
+        from andromeda_agent import mcp_cloud
+
+        try:
+            mcp_cloud.materialise(values, Path("/tmp/andromeda-mcp") / job_id)
+        except Exception as exc:  # noqa: BLE001 - a job with no MCP still runs
+            print(f"[andromeda] MCP setup failed, continuing without it: {exc}")
+
         for name, value in values.items():
             os.environ[name] = value
-            # Registered with the redactor the moment it exists, before any
-            # tool output or transcript could carry it back out.
             from andromeda_agent import redact
 
             redact.register_known(value, f"secret:{name}")
@@ -310,7 +327,9 @@ def run_fire(user_id: str, job_id: str, fire_at: str) -> dict:
         # Calling the inner one directly skipped all of it and, because the two
         # signatures differ, failed with `execute() got multiple values for
         # argument 'schedule'` at the first real fire.
-        run = cron_cmd.execute(job, config_module.load(), schedule=schedule, source="fire")
+        run = cron_cmd.execute(
+            job, config_module.load(), schedule=schedule, source="fire", event=event
+        )
         ok = run.status != "failed"
         try:
             cloud_client.report_run(base, token, device, job_id, fire_at, run)
@@ -361,12 +380,20 @@ def run_fire(user_id: str, job_id: str, fire_at: str) -> dict:
                 ok = False
                 run.error = f"{run.error} · {exc}".strip(" ·")
 
+        # Re-arm from what the job now says. `cron_cmd.execute` recorded the
+        # run, which is what advanced `next_run_at` past the fire this
+        # container just consumed — and pushing an *unadvanced* time is not a
+        # missed re-arm but a loop: the server arms a one-shot for a moment
+        # already gone, fires the identical `fireAt`, the claim comes back
+        # `settled`, and the fire is answered `202 duplicate` for ever.
         current = schedule.resolve(job_id)
         if current is not None and current.next_run_at:
             try:
                 cloud_client.push_job(base, token, device, current)
-            except cloud_client.CloudUnavailable:
-                pass
+            except cloud_client.CloudUnavailable as exc:
+                # Printed, because this is the failure that silently retires a
+                # job: one unreported cadence and nothing wakes it again.
+                print(f"[andromeda] {job_id} ran but could not re-arm: {exc}")
     finally:
         # Settle first, then persist. A settled fire with unwritten state is a
         # job that repeats work; an unsettled fire with written state is a job
@@ -447,7 +474,7 @@ def fire():
     async def handle(request: Request) -> Response:  # noqa: D401
         from andromeda_agent import cloud_client
         from andromeda_agent.fires import Outcome, RemoteFires
-        from andromeda_agent.serve import FireError, verify_hmac
+        from andromeda_agent.serve import EVENT_FIELD, FireError, verify_hmac
 
         try:
             payload = await request.json()
@@ -505,7 +532,13 @@ def fire():
 
         # `.aio`, because this handler is async. The blocking form works and
         # warns, and a warning on every fire is a warning nobody reads.
-        await run_fire.spawn.aio(user_id, job_id, fire_at)
+        #
+        # The event is read from the body only after `verify_hmac` returned:
+        # the signature covers it, so until then it is not an event, it is
+        # bytes somebody sent.
+        await run_fire.spawn.aio(
+            user_id, job_id, fire_at, payload.get(EVENT_FIELD)
+        )
         return answer(202, {"status": "accepted", "job_id": job_id})
 
     return web

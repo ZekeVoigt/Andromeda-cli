@@ -1,0 +1,26 @@
+manifest_version: 1
+name: github
+description: Repositories, issues, pull requests, and Actions from GitHub.
+source: https://github.com/github/github-mcp-server
+# GitHub publishes OAuth resource metadata, but its authorization server
+# (github.com/login/oauth) exposes NO `registration_endpoint` — verified
+# 2026-08-27 through this client's own discovery path. Without dynamic client
+# registration a third-party client cannot mint credentials, so a personal
+# access token is the route that actually works.
+transport:
+  type: http
+  url: https://api.githubcopilot.com/mcp/
+auth:
+  type: header
+  env:
+    - name: GITHUB_MCP_PAT
+      prompt: "GitHub personal access token (fine-grained, with the repo scopes you want)"
+      secret: true
+      header: Authorization
+      prefix: "Bearer "
+suggest:
+  keywords: [github, repo, pull request, issue]
+  hosts: [github.com]
+post_install: |
+  Create one at https://github.com/settings/personal-access-tokens
+  Grant only the repositories and scopes this should reach.

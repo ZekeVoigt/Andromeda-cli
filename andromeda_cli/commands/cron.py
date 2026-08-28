@@ -27,12 +27,14 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from andromeda_agent import Callbacks, build_provider
 from andromeda_agent import runner as runner_module
 from andromeda_agent import blueprints as blueprints_module
 from andromeda_agent import cloud as cloud_module
 from andromeda_agent import cloud_client
+from andromeda_agent import live
 from andromeda_agent import providers_cron
 from andromeda_agent import seeding as seeding_module
 from andromeda_agent import pause as pause_module
@@ -266,7 +268,13 @@ def add(
             thinking=thinking,
             enabled_tools=[name.strip() for name in tools.split(",") if name.strip()],
             skills=skills or [],
-            attach_to=attach_to,
+            # A job's runs land in a transcript of the job's own. `--attach`
+            # still overrides it, because somebody who names a session has said
+            # what they want — but the default is no longer "whatever
+            # conversation happened to create this", which turned a five-minute
+            # poll into a message pair landing in a live chat every five
+            # minutes.
+            attach_to=attach_to or sessions_store.for_job(name or "job", root).id,
             runs_on=runs_on,
             workspace_kind=workspace_kind,
             repo_url=repo_url,
@@ -335,7 +343,10 @@ def _describe_new(job: Job) -> None:
         ]
         output.info(f"  its own   {' · '.join(overrides)}")
     if job.attach_to:
-        output.info(f"  attaches  each run to session {job.attach_to}")
+        output.info(f"  runs land in session {job.attach_to}")
+        output.info(f"            andromeda --resume {job.attach_to}")
+    if job.created_in:
+        output.info(f"  created in session {job.created_in}")
 
     if job.deliver == "none":
         output.info("  tells you nothing — read it with `andromeda cron logs`")
@@ -398,7 +409,18 @@ def _describe_new(job: Job) -> None:
         # the arming shipped.
         pass
     elif heartbeat_age(_heartbeat_path()) is None:
-        output.info("  andromeda cron install       # nothing is running jobs yet")
+        # Arm it rather than advising it. A job created here is a request for a
+        # scheduler, and the version of this line that printed a command left
+        # people with jobs that looked scheduled and never fired.
+        try:
+            from . import service as service_module
+
+            if service_module.ensure_installed():
+                output.info("  started the background scheduler")
+            elif not service_module.is_installed():
+                output.info("  andromeda cron daemon        # to run it in this terminal")
+        except Exception:  # noqa: BLE001 - the job is good either way
+            pass
 
 
 def _report_store(schedule) -> None:
@@ -766,7 +788,7 @@ def notepad(identifier: str, action: str, key: str = "", value: str = "") -> int
 # ---------------------------------------------------------------------------
 
 
-def _build_for(notepad_store: Notepad):
+def _build_for(notepad_store: Notepad, journal: "live.Writer | None" = None):
     """The thing `runner.execute` calls to get one answer.
 
     A thin wrapper rather than `build_conversation` itself: the runner's
@@ -774,6 +796,12 @@ def _build_for(notepad_store: Notepad):
     `andromeda_agent` from importing the CLI's session assembly. The notepad
     and the job id go straight through — a scheduled run is a session with one
     extra tool bound to it, not a different kind of thing.
+
+    The `Callbacks()` this used to pass were empty, and that emptiness was the
+    whole bug behind "it just sends me a notification and nothing else": a
+    scheduled run is a full agent turn and every event it produced was dropped
+    on the floor because the process running it had no screen. They are now
+    wired to the run's journal, which any surface can tail.
     """
 
     def build(settings: dict, workspace: str, job: Job):
@@ -788,9 +816,26 @@ def _build_for(notepad_store: Notepad):
             surface="cron",
         )
 
+        callbacks = Callbacks()
+        if journal is not None:
+            callbacks = Callbacks(
+                on_text=journal.text,
+                on_tool_start=lambda spec, args: journal.tool(
+                    spec.summary(args), spec.risk_tier
+                ),
+                on_tool_result=lambda spec, result: journal.tool_result(
+                    (result.display or "").splitlines()[0] if result.display else "",
+                    result.ok,
+                ),
+                on_tool_denied=lambda spec, reason: journal.note(
+                    f"declined {spec.name} — {reason}"
+                ),
+                on_retry=journal.note,
+            )
+
         class _Turn:
             def send(self, prompt: str) -> str:
-                return conversation.send(prompt, Callbacks())
+                return conversation.send(prompt, callbacks)
 
         return _Turn()
 
@@ -798,35 +843,121 @@ def _build_for(notepad_store: Notepad):
 
 
 def execute(
-    job: Job, config: dict, schedule: Schedule | None = None, source: str = "manual"
+    job: Job,
+    config: dict,
+    schedule: Schedule | None = None,
+    source: str = "manual",
+    event: Any = None,
 ) -> Run:
-    """One run, bracketed by a durable ledger entry.
+    """One run, bracketed by a durable ledger entry, and always on cadence after.
 
     The ledger row is written *before* anything with a side effect and closed
     after, so a scheduler killed mid-job leaves a row that says so. Without it,
     "never ran" and "ran, did the thing, died before recording it" are the same
     empty history — and guessing between them is how a job gets done twice.
+
+    **`schedule.record` happens here, on every path out.** It used to be the
+    caller's job, and two of the four callers did not do it — both of them the
+    hosted ones. The consequence was not a missing history entry: `record` is
+    what calls `schedule_next`, so a hosted run left `next_run_at` pointing at
+    the fire that had just happened. The runner then re-armed the server with
+    that same past time, the server fired the same `fireAt` again at once, the
+    runner's claim said `settled`, and the fire was answered `202 duplicate` —
+    which the server counted as a delivery. A job in that state fires forever,
+    runs once, and reports nothing, until the daily fire cap pauses it. The
+    comment in `cron serve` already asserted "execute advanced the job"; this
+    makes that true rather than aspirational.
+
+    The `raise` path records a failed run for the same reason it closes the
+    ledger: a job whose execution *throws* must still move off the fire it just
+    consumed, or it re-fires the identical `fireAt` for ever. Recording it as a
+    failure is also what lets the consecutive-failure pause eventually stop a
+    job that throws every time, instead of it looping silently.
     """
     schedule = schedule or _schedule()
     pad = _notepad()
     ledger = _ledger()
+    home = config_module.home()
     attempt = ledger.claim(job.id, source=source)
     ledger.running(attempt)
+    # Opened before the work and closed on every path out, including the one
+    # through `raise`. A journal that only records runs which finished tidily
+    # is exactly no use for the runs anybody needs to look at.
+    journal = live.Writer(
+        home,
+        job_id=job.id,
+        job_name=job.name,
+        session=job.attach_to,
+        where="cloud" if job.runs_on == "cloud" else "local",
+    )
+    journal.started(reason=source)
     try:
         run = runner_module.execute(
             job,
             schedule,
             config,
-            config_module.home(),
-            build=_build_for(pad),
+            home,
+            build=_build_for(pad, journal),
             notepad=pad,
+            event=event,
         )
     except BaseException as exc:  # noqa: BLE001 - the ledger must close either way
+        journal.finished("failed", error=f"{type(exc).__name__}: {exc}")
         ledger.finish(attempt, ok=False, error=f"{type(exc).__name__}: {exc}")
+        now = time.time()
+        schedule.record(
+            job,
+            Run(
+                started_at=now,
+                finished_at=now,
+                ok=False,
+                status="failed",
+                error=f"{type(exc).__name__}: {exc}",
+            ),
+            advance=event is None,
+        )
         raise
+    journal.finished(run.status, summary=run.summary or "", error=run.error or "")
     ledger.finish(attempt, ok=run.status != "failed", error=run.error)
+    # Before `_attach`, and before the caller can read `next_run_at`: this is
+    # the line that moves the job off the fire it just consumed.
+    #
+    # An event run is recorded in full and does **not** move the clock — see
+    # `Schedule.record`. It never consumed a scheduled fire, so there is nothing
+    # to move it off.
+    schedule.record(job, run, advance=event is None)
     _attach(job, run)
     return run
+
+
+def _append_to_session(session_id: str, job_name: str, body: str, where: str = "") -> bool:
+    """Put one run into one transcript. The single writer for both locations.
+
+    Local and cloud runs land here through different routes — a local run
+    writes on the machine that produced it, a cloud run is folded in when its
+    summary reaches home — and the transcript they produce has to be identical.
+    Two formatters would drift, and the drift would show up as a session where
+    half the entries read one way and half the other.
+
+    Best-effort: a missing or unreadable session is never a failed job.
+    """
+    if not session_id:
+        return False
+    try:
+        record = sessions_store.resolve(session_id)
+        if record is None:
+            return False
+        marker = f"[scheduled job {job_name} ran"
+        marker += f" · {where}]" if where else "]"
+        record.messages = [
+            *record.messages,
+            {"role": "user", "content": marker},
+            {"role": "assistant", "content": body or "(no output)"},
+        ]
+        record.save()
+        return True
+    except Exception:  # noqa: BLE001 - never fail a run over its transcript copy
+        return False
 
 
 def _attach(job: Job, run: Run) -> None:
@@ -834,23 +965,100 @@ def _attach(job: Job, run: Run) -> None:
 
     So a scheduled follow-up shows up in `andromeda --resume` next to the
     conversation that asked for it, rather than only in a directory somebody
-    has to remember exists. Best-effort: a missing session is not a failed job.
+    has to remember exists.
+
+    A cloud job does **not** attach from here even though this code also runs
+    on the container: the container's session directory is its own, so writing
+    there would put the run in a transcript nobody can reach and mark the work
+    done. `_fold_cloud_runs` does it at home instead, off the reported summary.
     """
-    if not job.attach_to or run.status in {"no_change", "silent"}:
+    if run.status in {"no_change", "silent"}:
         return
+    if job.runs_on == "cloud":
+        return
+    body = run.summary if run.status != "failed" else run.error
+    _append_to_session(job.attach_to, job.name, body or "")
+
+
+def _folded_path() -> Path:
+    """Which cloud runs have already been folded into a transcript.
+
+    Kept locally rather than read off the server's `acknowledgedAt`, because
+    the question is "has *this machine* written it into *its* session file",
+    and that is not a fact the server can hold. Two laptops on one account both
+    want the run in their own copy of the transcript.
+    """
+    return schedule_path().parent / "cloud-attached.json"
+
+
+#: How many fold markers to keep. Well past any sane backlog, and bounded so a
+#: file nothing ever prunes cannot grow for the life of the install.
+MAX_FOLDED = 500
+
+
+def _fold_cloud_runs(rows: list[dict]) -> int:
+    """Append finished cloud runs into the sessions that created them.
+
+    The other half of `_attach`, for work that happened somewhere else. Called
+    wherever cloud runs are read, so opening a terminal is enough to bring the
+    night's runs into the conversations that asked for them.
+
+    Keyed on job id **and** fire time: a job id alone would fold only the first
+    run of a repeating job, and a summary alone would drop two genuinely
+    identical reports from a watcher that found the same thing twice.
+
+    Returns how many were folded. Best-effort throughout — this runs on the
+    launch path, and a broken marker file must cost a re-append at worst, never
+    a failed start.
+    """
+    import json
+
+    if not rows:
+        return 0
     try:
-        record = sessions_store.resolve(job.attach_to)
-        if record is None:
-            return
-        body = run.summary if run.status != "failed" else run.error
-        record.messages = [
-            *record.messages,
-            {"role": "user", "content": f"[scheduled job {job.name} ran]"},
-            {"role": "assistant", "content": body or "(no output)"},
-        ]
-        record.save()
-    except Exception:  # noqa: BLE001 - never fail a run over its transcript copy
-        pass
+        schedule = _schedule()
+    except Exception:  # noqa: BLE001 - an unreadable store folds nothing
+        return 0
+
+    path = _folded_path()
+    try:
+        seen = set(json.loads(path.read_text(encoding="utf-8")))
+    except Exception:  # noqa: BLE001 - a missing or corrupt marker file is empty
+        seen = set()
+
+    folded = 0
+    fresh: list[str] = []
+    for row in rows:
+        job_id = str(row.get("jobId") or "")
+        key = f"{job_id}:{row.get('fireAt') or ''}"
+        if not job_id or key in seen:
+            continue
+        # `fired` is still running and has nothing to report; the quiet
+        # statuses deliberately say nothing, exactly as a local run does.
+        if str(row.get("status")) not in {"ok", "failed"}:
+            continue
+        # Marked before the write is attempted, not after. A session that
+        # cannot be written — deleted, pruned, on another machine — would
+        # otherwise be retried on every launch forever.
+        fresh.append(key)
+        job = schedule.resolve(job_id)
+        if job is None or not job.attach_to:
+            continue
+        body = str(row.get("summary") or row.get("error") or "")
+        if _append_to_session(job.attach_to, job.name, body, where="cloud"):
+            folded += 1
+
+    if fresh:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(sorted(seen | set(fresh))[-MAX_FOLDED:]), encoding="utf-8"
+            )
+        except OSError:
+            # Losing the marker file means a re-append next launch, which is
+            # visible and harmless. Failing the caller is neither.
+            pass
+    return folded
 
 
 def run_now(identifier: str) -> int:
@@ -863,8 +1071,9 @@ def run_now(identifier: str) -> int:
     output.info(f"Running {job.id} — {job.name}")
     settings = config_module.load()
     shell_hooks.register_from_config(settings)
+    # `execute` records it. Recording again here would double-count the run
+    # against `repeat` and advance the cadence twice.
     run = execute(job, settings, schedule, source="manual")
-    schedule.record(job, run)
 
     took = int(run.finished_at - run.started_at)
     if run.status == "no_change":
@@ -1118,7 +1327,7 @@ def suggest_dismiss(reference: str) -> int:
 
 def blueprint_list() -> int:
     by_category: dict[str, list] = {}
-    for blueprint in blueprints_module.CATALOG:
+    for blueprint in blueprints_module.all_blueprints():
         by_category.setdefault(blueprint.category, []).append(blueprint)
 
     for category, entries in sorted(by_category.items()):
@@ -1256,14 +1465,18 @@ def serve(host: str = "0.0.0.0", port: int = 8080) -> int:
     pad = _notepad()
     fires_store = _fires()
 
-    def run_one(job: Job, fire_at: str) -> None:
+    def run_one(job: Job, fire_at: str, event: Any = None) -> None:
         # Straight through `execute`, which is the same path `cron run` and the
         # local daemon take: the ledger row, the hooks, the delivery and the
         # output file all come from there. A second execution path for hosted
         # jobs would be a second set of bugs.
-        run = execute(job, config, schedule=schedule, source="fire")
-        # Re-read: `execute` advanced the job, and the next fire is armed from
-        # what it left behind.
+        run = execute(
+            job, config, schedule=schedule, source="fire", event=event
+        )
+        # Re-read: `execute` recorded the run, which advanced the job, and the
+        # next fire is armed from what it left behind. Pushing an *unadvanced*
+        # time is not a missed re-arm but a loop — the server arms a one-shot
+        # for a moment already gone and fires the identical `fireAt` for ever.
         schedule.load()
 
         base, token, device = _cloud_endpoint()
@@ -1441,6 +1654,8 @@ def runs(limit: int = 20) -> int:
         output.info("  no cloud runs yet.")
         return 0
 
+    folded = _fold_cloud_runs(rows)
+
     marks = {
         "ok": "[green]ok[/green]",
         "failed": "[red]failed[/red]",
@@ -1448,6 +1663,10 @@ def runs(limit: int = 20) -> int:
         "silent": "[dim]quiet[/dim]",
         "fired": "[cyan]running[/cyan]",
         "undelivered": "[yellow]not delivered[/yellow]",
+        # Not "running" and not a failure: this moment had already been run, so
+        # nothing happened and nothing is coming. Shown rather than hidden,
+        # because a job producing these is a job whose cadence needs a look.
+        "duplicate": "[dim]already run[/dim]",
     }
     for row in rows:
         status = str(row.get("status", ""))
@@ -1461,6 +1680,12 @@ def runs(limit: int = 20) -> int:
         if body:
             output.console.print(f"       [dim]{body.splitlines()[0][:160]}[/dim]")
 
+    if folded:
+        plural = "" if folded == 1 else "s"
+        output.info(
+            f"\n  {folded} run{plural} added to the session that created "
+            f"{'it' if folded == 1 else 'them'} — `andromeda --resume`"
+        )
     # Named because the volume is unreachable and the person has no other way in.
     output.info("\n  full output: `andromeda cron logs <job>` on the runner")
     return 0
@@ -1480,6 +1705,10 @@ def unseen_cloud_runs(limit: int = 20) -> int:
         rows = cloud_client.recent_runs(base, token, device, limit)
     except Exception:  # noqa: BLE001 - a greeting is never worth an error
         return 0
+    try:
+        _fold_cloud_runs(rows)
+    except Exception:  # noqa: BLE001 - same rule: a greeting never raises
+        pass
     return sum(
         1
         for row in rows

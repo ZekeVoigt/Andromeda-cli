@@ -1,0 +1,15 @@
+manifest_version: 1
+name: sanity
+description: Documents, datasets, and schemas from your Sanity projects.
+source: https://www.sanity.io/docs
+transport:
+  type: http
+  url: https://mcp.sanity.io/mcp
+auth:
+  type: oauth
+suggest:
+  keywords: [sanity, cms, dataset]
+  hosts: [sanity.io]
+post_install: |
+  Run `andromeda mcp login sanity` to authorize in a browser,
+  then start a new session so the tools load.

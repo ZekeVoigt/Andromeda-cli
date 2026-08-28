@@ -58,10 +58,15 @@ def runner(fires):
     actually ran.
     """
     ran: list[tuple[str, str]] = []
+    # What each run was handed as "why you are awake". Kept beside `ran` rather
+    # than widened into it, so every existing assertion about `ran` keeps
+    # meaning exactly what it meant.
+    events: list = []
     done = threading.Event()
 
-    def execute(job, fire_at: str) -> None:
+    def execute(job, fire_at: str, event=None) -> None:
         ran.append((job.id, fire_at))
+        events.append(event)
         done.set()
 
     built = serve_module.Runner(
@@ -71,6 +76,7 @@ def runner(fires):
         max_concurrent=2,
     )
     built.ran = ran  # type: ignore[attr-defined]
+    built.events = events  # type: ignore[attr-defined]
     built.done = done  # type: ignore[attr-defined]
     return built
 
@@ -358,7 +364,7 @@ def test_unknown_fires_are_listed_and_never_pruned(fires):
 def test_a_job_that_raises_still_settles(fires):
     """An unsettled fire is indistinguishable from a machine that died, and
     would be reported as unknown forever."""
-    def explode(job, fire_at):
+    def explode(job, fire_at, event=None):
         raise RuntimeError("the job failed")
 
     runner = serve_module.Runner(
@@ -386,7 +392,7 @@ def test_the_response_arrives_before_the_work_finishes(fires):
     started = threading.Event()
     release = threading.Event()
 
-    def slow(job, fire_at):
+    def slow(job, fire_at, event=None):
         started.set()
         release.wait(5)
 
@@ -416,7 +422,7 @@ def test_over_capacity_is_503_and_retryable(fires):
     accepted fire that waits behind three others has consumed its one claim."""
     release = threading.Event()
 
-    def slow(job, fire_at):
+    def slow(job, fire_at, event=None):
         release.wait(5)
 
     runner = serve_module.Runner(
@@ -475,7 +481,7 @@ def test_the_verifier_is_a_seam(monkeypatch):
 def test_a_draining_runner_refuses_new_fires_but_stays_up(fires):
     release = threading.Event()
 
-    def slow(job, fire_at):
+    def slow(job, fire_at, event=None):
         release.wait(5)
 
     runner = serve_module.Runner(
@@ -498,7 +504,7 @@ def test_a_drain_waits_for_a_running_job_and_it_settles(fires):
     release = threading.Event()
     finished = threading.Event()
 
-    def slow(job, fire_at):
+    def slow(job, fire_at, event=None):
         release.wait(5)
         finished.set()
 
@@ -526,7 +532,7 @@ def test_a_drain_that_times_out_reports_what_it_stranded(fires):
     to connect them to the deploy that caused them."""
     release = threading.Event()
 
-    def slow(job, fire_at):
+    def slow(job, fire_at, event=None):
         release.wait(10)
 
     runner = serve_module.Runner(
@@ -575,7 +581,7 @@ def test_the_kill_switch_applies_before_the_job_is_even_resolved(fires, monkeypa
         raise AssertionError("the switch must be checked before resolving")
 
     runner = serve_module.Runner(
-        fires=fires, resolve=explode, execute=lambda job, fire_at: None
+        fires=fires, resolve=explode, execute=lambda job, fire_at, event=None: None
     )
     with pytest.raises(serve_module.FireError) as caught:
         runner.accept("job_1", "t1")
@@ -713,7 +719,7 @@ def test_an_unreachable_claim_server_is_a_503_and_never_a_run(fires):
     runner = serve_module.Runner(
         fires=RemoteFires(_FakeClaims(explode=True), "alice"),
         resolve=lambda job_id: _Job(job_id),
-        execute=lambda job, fire_at: ran.append(job.id),
+        execute=lambda job, fire_at, event=None: ran.append(job.id),
     )
     with pytest.raises(serve_module.FireError) as caught:
         runner.accept("job_1", "t1")
@@ -848,3 +854,141 @@ def test_an_ed25519_runner_wants_a_public_key_not_a_long_secret(monkeypatch):
 
 def test_both_schemes_are_reachable_through_the_one_seam():
     assert set(serve_module.VERIFIERS) == {"hmac", "ed25519"}
+
+
+# ---------------------------------------------------------------------------
+# 6. "Something happened, here is what" — the door widened (O1)
+#
+# A fire used to mean exactly one thing: it is time. These are the tests that
+# make it mean two things without making it mean two doors. `I-TRIGGER-1` says
+# every wake enters through the same authenticated route with the same lease
+# and the same at-most-once claim, so the event travels *inside* the fire that
+# was already hardened rather than beside it.
+# ---------------------------------------------------------------------------
+
+
+def test_a_time_fire_is_byte_identical_to_what_it_always_was():
+    """The rollout property, and the reason the event is not simply appended.
+
+    Convex and Modal deploy separately, so there is always a window where one
+    end is new and the other is old. A payload mismatch fails closed *silently*
+    — a machine that 401s every fire while looking healthy — so a fire carrying
+    no event must sign the same four-field string it has always signed, with no
+    trailing separator.
+    """
+    assert serve_module._payload("u", "j", "t", 5) == b"u|j|t|5"
+    assert serve_module._payload("u", "j", "t", 5, None) == b"u|j|t|5"
+    assert set(serve_module.mint(SECRET, "j", "t", user_id="u")) == {
+        "user_id", "job_id", "fire_at", "exp", "token",
+    }
+
+
+def test_an_event_fire_signs_the_event_too():
+    """Otherwise the one field that tells the agent what happened in the world
+    is the one field anybody holding a valid fire can rewrite."""
+    event = {"family": "messaging", "kind": "arrived"}
+    assert serve_module._payload("u", "j", "t", 5, event) != b"u|j|t|5"
+    assert serve_module._payload("u", "j", "t", 5, event).startswith(b"u|j|t|5|")
+
+
+def test_the_canonical_encoding_does_not_depend_on_key_order():
+    """Two ends that encode the same object differently produce different
+    digests and therefore a 401 that reads as a bad secret."""
+    assert serve_module.event_digest({"b": 2, "a": 1}) == serve_module.event_digest(
+        {"a": 1, "b": 2}
+    )
+    assert serve_module.event_digest(None) == ""
+
+
+def test_non_ascii_survives_the_canonical_encoding():
+    """`ensure_ascii=False` is load-bearing: Python escapes non-ASCII by default
+    and `JSON.stringify` does not, so one accented character would otherwise
+    break every signature between the two implementations."""
+    assert "\u00e9" in serve_module.canonical_event({"who": "ren\u00e9e"})
+
+
+def test_an_event_reaches_the_job(server, runner):
+    event = {"family": "messaging", "kind": "arrived", "where": {"id": "abc"}}
+    body = serve_module.mint(SECRET, "job_1", "2026-08-25T02:00:00+00:00", event=event)
+    assert _post(server, body, body["token"])[0] == 202
+    assert runner.done.wait(5)
+    assert runner.events == [event]
+
+
+def test_a_time_fire_hands_the_job_no_event(server, runner):
+    """`None`, not an empty dict. "Nothing happened, it is simply time" and
+    "something happened and it was empty" are different claims, and a job that
+    cannot tell them apart will describe the wrong one."""
+    body = _signed()
+    assert _post(server, body, body["token"])[0] == 202
+    assert runner.done.wait(5)
+    assert runner.events == [None]
+
+
+def test_an_event_added_after_signing_is_refused(server, runner):
+    """The attack this exists to stop: take a valid fire, staple a different
+    event to it, and choose what the agent believes about the world."""
+    body = _signed()
+    body["event"] = {"family": "money", "kind": "arrived", "amount": 1000000}
+    status, answer = _post(server, body, body["token"])
+    assert status == 401
+    assert answer["error"] == "bad token"
+    assert runner.ran == []
+
+
+def test_an_event_swapped_for_another_is_refused(server, runner):
+    """Signed with one event, delivered with a different one."""
+    body = serve_module.mint(
+        SECRET, "job_1", "2026-08-25T02:00:00+00:00", event={"kind": "arrived"}
+    )
+    body["event"] = {"kind": "removed"}
+    assert _post(server, body, body["token"])[0] == 401
+    assert runner.ran == []
+
+
+def test_a_stripped_event_is_refused(server, runner):
+    """The other direction: signed WITH an event, delivered without one. It must
+    not silently degrade into a valid time fire."""
+    body = serve_module.mint(
+        SECRET, "job_1", "2026-08-25T02:00:00+00:00", event={"kind": "arrived"}
+    )
+    del body["event"]
+    assert _post(server, body, body["token"])[0] == 401
+    assert runner.ran == []
+
+
+def test_an_oversized_event_is_refused_before_it_is_hashed(server, runner):
+    """The bound applies to what an *unauthorised* caller can make this process
+    do, not only to what a valid one sends — the digest runs on
+    attacker-influenced bytes."""
+    body = _signed()
+    body["event"] = {"blob": "x" * (serve_module.MAX_EVENT_BYTES + 100)}
+    status, answer = _post(server, body, body["token"])
+    assert status == 400
+    assert "larger than" in answer["error"]
+    assert runner.ran == []
+
+
+def test_a_redelivered_event_fire_is_a_duplicate_and_runs_once(server, runner):
+    """The lease does not care which kind of fire it is. `I-TRIGGER-1`: same
+    door, same at-most-once claim."""
+    event = {"family": "code", "kind": "changed"}
+    body = serve_module.mint(SECRET, "job_1", "2026-08-25T02:00:00+00:00", event=event)
+    assert _post(server, body, body["token"]) == (
+        202, {"status": "accepted", "job_id": "job_1"}
+    )
+    assert runner.done.wait(5)
+    assert _post(server, body, body["token"]) == (
+        202, {"status": "duplicate", "job_id": "job_1"}
+    )
+    assert runner.ran == [("job_1", "2026-08-25T02:00:00+00:00")]
+
+
+def test_an_event_cannot_wake_a_job_a_time_fire_could_not(server, runner):
+    """`I-TRIGGER-2` — a trigger cannot widen a permission. Structural here: the
+    event is carried, never consulted, so every refusal is unchanged by it."""
+    event = {"family": "messaging", "kind": "arrived"}
+    missing = serve_module.mint(SECRET, "nope_1", "2026-08-25T03:00:00+00:00", event=event)
+    assert _post(server, missing, missing["token"])[0] == 404
+    real = serve_module.mint(SECRET, "job_1", "2026-08-25T04:00:00+00:00", event=event)
+    assert _post(server, real, real["token"])[0] == 202

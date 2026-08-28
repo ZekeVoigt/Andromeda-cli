@@ -159,7 +159,7 @@ def _verifier_admits(tool: ToolSpec) -> bool:
     return is_read_only(tool) and not tool.name.startswith("memory_store")
 
 
-SPECIALISTS: dict[str, Specialist] = {
+BUILTIN_SPECIALISTS: dict[str, Specialist] = {
     "scout": Specialist(
         id="scout",
         label="Scout",
@@ -218,8 +218,68 @@ SPECIALISTS: dict[str, Specialist] = {
     ),
 }
 
-SPECIALIST_IDS = tuple(SPECIALISTS)
+def specialist_ids() -> tuple[str, ...]:
+    """Every belt id, built-in and plugin.
+
+    A function rather than the constant it used to be: a plugin's belt arrives
+    after this module is imported, and a tuple frozen at import time would list
+    the built-ins forever.
+    """
+    return tuple(all_specialists())
 
 
 def resolve(specialist_id: str) -> Specialist | None:
-    return SPECIALISTS.get((specialist_id or "").strip().lower())
+    return all_specialists().get((specialist_id or "").strip().lower())
+
+
+def all_specialists() -> dict[str, Specialist]:
+    """Every belt, built-in first.
+
+    A plugin cannot shadow a built-in id. The belts are how a delegated child's
+    permissions are decided, so replacing `scout` would mean quietly widening
+    what every read-only lane in the install is allowed to touch.
+    """
+    combined = dict(BUILTIN_SPECIALISTS)
+    try:
+        from . import plugins as plugins_module
+
+        for identifier, specialist in plugins_module.specialists().items():
+            if identifier not in combined:
+                combined[identifier] = specialist
+    except Exception:  # noqa: BLE001 - delegation must not depend on plugins
+        pass
+    return combined
+
+
+class _SpecialistsProxy(dict):
+    """`SPECIALISTS` kept as a name, resolving through `all_specialists()`."""
+
+    def __getitem__(self, key):
+        return all_specialists()[key]
+
+    def get(self, key, default=None):
+        return all_specialists().get(key, default)
+
+    def __iter__(self):
+        return iter(all_specialists())
+
+    def __len__(self):
+        return len(all_specialists())
+
+    def __contains__(self, key):
+        return key in all_specialists()
+
+    def keys(self):
+        return all_specialists().keys()
+
+    def values(self):
+        return all_specialists().values()
+
+    def items(self):
+        return all_specialists().items()
+
+    def __repr__(self):
+        return repr(all_specialists())
+
+
+SPECIALISTS = _SpecialistsProxy()

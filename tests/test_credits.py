@@ -120,31 +120,90 @@ class TestTheDenominator:
 
 
 class TestFormatting:
-    def test_micros_become_dollars_only_at_the_edge(self):
-        assert credits.format_micros(7_500_000) == "$7.50"
-        assert credits.format_micros(0) == "$0.0000"
+    def test_micros_become_credits_only_at_the_edge(self):
+        # 7,500,000 micros is $7.50 on the wire and 7,500 credits on screen.
+        # The dollar figure never appears; see the module docstring.
+        assert credits.format_credits(7_500_000) == "7,500"
+        assert credits.format_credits(0) == "0.000"
 
-    def test_a_sub_cent_balance_does_not_render_as_empty(self):
-        # Rounding $0.0004 to "$0.00" reads as nothing left.
-        assert credits.format_micros(400) == "$0.0004"
+    def test_a_sub_credit_balance_does_not_render_as_empty(self):
+        # Rounding 0.4 of a credit to "0" reads as nothing left.
+        assert credits.format_credits(400) == "0.400"
 
     def test_unknown_formats_to_nothing(self):
-        assert credits.format_micros(None) == ""
+        assert credits.format_credits(None) == ""
 
     def test_a_negative_balance_keeps_its_sign(self):
-        assert credits.format_micros(-1_500_000) == "-$1.50"
+        assert credits.format_credits(-1_500_000) == "-1,500"
+
+    def test_no_surface_renders_a_currency(self):
+        """The commercial reason this module exists in this shape.
+
+        A plan's dollar ceiling is a fact about margin. Every figure a person
+        can see is in credits, and there is no code path back.
+        """
+        rendered = [
+            credits.format_credits(7_500_000),
+            credits.format_credits(400),
+            credits.format_credits(-1_500_000),
+            credits.summary(
+                credits.parse(headers())
+            ),
+        ]
+        for text in rendered:
+            assert "$" not in text
+        assert not hasattr(credits, "format_micros")
+
+    def test_the_credit_rate_matches_the_billing_catalogue(self):
+        """`USD_MICROS_PER_CREDIT` in `shared/billing/catalog.ts` is the
+        definition; `MICROS_PER_CREDIT` here is a copy, and a copy that drifts
+        would misprice every figure on the screen.
+        """
+        from pathlib import Path
+        import re
+
+        catalog = (
+            Path(__file__).resolve().parents[2]
+            / "shared"
+            / "billing"
+            / "catalog.ts"
+        )
+        if not catalog.exists():
+            pytest.skip("the web app is not in this checkout")
+        found = re.search(
+            r"USD_MICROS_PER_CREDIT\s*=\s*([0-9_]+)", catalog.read_text()
+        )
+        assert found is not None
+        assert int(found.group(1).replace("_", "")) == credits.MICROS_PER_CREDIT
 
 
 class TestSummary:
     def test_says_nothing_when_the_balance_is_unknown(self):
         # The BYOK lane never sets these headers: there is no account here to
-        # have a balance, and inventing "$0.00" would be a lie.
+        # have a balance, and inventing "0 credits" would be a lie.
         assert credits.summary(credits.Balance()) == ""
 
     def test_reads_as_a_status_line(self):
         line = credits.summary(credits.parse(headers()))
-        assert "$7.50" in line
-        assert "$10.00" in line
+        assert "7,500 of 10,000 credits" in line
+
+    def test_the_denominator_comes_from_the_server_not_from_here(self):
+        """What makes it adapt without a release.
+
+        The grant is whatever this window says it is. Nothing in the CLI knows
+        a plan's size, so an upgrade is visible on the very next reply and
+        there is no local cache to go stale — which is exactly how a status bar
+        ends up insisting on an old plan's ceiling.
+        """
+        small = credits.summary(
+            credits.Balance(remaining_micros=100_000, grant_micros=100_000)
+        )
+        large = credits.summary(
+            credits.Balance(remaining_micros=12_000_000, grant_micros=12_000_000)
+        )
+
+        assert "100 of 100 credits" in small
+        assert "12,000 of 12,000 credits" in large
 
     def test_depletion_is_said_out_loud(self):
         line = credits.summary(credits.parse(headers(access="depleted")))
@@ -244,44 +303,44 @@ class TestTheTwoSidesAgree:
 
 
 class TestPrecisionThatShowsMovement:
-    """A `$0.10` grant spent in fractions of a cent must not read as frozen.
+    """A small grant spent in fractions of a credit must not read as frozen.
 
     Reported from a live session: "$0.10 out of $0.10" while actively using it.
-    Both figures were being rounded to the cent independently, so a real
-    deduction of three hundredths of a cent was invisible in both.
+    Both figures were being rounded independently, so a real deduction was
+    invisible in both. The unit is credits now; the trap is identical.
     """
 
-    def test_equal_figures_stay_at_cents(self):
-        assert credits.format_pair(100_000, 100_000) == ("$0.10", "$0.10")
+    def test_equal_figures_stay_whole(self):
+        assert credits.format_pair(100_000, 100_000) == ("100", "100")
 
-    def test_places_are_added_only_when_cents_would_hide_the_difference(self):
-        assert credits.format_pair(99_700, 100_000) == ("$0.0997", "$0.1000")
+    def test_places_are_added_only_when_whole_credits_would_hide_it(self):
+        assert credits.format_pair(99_700, 100_000) == ("99.7", "100.0")
 
-    def test_a_difference_cents_can_express_stays_at_cents(self):
-        assert credits.format_pair(6_124_000, 10_000_000) == ("$6.12", "$10.00")
+    def test_a_difference_whole_credits_can_express_stays_whole(self):
+        assert credits.format_pair(6_124_000, 10_000_000) == ("6,124", "10,000")
 
     def test_precision_escalates_as_far_as_it_needs_to(self):
         left, right = credits.format_pair(99_999, 100_000)
 
         assert left != right
-        assert left == "$0.099999"
+        assert left == "99.999"
 
     def test_both_figures_are_rendered_at_one_precision(self):
-        """Two places on one and four on the other is unreadable as a ratio."""
+        """One place on one and three on the other is unreadable as a ratio."""
         left, right = credits.format_pair(99_700, 100_000)
 
         assert left.count(".") == right.count(".")
         assert len(left.split(".")[1]) == len(right.split(".")[1])
 
     def test_an_unknown_figure_does_not_force_a_precision(self):
-        assert credits.format_pair(None, 100_000) == ("", "$0.10")
+        assert credits.format_pair(None, 100_000) == ("", "100")
 
     def test_the_summary_uses_it(self):
         line = credits.summary(
             credits.Balance(remaining_micros=99_700, grant_micros=100_000)
         )
 
-        assert line.startswith("$0.0997 of $0.1000")
+        assert line.startswith("99.7 of 100.0 credits")
 
     def test_a_top_up_is_still_in_the_denominator(self):
         """The gauge is drawn against grant plus adjustment, at one precision."""
@@ -293,4 +352,4 @@ class TestPrecisionThatShowsMovement:
             )
         )
 
-        assert "$0.1497 of $0.1500" in line
+        assert "149.7 of 150.0 credits" in line

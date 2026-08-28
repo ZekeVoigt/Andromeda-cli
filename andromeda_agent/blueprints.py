@@ -249,11 +249,43 @@ CATALOG: list[Blueprint] = [
     ),
 ]
 
+def all_blueprints() -> list["Blueprint"]:
+    """The catalogue, built-in first, plugins appended.
+
+    Ungated on the plugin side: a blueprint is a *form*. Filling it in still
+    goes through `Schedule.add`, which refuses `approval_mode="auto"` from an
+    agent — so a plugin cannot use one to create a job more permissive than the
+    person creating it asked for.
+    """
+    combined = list(CATALOG)
+    known = {blueprint.key for blueprint in CATALOG}
+    try:
+        from . import plugins as plugins_module
+
+        for blueprint in plugins_module.blueprints():
+            key = getattr(blueprint, "key", "")
+            if key and key not in known:
+                combined.append(blueprint)
+                known.add(key)
+    except Exception:  # noqa: BLE001 - the catalogue must not depend on plugins
+        pass
+    return combined
+
+
 BY_KEY = {blueprint.key: blueprint for blueprint in CATALOG}
 
 
 def get(key: str) -> Blueprint | None:
-    return BY_KEY.get((key or "").strip().lower())
+    """One blueprint by key, built-in or plugin.
+
+    Normalisation is the caller's usual mistake, not theirs: `cron blueprint
+    use Morning-Brief` is what people type.
+    """
+    wanted = (key or "").strip().lower()
+    for blueprint in all_blueprints():
+        if blueprint.key == wanted:
+            return blueprint
+    return None
 
 
 # ---------------------------------------------------------------------------

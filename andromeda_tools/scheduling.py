@@ -66,14 +66,6 @@ CRON_DESCRIPTION = (
     "anyway and tell the user to run `andromeda cron approve <id> --approval "
     "auto` — granting a job the ability to change things unattended is their "
     "decision, not yours.\n\n"
-    "IF THE USER ASKS FOR IT TO RUN IN THE CLOUD — hosted, remote, or 'with my "
-    "laptop closed' — create it here anyway and then tell them, in your reply, "
-    "to run `andromeda cron approve <id> --run-on cloud`. You cannot put a job "
-    "on a hosted runner yourself and there is no parameter for it: that runner "
-    "spends their credit on a schedule with nobody watching, so moving a job "
-    "onto it is theirs to grant. Do not describe this as something you are "
-    "unable to help with — you make the job, they grant the location, and the "
-    "command is the whole of their half.\n\n"
     "Use this when the user asks for something recurring or for later. Do not "
     "use it to remember a fact (that is memory_store) or to do something now."
 )
@@ -159,7 +151,13 @@ def _describe(job) -> str:
     # Where it runs, so a report about "your scheduled jobs" cannot claim a
     # local job survives a closed laptop, or that a hosted one is stoppable
     # from here.
-    where = "a hosted runner" if job.runs_on == "cloud" else "this machine"
+    # An `auto` job has no single answer, so it reports where the next fire
+    # goes and says that it can move. Reporting the *declared* location would
+    # have said "this machine" for a job that has run in the cloud all week.
+    resolved = job.placement()
+    where = "a hosted runner" if resolved == "cloud" else "this machine"
+    if job.runs_on == "auto":
+        where += " (auto)"
     reach = "no filesystem" if job.workspace_kind == "detached" else job.workspace
     parts.append(f"  runs on {where} · reaches {reach}")
     last = job.last_run
@@ -168,7 +166,24 @@ def _describe(job) -> str:
     return "\n".join(parts)
 
 
-def cron_spec(schedule: Any, workspace_root: str) -> ToolSpec:
+def _job_session(name: str, workspace_root: str, created_in: str) -> str:
+    """A transcript of the job's own, or nothing.
+
+    Best-effort by construction. A session store that cannot be written to is
+    not a reason to refuse to create the job — it just means the runs are
+    reachable through `andromeda cron runs` rather than as a conversation.
+    Falling back to the *creating* session would be worse than falling back to
+    none: that is the interleaving this exists to stop.
+    """
+    try:
+        from andromeda_cli import sessions as sessions_store
+
+        return sessions_store.for_job(name, workspace_root, created_in).id
+    except Exception:  # noqa: BLE001 - never fail a job over its transcript
+        return ""
+
+
+def cron_spec(schedule: Any, workspace_root: str, session_id: str = "") -> ToolSpec:
     def run(
         action: str,
         prompt: str = "",
@@ -179,6 +194,7 @@ def cron_spec(schedule: Any, workspace_root: str) -> ToolSpec:
         watch: str = "",
         watch_url: str = "",
         deliver: str = "none",
+        needs_files: bool = False,
     ) -> ToolResult:
         from andromeda_agent.schedule import ScheduleError
 
@@ -237,22 +253,108 @@ def cron_spec(schedule: Any, workspace_root: str) -> ToolSpec:
                     monitor_source=watch or watch_url,
                     deliver=deliver if deliver in {"none", "notify", "stdout"} else "none",
                     origin="agent",
+                    # Not "where does this run" — the model has no way to know
+                    # that and it is not its call. The question it *can* answer
+                    # is whether the job has to see this machine's files, and
+                    # that is what decides placement at fire time.
+                    #
+                    # Most jobs do not: watching a deploy, checking an inbox,
+                    # polling an API. Those get a detached workspace and run in
+                    # the cloud, which is the point — a watcher earns its keep
+                    # on the nights the lid is shut.
+                    workspace_kind="device" if needs_files else "detached",
+                    runs_on="auto",
+                    # The job's OWN transcript, created here, not the
+                    # conversation that asked for it. Attaching to the caller
+                    # read well in the design and badly in use: a job polling
+                    # every five minutes wrote a pair of messages into a *live*
+                    # conversation every five minutes, interleaved with what
+                    # the person was actually saying.
+                    #
+                    # Neither is a parameter. The model does not choose which
+                    # conversation it is having, and a session id it could set
+                    # would be a way to write into somebody else's transcript.
+                    #
+                    # This does NOT make the job read either session. The
+                    # prompt stays self-contained — a job that re-read its
+                    # whole thread would grow its own cost on every run, and
+                    # would break the day the session was pruned.
+                    attach_to=_job_session(name or "job", workspace_root, session_id),
+                    created_in=session_id,
                 )
             except ScheduleError as exc:
                 return failure(str(exc))
+            # The scheduler arms itself here rather than being homework.
+            # Creating a job *is* the request for one, and a job that looks
+            # scheduled but silently never fires is the worst outcome
+            # available — the person finds out days later by noticing they
+            # were never told anything.
+            armed = False
+            running = False
+            try:
+                from andromeda_cli.commands import service as service_module
+
+                armed = service_module.ensure_installed()
+                running = service_module.is_installed()
+            except Exception:  # noqa: BLE001 - never fail a good job over its supervisor
+                pass
+
+            content = f"Scheduled {job.id} — {job.name}\n{_describe(job)}\n\n"
+            where = job.placement()
+            content += (
+                "It will run in the cloud, so it keeps working when the laptop "
+                "is shut.\n\n"
+                if where == "cloud"
+                else "It needs this machine's files, so it only fires while "
+                "this machine is awake.\n\n"
+            )
+            if job.attach_to:
+                # Told once, here, and never again. This is the only moment the
+                # person can be handed the thread their job will talk in — and
+                # without it the job's output lives somewhere they have no way
+                # to find. Say it plainly rather than burying it.
+                # The command is written out because the surface turns it into
+                # a clickable row — see `Transcript.link_sessions_in`. Telling
+                # the model to instruct somebody to *type* it is the thing to
+                # avoid: the id is already on screen, and asking a person to
+                # select, copy, leave the app and paste is asking them to be a
+                # terminal.
+                content += (
+                    f"Its runs go to their own conversation, not this one, so "
+                    f"they will not interrupt what we are doing. Mention that "
+                    f"in one short sentence and include this line exactly once "
+                    f"— the interface turns it into a clickable link, so do "
+                    f"NOT tell the user to run or type it:\n"
+                    f"  andromeda --resume {job.attach_to}\n\n"
+                )
+            if armed:
+                content += "The background scheduler was started. "
+            if running:
+                content += (
+                    "It is running and will fire on its own — say so plainly, "
+                    "and do NOT tell the user to run any command to make it "
+                    "work.\n\n"
+                )
+            else:
+                # The honest branch. Claiming a job will fire when nothing is
+                # there to fire it is the exact failure the auto-install exists
+                # to prevent, and it would be worse coming from a confident
+                # sentence than from silence.
+                content += (
+                    "NOTE: no background scheduler is installed on this machine "
+                    "and one could not be started, so this job will not fire "
+                    "until one runs. Tell the user that plainly rather than "
+                    "implying it is live.\n\n"
+                )
+            content += (
+                "It is read-only: it can look at things and report, but cannot "
+                "change files or run commands. That is usually right. Mention "
+                "the wider grant ONLY if this job actually needs to act — and "
+                "then say `/approve " + job.id + "`, which works right here, "
+                "never a shell command they would have to leave for."
+            )
             return ToolResult(
-                content=(
-                    f"Scheduled {job.id} — {job.name}\n{_describe(job)}\n\n"
-                    "It is read-only. Tell the user that, and tell them to run "
-                    f"`andromeda cron approve {job.id} --approval auto` if it "
-                    "needs to change files or run commands. The scheduler must "
-                    "be running for it to fire: `andromeda cron install`.\n\n"
-                    "It runs on THIS machine, so it only fires while the "
-                    "computer is awake. If they wanted it to run with the "
-                    "laptop closed, give them this line and say it is the one "
-                    "thing only they can do:\n"
-                    f"  andromeda cron approve {job.id} --run-on cloud"
-                ),
+                content=content,
                 display=f"scheduled {job.id}: {job.name}",
             )
 
@@ -321,6 +423,21 @@ def cron_spec(schedule: Any, workspace_root: str) -> ToolSpec:
                         "notification. Output is always saved either way."
                     ),
                 },
+                "needs_files": {
+                    "type": "boolean",
+                    "description": (
+                        "Whether this job must read or write files on THIS "
+                        "machine. Default false. Say false for anything that "
+                        "works over the network — watching a deployment, "
+                        "checking an API, polling a site, reading an inbox — "
+                        "so it can run while the machine is asleep, which is "
+                        "when a scheduled job is worth having. Say true only "
+                        "when the job genuinely needs the local filesystem, "
+                        "such as tidying a directory or running this repo's "
+                        "tests; that pins it to this machine and it will not "
+                        "fire while the lid is shut."
+                    ),
+                },
             },
             "required": ["action"],
         },
@@ -335,8 +452,9 @@ def cron_spec(schedule: Any, workspace_root: str) -> ToolSpec:
         # Renaming rather than shadowing is the point — `test_source_hygiene`
         # fails the build on a name that shadows an import.
         run=lambda action, schedule="", prompt="", name="", job_id="", repeat=0,
-        watch="", watch_url="", deliver="none": run(
-            action, prompt, schedule, name, job_id, repeat, watch, watch_url, deliver
+        watch="", watch_url="", deliver="none", needs_files=False: run(
+            action, prompt, schedule, name, job_id, repeat, watch, watch_url,
+            deliver, needs_files,
         ),
         summarize=lambda arguments: (
             f"schedule {arguments.get('schedule', '')!r}: "

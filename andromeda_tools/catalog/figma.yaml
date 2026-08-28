@@ -1,0 +1,15 @@
+manifest_version: 1
+name: figma
+description: Design context, Code Connect, and write-to-canvas in Figma.
+source: https://developers.figma.com/docs/figma-mcp-server/remote-server-installation/
+transport:
+  type: http
+  url: https://mcp.figma.com/mcp
+auth:
+  type: oauth
+suggest:
+  keywords: [figma, mockup, wireframe]
+  hosts: [figma.com]
+post_install: |
+  Run `andromeda mcp login figma` to authorize in a browser,
+  then start a new session so the tools load.

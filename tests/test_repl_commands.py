@@ -163,10 +163,12 @@ class TestCreditsAndUsage:
     """The two questions that used to have one confusing answer.
 
     A user reported `/credits` reading "$0.10 out of $0.10" while they were
-    plainly spending it. Three things caused that and all three are pinned
-    here: the figure was rounded to the cent at a scale where a turn costs
-    fractions of one, the headers describe the balance from *before* the reply
-    they arrive on, and nothing anywhere reported what had actually been used.
+    plainly spending it. Four things caused that and all four are pinned here:
+    the figure was rounded too coarsely at a scale where a turn costs fractions
+    of a unit, the headers describe the balance from *before* the reply they
+    arrive on, nothing anywhere reported what had actually been used, and it
+    was denominated in dollars at all — which both exposed the plan's cost
+    ceiling and gave the number a scale nobody could read.
     """
 
     def test_credits_shows_enough_places_for_the_balance_to_move(
@@ -181,13 +183,13 @@ class TestCreditsAndUsage:
         run("/credits", conversation)
         printed = capsys.readouterr().out
 
-        assert "$0.0997" in printed
-        assert "$0.10 of $0.10" not in printed
+        assert "99.7 of 100.0" in printed
+        assert "100 of 100" not in printed
 
-    def test_an_untouched_grant_still_reads_as_whole_dollars_and_cents(
+    def test_an_untouched_grant_still_reads_as_whole_credits(
         self, conversation, capsys
     ):
-        """A window that has just renewed should say "$0.10 of $0.10"."""
+        """A window that has just renewed should say "100 of 100" and mean it."""
         from andromeda_agent import credits as credits_module
 
         conversation.provider.balance = credits_module.Balance(
@@ -196,7 +198,30 @@ class TestCreditsAndUsage:
 
         run("/credits", conversation)
 
-        assert "$0.10 of $0.10" in capsys.readouterr().out
+        assert "100 of 100 credits" in capsys.readouterr().out
+
+    def test_no_dollar_figure_reaches_the_screen(self, conversation, capsys):
+        """The plan's cost ceiling is not the user's business.
+
+        `/credits` is the one surface that renders a balance, so it is the one
+        that has to be checked. A dollar figure here tells every user what the
+        plan costs to serve.
+        """
+        from andromeda_agent import credits as credits_module
+
+        conversation.provider.balance = credits_module.Balance(
+            remaining_micros=11_997_383,
+            grant_micros=12_000_000,
+            used_micros=2_617,
+            access="active",
+        )
+
+        run("/credits", conversation)
+        printed = capsys.readouterr().out
+
+        assert "$" not in printed
+        assert "11,997 of 12,000 credits" in printed
+        assert "credits settled this period" in printed
 
     def test_credits_says_the_figure_lags_a_turn(self, conversation, capsys):
         from andromeda_agent import credits as credits_module
@@ -229,3 +254,58 @@ class TestCreditsAndUsage:
         run("/help", conversation)
 
         assert "/usage" in capsys.readouterr().out
+
+
+class TestUpgrade:
+    """`/upgrade` — the one thing the terminal genuinely cannot do itself.
+
+    A plan change needs a signed-in browser and a card. What the CLI owes the
+    person is the shortest path to it and an honest statement of what happens
+    when they come back.
+    """
+
+    def test_it_opens_the_settings_page(self, conversation, capsys, monkeypatch):
+        from andromeda_cli.commands import auth as auth_module
+
+        opened = []
+        monkeypatch.setattr(
+            auth_module.webbrowser, "open", lambda url: opened.append(url) or True
+        )
+
+        run("/upgrade", conversation)
+        printed = capsys.readouterr().out
+
+        assert opened == [auth_module.upgrade_url()]
+        assert auth_module.upgrade_url().endswith("/settings")
+        assert "next reply" in printed
+
+    def test_a_headless_box_still_gets_the_link(
+        self, conversation, capsys, monkeypatch
+    ):
+        """`webbrowser.open` returns False over SSH and raises on some boxes.
+
+        Either way the url has to be printed. A message that only said "opened
+        your browser" would be a dead end on exactly the machines where a
+        person cannot go and look for themselves.
+        """
+        from andromeda_cli.commands import auth as auth_module
+
+        def boom(url):
+            raise RuntimeError("no display")
+
+        monkeypatch.setattr(auth_module.webbrowser, "open", boom)
+
+        run("/upgrade", conversation)
+        printed = capsys.readouterr().out
+
+        assert auth_module.upgrade_url() in printed
+        assert "Open this to change your plan" in printed
+
+    def test_both_surfaces_offer_it(self):
+        """The REPL and the full-screen surface must not drift on this."""
+        from andromeda_cli import repl as repl_module
+        from andromeda_tui import app
+
+        assert "/upgrade" in repl_module.slash_help()
+        assert "/upgrade" in app.slash_help()
+

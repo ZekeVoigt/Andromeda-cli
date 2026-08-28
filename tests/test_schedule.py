@@ -123,6 +123,120 @@ class TestConsent:
         assert seen["approval_mode"] == "ask"
 
 
+class TestExecuteAlwaysMovesTheJobOn:
+    """A run always leaves its job pointing at a *later* fire.
+
+    The one invariant that keeps the hosted lane from eating itself. The server
+    arms a one-shot at `next_run_at` and derives `fireAt` from it, so a job that
+    finishes a run still pointing at the moment it just ran re-arms the identical
+    `fireAt`: the runner's claim comes back `settled`, it answers `202 duplicate`,
+    the server counts a delivery, and the pair repeat on every reconcile until
+    the daily fire cap pauses the job. Hours of firing, one run, nothing said.
+
+    Recording lives in `cron.execute` for exactly this reason — it is the only
+    place all four callers pass through, and two of them (the hosted ones) had
+    no provider hook to call.
+    """
+
+    def _job(self, schedule, monkeypatch, outcome):
+        from andromeda_cli.commands import cron as cron_cmd
+
+        job = schedule.add("every 1h", "x", "/tmp", approval_mode="ask")
+        monkeypatch.setattr(cron_cmd, "_schedule", lambda: schedule)
+        monkeypatch.setattr(cron_cmd, "_attach", lambda *a, **k: None)
+        monkeypatch.setattr(cron_cmd.runner_module, "execute", outcome)
+        return cron_cmd, job
+
+    def test_a_finished_run_advances_the_cadence(self, schedule, monkeypatch):
+        def ran(job, *a, **k):
+            return Run(started_at=time.time(), finished_at=time.time(), ok=True,
+                       summary="done")
+
+        cron_cmd, job = self._job(schedule, monkeypatch, ran)
+        consumed = job.next_run_at
+        cron_cmd.execute(job, {"model": "x"}, schedule=schedule, source="fire")
+        assert job.next_run_at > consumed
+        assert job.next_run_at > time.time()
+
+    def test_a_run_that_throws_advances_it_too(self, schedule, monkeypatch):
+        """Otherwise a job that crashes every time re-fires one spent moment for
+        ever — the loop, with no run to show for it. Recorded as a failure as
+        well as advanced, so the consecutive-failure pause can eventually stop it.
+        """
+        def threw(job, *a, **k):
+            raise RuntimeError("boom")
+
+        cron_cmd, job = self._job(schedule, monkeypatch, threw)
+        consumed = job.next_run_at
+        with pytest.raises(RuntimeError):
+            cron_cmd.execute(job, {"model": "x"}, schedule=schedule, source="fire")
+        assert job.next_run_at > consumed
+        assert job.consecutive_failures == 1
+
+    def test_it_is_recorded_once_not_twice(self, schedule, monkeypatch):
+        """`run_now` used to record after calling `execute`. Doing both would
+        double-count the run against `repeat` and skip a beat of the cadence."""
+        def ran(job, *a, **k):
+            return Run(started_at=time.time(), finished_at=time.time(), ok=True)
+
+        cron_cmd, job = self._job(schedule, monkeypatch, ran)
+        cron_cmd.execute(job, {"model": "x"}, schedule=schedule, source="fire")
+        assert job.runs_done == 1
+        assert len(job.runs) == 1
+
+    def test_an_event_run_is_recorded_but_does_not_move_the_clock(
+        self, schedule, monkeypatch
+    ):
+        """An event has no opinion on when a job next wants running on its own.
+
+        Letting it advance `next_run_at` lets the outside world quietly
+        reschedule work it was only supposed to trigger — an `every 12h` job
+        nudged later by every message that arrives. Caught as a four-minute
+        drift the first time a real event ran a real job.
+        """
+        def ran(job, *a, **k):
+            return Run(started_at=time.time(), finished_at=time.time(), ok=True)
+
+        cron_cmd, job = self._job(schedule, monkeypatch, ran)
+        due_at = job.next_run_at
+        cron_cmd.execute(
+            job, {"model": "x"}, schedule=schedule, source="fire",
+            event={"family": "messaging", "kind": "arrived"},
+        )
+        assert job.next_run_at == due_at
+        # Recorded in full all the same: the run happened, and it counts.
+        assert job.runs_done == 1
+        assert len(job.runs) == 1
+
+    def test_an_event_run_that_throws_also_leaves_the_clock_alone(
+        self, schedule, monkeypatch
+    ):
+        def threw(job, *a, **k):
+            raise RuntimeError("boom")
+
+        cron_cmd, job = self._job(schedule, monkeypatch, threw)
+        due_at = job.next_run_at
+        with pytest.raises(RuntimeError):
+            cron_cmd.execute(
+                job, {"model": "x"}, schedule=schedule, source="fire",
+                event={"kind": "arrived"},
+            )
+        assert job.next_run_at == due_at
+        assert job.consecutive_failures == 1
+
+    def test_the_advance_survives_to_disk(self, schedule, monkeypatch):
+        """The hosted runner re-reads the store before telling the server when
+        this job next wants firing. An advance held only in memory re-arms the
+        old time."""
+        def ran(job, *a, **k):
+            return Run(started_at=time.time(), finished_at=time.time(), ok=True)
+
+        cron_cmd, job = self._job(schedule, monkeypatch, ran)
+        cron_cmd.execute(job, {"model": "x"}, schedule=schedule, source="fire")
+        reread = Schedule(schedule.path)
+        assert reread.resolve(job.id).next_run_at == job.next_run_at
+
+
 class TestManaging:
     def test_a_job_needs_something_to_do(self, schedule):
         with pytest.raises(ScheduleError):

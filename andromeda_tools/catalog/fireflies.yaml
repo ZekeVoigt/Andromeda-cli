@@ -1,0 +1,15 @@
+manifest_version: 1
+name: fireflies
+description: Meeting transcripts, summaries, and action items from Fireflies.
+source: https://docs.fireflies.ai/
+transport:
+  type: http
+  url: https://api.fireflies.ai/mcp
+auth:
+  type: oauth
+suggest:
+  keywords: [fireflies, meeting, transcript, call notes]
+  hosts: [fireflies.ai, app.fireflies.ai]
+post_install: |
+  Run `andromeda mcp login fireflies` to authorize in a browser,
+  then start a new session so the tools load.

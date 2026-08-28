@@ -1,0 +1,15 @@
+manifest_version: 1
+name: datadog
+description: Logs, monitors, dashboards, and incidents from Datadog.
+source: https://docs.datadoghq.com/bits_ai/mcp_server/
+transport:
+  type: http
+  url: https://mcp.datadoghq.com/api/unstable/mcp-server/mcp
+auth:
+  type: oauth
+suggest:
+  keywords: [datadog, apm]
+  hosts: [datadoghq.com, datadoghq.eu]
+post_install: |
+  Run `andromeda mcp login datadog` to authorize in a browser,
+  then start a new session so the tools load.

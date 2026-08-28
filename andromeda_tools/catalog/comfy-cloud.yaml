@@ -1,0 +1,15 @@
+manifest_version: 1
+name: comfy-cloud
+description: Generate images, video, audio, and 3D on Comfy Cloud.
+source: https://docs.comfy.org/agent-tools/cloud
+transport:
+  type: http
+  url: https://cloud.comfy.org/mcp
+auth:
+  type: oauth
+suggest:
+  keywords: [comfy, comfyui]
+  hosts: [comfy.org]
+post_install: |
+  Run `andromeda mcp login comfy-cloud` to authorize in a browser,
+  then start a new session so the tools load.

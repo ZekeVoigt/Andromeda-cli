@@ -6,6 +6,252 @@ Until 1.0, a minor bump may change a command's shape. Anything that changes a
 tool's name, arguments or risk tier is called out explicitly, because a model
 that learned the old contract will keep using it.
 
+## [0.9.0] — 2026-08-27
+
+The unattended half, made to actually work. A scheduled fire had never been
+seen end to end; driving one found that hosted jobs fired for ever and ran
+once, and that every cloud job was also running a second time on the laptop.
+Both are fixed and proven against the real runner. Then the door was widened:
+a fire can now mean *something happened, here is what*, not only *it is time*.
+
+### Added
+- **The door means two things now.** A fire used to mean exactly one thing —
+  *it is time*. It can now also mean *something happened, here is what*, and it
+  does so through the same route, the same HMAC, the same lease and the same
+  at-most-once claim (`I-TRIGGER-1`). There is no second inbound path. The event
+  is carried into the job's prompt and consulted by none of the refusals above
+  it, which is `I-TRIGGER-2` — a trigger cannot widen a permission — satisfied
+  structurally rather than by review.
+  - **The event is signed.** A caller who could swap the event body of an
+    otherwise valid fire chooses what the agent believes about the world, which
+    is most of choosing what it does. Adding, swapping or stripping an event
+    after signing is a `401`.
+  - **A fire with no event signs the byte-identical string it always has.** The
+    server and the runner deploy separately, so there is always a window where
+    one end is new and the other is old — and a payload mismatch fails closed
+    *silently*, as a machine that 401s every fire while looking healthy. Time
+    fires being unchanged on the wire is what makes that window survivable.
+  - **The two implementations of the signature are pinned against each other.**
+    `test_fire_wire_contract` extracts the real TypeScript from `cloudFire.ts`,
+    runs it under Node, and compares digests with Python's over inputs chosen
+    to break the places the languages differ by default — key order, non-ASCII,
+    nesting, empty containers. Unit tests on either side cannot catch this
+    class of bug, because each is self-consistent.
+  - **An inbound door for sources.** `POST /api/cloud/events` — authenticated by
+    a per-source shared secret over the raw body, deduplicated by the source's
+    own name for the occurrence, matched against armed triggers, and handed to
+    the existing fire path. It lives in the web app rather than the runner
+    (D56): the runner scales to zero, and a source that must be answered in
+    seconds cannot wait on a cold start — it times out, retries, and turns one
+    event into a storm.
+  - **Sources and triggers are separate objects.** `I-TRIGGER-6` — cost is
+    bounded per source, not per job — so ten jobs watching one source share one
+    registration, one secret and one inbound request.
+  - **A trigger's `where` is contained, not equalled.** A trigger names the
+    sliver it cares about; an event carries everything the source knows.
+    Requiring equality would mean predicting every field a source might add,
+    and any addition would silently stop matching.
+  - **An event fire never touches a job's clock.** `next_run_at` answers "when
+    does this want running on its own", and an event has no opinion on that.
+    Letting it advance means the outside world quietly reschedules work it was
+    only supposed to trigger — caught live as a four-minute drift the first time
+    a real event ran a real job, which is small enough to have shipped
+    unnoticed and would not have stayed small.
+  - Family and kind are validated **in the route as well as the mutation**, and
+    not for belt and braces: Convex turns a `throw` inside a mutation into an
+    opaque "Server Error" by the time a client sees it, and `"gmail" is not a
+    capability family` is the entire value of that refusal.
+  - The event body is framed in the prompt as **data, never instructions**, and
+    the framing is placed ahead of the payload. It was written by whoever can
+    send that source an item, not by the person who set the job up.
+
+### Fixed
+- **Exactly one thing can decide any job is due, and it is now pinned.**
+  `I-TRIGGER-7` asked for it; a test over the whole job matrix — device, cloud,
+  auto+detached, auto+device — asserts no job is reachable by both the server's
+  scheduler and this machine's tick loop. The two filters have to stay exact
+  complements (`_arm`/`cron push` upload exactly `runs_on == "cloud"`;
+  `Schedule.due` excludes exactly that), so widening one without the other now
+  fails. Written as a table because the bug it replaces was invisible in any
+  single case: every cloud job was running twice, and it looked fine from either
+  side alone.
+- **A hosted job that ran once then fired for ever.** `schedule.record` — the
+  call that advances `next_run_at` — was the caller's responsibility, and two
+  of the four callers did not do it: the fire handler in `cron serve` and the
+  Modal runner, both hosted. So a hosted run finished still pointing at the
+  moment it had just run, re-armed the server with that past time, and the
+  server fired the identical `fireAt` at once. The runner's claim came back
+  `settled`, it answered `202 duplicate`, the server counted a delivery, and
+  the pair repeated on every reconcile — hourly, silently, one real run to show
+  for it — until the daily fire cap paused the job. Recording moved into
+  `cron.execute`, which is the one place all four callers pass through, and it
+  happens on the `raise` path too: a job whose execution throws must still move
+  off the fire it consumed, and recording the failure is what lets the
+  consecutive-failure pause eventually stop it.
+- **Every cloud job was running twice.** Once on the hosted runner and once on
+  the laptop, with different results. `Schedule.due` — the tick loop's answer to
+  "what should I run now" — did not look at where a job runs, so the local
+  daemon claimed hosted jobs too. The `Relay` provider exists to prevent exactly
+  this by returning nothing from `due`, but it is opt-in (`cron_provider: relay`)
+  and an unset or misspelt value falls back to the built-in loop; a double-fire
+  must not depend on a setting somebody has to know to write down. `due` now
+  excludes `runs_on == "cloud"`, which is the precise complement of what the
+  server knows about — `_arm` and `cron push` upload those jobs and no others.
+  An `auto` job is deliberately still included: nothing else is firing it.
+- **A duplicate fire is now recorded as one.** The runner answers `202` to a
+  duplicate deliberately, and the server read only the status code — so an
+  already-run fire became a `cloudRuns` row that waits for an outcome nobody
+  will ever send, indistinguishable from a run still in flight. New `duplicate`
+  status, terminal on arrival. The server also checks for an already-settled
+  fire *before* sending one, which costs nothing and saves a container wake and
+  a daily fire slot; either way the job is re-armed at a fresh time, so the
+  next fire carries a `fireAt` nothing has claimed and the cadence repairs
+  itself.
+
+## [0.8.0] — 2026-08-26
+
+### Added
+- **Portable packages.** A `plugin.json` directory carrying skills and MCP
+  servers and *no code* — the interchange format from `agent-plugins.org`, so a
+  package written for another harness loads here unchanged. Nothing in one is
+  ever imported, which is why it declares no capabilities and is refused if it
+  tries to. Its skills are loadable as `<package>:<skill>`; its servers connect
+  as `<package>:<server>`, namespaced so neither can shadow one you configured.
+  `${PLUGIN_ROOT}` and `${PLUGIN_DATA}` expand in `command`, `args`, `env` and
+  `cwd`, and a `cwd` resolving outside the package is dropped.
+- **`andromeda plugins new <name>`** — a manifest, a `register(ctx)` with one
+  tool and one command, and a README. A plugin that already loads, because the
+  first thing an author needs is not documentation.
+- The plugin index is now **served**: `public/plugins/index.json`, pinned
+  byte-identical to the bundled seed by a test. `plugins search` would
+  otherwise have fetched a 404 — which is exactly how `install.sh` failed once.
+
+### Changed
+- `install`, `list`, `show`, `enable` and `doctor` all understand a portable
+  package, and each says so where it matters. `install` names the kind *before*
+  asking anything, because "there is no code in this one" changes what is being
+  consented to.
+- A load can now carry **notes** — non-fatal problems, like a portable
+  package's one broken skill. Shown by `plugins show` rather than logged and
+  forgotten, because "my skill does not appear" is otherwise unanswerable.
+- An empty portable package is reported as empty on enable. Not an error, but
+  said out loud.
+
+## [0.7.0] — 2026-08-26
+
+The plugin socket, widened until every seam this harness actually has is
+reachable from outside it.
+
+### Added
+- **Middleware**, four kinds with four real fire sites in the loop:
+  `tool_request` and `llm_request` rewrite a payload on its way in;
+  `tool_execution` and `llm_execution` are handed the call itself, so a plugin
+  can retry it, cache it, time it, or answer without running it. Execution
+  middleware nests, first-registered outermost. All four sit behind one
+  capability, `runtime.middleware`.
+- **Eleven more registration points**, each landing on a seam that already
+  existed: `register_web_search_provider`, `register_browser_provider`,
+  `register_lsp_server`, `register_specialist`, `register_blueprint`,
+  `register_eval`, `register_auxiliary_task`, `register_approval_transport`,
+  `register_middleware`, plus `ctx.dispatch_tool`, `ctx.call_mcp`, `ctx.llm`
+  and `ctx.profile_name`.
+- **Five more capabilities**, twelve in total: `model.auxiliary`,
+  `browser.provider`, `lanes.specialist`, `approvals.transport`,
+  `runtime.middleware`. Every one still has an enforcing gate that a test
+  greps for.
+- **A community index.** `andromeda plugins search <words>` and
+  `andromeda plugins install <name>`. Remote → 24h cache → stale cache →
+  bundled seed, in that order, and the source is printed when it is not the
+  live one. Every entry pins a 40-character commit; a tag or a branch name is
+  dropped with a warning naming the entry.
+- **Packs.** `andromeda plugins pack export|show|install` — a set of plugins as
+  one shareable YAML file. Three refusals define the format: every entry pins a
+  commit, a pack can never grant a capability, and `config:` cannot carry a
+  credential.
+
+### Changed
+- `SERVERS`, `SPECIALISTS` and the blueprint catalogue are live views rather
+  than tuples frozen at import, so a plugin's entry is seen without editing
+  each reader. A plugin can only *append*: it cannot take `.py` from pyright
+  or redefine what `scout` is allowed to touch.
+- `specialists.SPECIALIST_IDS` became `specialists.specialist_ids()`, for the
+  same reason.
+- The browser is built through `browser.build_session()` rather than
+  constructed directly, so a provider answers before a page is opened — handing
+  over a session that already has cookies in it is handing over what it was
+  signed into.
+- An approval transport answers only when no surface has a live prompt. Someone
+  sitting here is the better authority than a message sent elsewhere.
+
+### Security
+- A plugin **cannot introduce a model.** `register_auxiliary_task` takes a
+  purpose that must already be in this build's auxiliary list; the capability
+  buys the *spending*, not the model id. The lock is the product decision this
+  harness is built on and a registration point that could widen it would be a
+  hole straight through it.
+- An approval transport **fails closed in every direction** — raising, timing
+  out, or returning anything that is not one of the gate's five answers all
+  become "no". It is the one registration point where failing open would mean a
+  tool running because a plugin was broken.
+- A `tool_execution` middleware that returns the wrong shape is reported to the
+  model as an ordinary tool error rather than reaching the transcript as a repr.
+
+## [0.6.0] — 2026-08-26
+
+### Added
+- **Plugins.** A directory with a `plugin.yaml` and an `__init__.py` defining
+  `register(ctx)` is now the supported way for outside code to extend this
+  harness. A plugin can *add* — tools, hooks, slash commands, `andromeda`
+  subcommands, skills, delivery modes, redaction patterns — and, with a granted
+  capability, *replace*: the memory backend, the cron provider, the model
+  provider, the secret resolver, a built-in tool, a built-in slash command, and
+  the system prompt. Everything lands on a seam that already existed; nothing
+  new was invented to hold it.
+- `andromeda plugins list|show|install|update|remove|enable|disable|revoke|
+  capabilities|doctor`. Install accepts `owner/repo`, a git URL or a local
+  path, and runs clone → security scan → capability consent → "enable it now?"
+  in that order, importing nothing until the last step.
+- **Capability consent.** Seven capabilities, each mapped one-to-one onto a
+  gate that is actually checked; a test fails if one is ever declared without
+  an enforcement point behind it. The grant records a hash of exactly the set
+  that was agreed to, so an update that asks for more asks again, and one that
+  asks for less drops what it no longer holds. `andromeda plugins capabilities`
+  says what each one means. **None of it is a sandbox, and the command says so.**
+- **A plugin security scan**, reusing the skill scanner's engine with three
+  changes a plugin needs: program-sized structural limits, an exemption on code
+  files for the "reads its own declared key and sends it to its own vendor"
+  pattern that every legitimate provider plugin matches, and four new rules for
+  the executable shapes a skill never has — a multi-line Python reverse shell
+  scored `safe` until one was written down. `dangerous` refuses the install and
+  `--force` does not override it.
+- `andromeda plugins doctor` loads a plugin through the real runtime with the
+  network cut, fakes its declared grants in memory so a developer need not
+  consent to their own plugin, and prints what it registered.
+- Per-plugin JSON state (10MB), per-plugin settings, and a namespaced
+  plugin-to-plugin event bus where the prefix is forced rather than trusted.
+- `--no-plugins` and `ANDROMEDA_NO_PLUGINS=1`. `andromeda plugins ...` never
+  loads plugins, so a plugin that breaks on import cannot break the command
+  that turns it off.
+- A bundled `git-context` plugin: the current branch and whether the tree is
+  dirty, in front of the model once per turn, plus `git_status` and `/branch`.
+  It is the reference example as much as it is a feature.
+
+### Changed
+- Enabling a plugin now switches on the tools it registers. `enabled_tools` is
+  an allowlist, so without this a plugin tool would exist and never be offered
+  — the plugin works, and nothing happens.
+- `hooks` gained an `unregister`, so unloading a plugin takes its callbacks off
+  the bus rather than leaving them pointing into a module that has been removed
+  from `sys.modules`.
+
+### Fixed
+- A `plugin.yaml` whose `name:` is `on`, `off`, `yes` or `no` now says that
+  YAML read it as a boolean, instead of reporting a missing name.
+- Plugin modules are compiled from source rather than through `__pycache__`. A
+  plugin edit that changes neither the file size nor the mtime second — a
+  one-word fix, an update landing a same-sized file — otherwise loaded the
+  previous version with nothing to indicate it.
+
 ## [0.5.0] — 2026-08-25
 
 ### Added

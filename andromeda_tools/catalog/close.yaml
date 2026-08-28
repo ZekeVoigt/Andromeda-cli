@@ -1,0 +1,15 @@
+manifest_version: 1
+name: close
+description: Leads, opportunities, and activities from Close CRM.
+source: https://developer.close.com/
+transport:
+  type: http
+  url: https://mcp.close.com/mcp
+auth:
+  type: oauth
+suggest:
+  keywords: [close, crm, lead, opportunity]
+  hosts: [close.com, app.close.com]
+post_install: |
+  Run `andromeda mcp login close` to authorize in a browser,
+  then start a new session so the tools load.

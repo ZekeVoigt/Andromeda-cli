@@ -36,27 +36,34 @@ class _Run:
 
 
 class _Job:
+    """A job, as much of one as arming needs.
+
+    `to_json` is here because arming sends the whole definition — a runner that
+    has never seen this machine has to be able to execute it — and a double
+    without it stops being a double for the thing under test. Kept as a real
+    dict rather than a `Mock` so a test can assert on what actually crossed the
+    wire.
+    """
+
     def __init__(self, job_id="job_1"):
         self.id = job_id
         self.name = "a job"
         self.schedule = "every 1h"
         self.next_run_at = 1_800_000_000.5
+        self.prompt = "watch the tide"
+        self.workspace = "/tmp/workspace"
 
     def to_json(self):
-        """The definition a runner needs, as `Job.to_json` returns it.
-
-        `runs` is included deliberately even though the stub has none of its
-        own: the point of the assertions below is that `push_job` strips it,
-        and a stub that never offers it cannot show that it was stripped.
-        """
         return {
             "id": self.id,
             "name": self.name,
             "schedule": self.schedule,
-            "prompt": "do the thing",
-            "approval_mode": "ask",
-            "enabled_tools": ["read_file"],
-            "runs": [{"status": "ok"}],
+            "prompt": self.prompt,
+            "workspace": self.workspace,
+            "nextRunAt": self.next_run_at,
+            # Present so `test_arming_sends_the_timing_and_not_the_prompt` can
+            # prove it is stripped rather than merely absent.
+            "runs": [{"startedAt": 1, "status": "ok"}],
         }
 
 
@@ -97,11 +104,20 @@ def _server(status: int = 200, body: dict | None = None, capture: list | None = 
 # ---------------------------------------------------------------------------
 
 
-def test_arming_sends_the_timing_and_not_the_prompt():
-    """A trigger decides *when*. It has no business holding what a job does.
+def test_arming_sends_the_definition_and_strips_the_run_history():
+    """What crosses the wire, and what deliberately does not.
 
-    A server that held the prompt would be a server that could change it, and
-    the whole consent model rests on the job's own machine owning that.
+    **This reverses an earlier contract, on purpose.** Arming used to send
+    timing only — `jobId`, `name`, `schedule`, `nextRunAt` — on the reasoning
+    that a trigger decides *when* and has no business holding what a job does.
+    That does not survive a runner: a container that has never seen this
+    machine cannot execute a job it has only been told the name of. So the
+    definition goes too, under `spec`.
+
+    What is still stripped is the run history. That is this machine's own
+    account of what happened, it grows without bound, and the server keeps
+    outcomes in `cloudRuns` already — so sending it would be paying to
+    duplicate a record that is already there.
     """
     seen: list = []
     httpd, base = _server(capture=seen)
@@ -112,18 +128,12 @@ def test_arming_sends_the_timing_and_not_the_prompt():
 
     assert len(seen) == 1
     body = seen[0]["body"]
-    # `spec` travels now — a runner has never met the machine that created the
-    # job, so the definition has to cross the wire with the timing. What must
-    # NOT travel is the run history: that is this machine's own account of what
-    # happened, it grows without bound, and the server keeps outcomes in
-    # `cloudRuns` already.
     assert set(body) == {"jobId", "name", "schedule", "nextRunAt", "spec"}
-    assert "runs" not in body["spec"]
-    assert body["spec"]["prompt"] == "do the thing"
-    # The top level still carries only the timing and enough to name the job.
-    assert "prompt" not in body
-    assert "approvalMode" not in body
-    assert "enabledTools" not in body
+
+    spec = body["spec"]
+    assert spec["prompt"] == "watch the tide"
+    assert spec["workspace"] == "/tmp/workspace"
+    assert "runs" not in spec, "the run history must not cross the wire"
 
 
 def test_the_fire_time_is_sent_in_milliseconds():

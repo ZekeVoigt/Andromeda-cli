@@ -1,0 +1,15 @@
+manifest_version: 1
+name: airtable
+description: Bases, tables, and records from your Airtable workspace.
+source: https://support.airtable.com/articles/9897799762-using-the-airtable-mcp-server
+transport:
+  type: http
+  url: https://mcp.airtable.com/mcp
+auth:
+  type: oauth
+suggest:
+  keywords: [airtable]
+  hosts: [airtable.com]
+post_install: |
+  Run `andromeda mcp login airtable` to authorize in a browser,
+  then start a new session so the tools load.

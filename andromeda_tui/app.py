@@ -57,9 +57,11 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Static
 
+from andromeda_agent import live
 from andromeda_agent.models import THINKING_LEVELS, supports_reasoning
+from andromeda_cli import config as config_module
 from andromeda_cli import checkpoints as checkpoint_module
-from andromeda_cli import art, render
+from andromeda_cli import art, render, vocabulary
 from andromeda_cli.session import set_asker, set_lane_announcer
 
 from . import events as ev
@@ -72,36 +74,30 @@ from .widgets import (
     StatusBar,
     StudyPanel,
     Transcript,
+    CommandPalette,
     screen_style,
 )
 
-# Kept in step with the REPL's list. `tests/test_tui.py` parses
-# `repl.SLASH_HELP` and asserts every verb there is handled here — two surfaces
-# of one product whose slash vocabularies disagree is the same class of bug as
-# a tool that is gated differently depending on where you call it from.
-SLASH_HELP = """  /help      show this
-  /new       start a fresh conversation
-  /rewind    undo the last exchange (/rewind N for a numbered checkpoint)
-  /history   list the checkpoints you can rewind to
-  /ps        background processes started this session
-  /recap     what has happened so far, without asking the model
-  /sessions  search past sessions (/sessions <text>)
-  /resume    switch to another session (/resume lists them)
-  /tools     list the tools this session can use
-  /skills    list the skills on this machine
-  /lanes     list the delegation specialists
-  /credits   the account balance, as the last reply reported it
-  /usage     what this session and this week have spent, in tokens
-  /model     show the model in use
-  /think     show or set the thinking level (off, low, medium, high)
-  /cwd       show the workspace root
-  /exit      leave (Ctrl-D also works)"""
+# Both surfaces read one registry now. They could not be kept in step by hand:
+# the list said twenty commands, the product had fifty, and a test that asserts
+# two hardcoded strings match proves only that they are equally out of date.
+def slash_help() -> str:
+    return vocabulary.help_text()
 
-KEY_HINT = "CTRL+C INTERRUPT  ·  CTRL+G EDITOR  ·  CTRL+L NEW  ·  CTRL+D QUIT"
+
+# `/` leads, because it is the one that makes the other fifty commands
+# findable; the key bindings are things you learn once and keep.
+KEY_HINT = "/ COMMANDS  ·  CTRL+C INTERRUPT  ·  CTRL+G EDITOR  ·  CTRL+L NEW  ·  CTRL+D QUIT"
 
 
 class AndromedaApp(App):
     """One conversation on one screen."""
+
+    #: The label on the frame around an answer this person asked for. A
+    #: constant because it is compared as well as painted — `ensure_frame` is
+    #: idempotent on `(label, tone)`, so a caller that spells it differently
+    #: opens a second frame instead of continuing the first.
+    ANSWER_FRAME = "andromeda"
 
     CSS = """
     Screen { background: #000000; color: #fafafa; }
@@ -148,29 +144,43 @@ class AndromedaApp(App):
         background: #000000;
     }
     #transcript .row { margin-bottom: 1; }
-    #transcript .prompt, #transcript .answer {
+    #transcript .prompt {
         height: auto; margin: 0 0 1 0; padding: 0;
+        border: none; background: #000000;
+    }
+    /* The answer is indented by padding rather than by prefixing its lines:
+       it is rendered markdown, and a string indent would push the fences and
+       table rules out of alignment with the width they were laid out for. */
+    #transcript .answer {
+        height: auto; margin: 0 0 1 0; padding: 0 1 0 2;
         border: none; background: #000000;
     }
     #transcript .error { height: auto; margin: 0 0 1 0; padding: 0; }
     #transcript .tool, #transcript .tool-result, #transcript .note {
         margin-bottom: 0;
     }
-    /* The rules that open and close a turn. They must reach the full width,
-       so no horizontal padding of their own. */
-    #transcript .frame { height: 1; margin: 0 0 1 0; padding: 0; }
+    /* The frame edges hug what they contain: no bottom margin under the top
+       rule, no top margin above the bottom one. A blank line between an edge
+       and the first row makes the frame read as two unrelated rules. */
+    #transcript .frame-top { height: 1; margin: 0 0 1 0; padding: 0; }
+    #transcript .frame-bottom { height: 1; margin: 0 0 1 0; padding: 0; }
 
     #activity {
         height: auto; margin: 0 3; padding: 0 1; display: none;
         background: #000000;
     }
     #composer-shell {
-        height: auto; max-height: 16; margin: 0 3; padding: 1;
+        height: auto; max-height: 30; margin: 0 3; padding: 1;
         border-top: solid #e4e4e7 24%; background: #000000;
     }
     #composer-help {
         height: 1; margin-top: 1;
         color: #e4e4e7; text-style: dim;
+    }
+    #command-palette {
+        height: auto; max-height: 14; margin-bottom: 1; padding: 0 1;
+        background: #000000; border-left: solid #a78bfa;
+        display: none;
     }
     #composer {
         height: auto; max-height: 10; border: none; padding: 0;
@@ -185,12 +195,22 @@ class AndromedaApp(App):
     /* The prompts. A dimmed backdrop is not decoration here: it is the visible
        statement that the thing underneath is stopped and waiting. */
     ApprovalScreen, ClarifyScreen { align: center middle; background: #000000 70%; }
+    /* `max-height` is what keeps the prompt answerable. Without it a box tall
+       enough to outgrow the terminal is clipped rather than fitted, and what
+       gets clipped is the top — the question — and then the bottom, which is
+       the input. Bounded, the scrolling region inside takes the squeeze. */
     #approval-box, #clarify-box {
-        width: 80%; max-width: 100; height: auto; padding: 1 2;
+        width: 80%; max-width: 100; height: auto; max-height: 100%; padding: 1 2;
         background: #000000; border: solid #e4e4e7 36%;
     }
     #approval-summary { padding: 1 0; }
     #approval-choices { padding-top: 1; }
+    #approval-detail, #clarify-choices {
+        height: auto; background: #000000;
+        scrollbar-size-vertical: 1; scrollbar-color: #e4e4e7 30%;
+        scrollbar-background: #000000; scrollbar-corner-color: #000000;
+    }
+    #clarify-choices { padding-bottom: 1; }
     #clarify-input {
         border: none; border-top: solid #e4e4e7 24%;
         background: #000000; color: #fafafa;
@@ -204,6 +224,18 @@ class AndromedaApp(App):
         Binding("ctrl+g", "edit_in_editor", "editor", show=False),
         Binding("pageup", "scroll_transcript(-1)", "scroll up", show=False),
         Binding("pagedown", "scroll_transcript(1)", "scroll down", show=False),
+        # The sessions rail. Chorded, because the composer owns the bare arrow
+        # keys and taking them would break typing to save a keystroke here.
+        # The click path in `SessionsRail.on_click` is the one that needs no
+        # teaching; these exist for people who do not reach for the mouse.
+        Binding("ctrl+left", "rail_tab(-1)", "prev group", show=False),
+        Binding("ctrl+right", "rail_tab(1)", "next group", show=False),
+        Binding("ctrl+up", "rail_move(-1)", "rail up", show=False),
+        Binding("ctrl+down", "rail_move(1)", "rail down", show=False),
+        # Delete the highlighted session. Chorded and confirmed, like every
+        # other rail key — and the click on the row's ✕ is the path that needs
+        # no teaching.
+        Binding("ctrl+backspace", "rail_delete", "delete session", show=False),
     ]
 
     def __init__(self, config: dict[str, Any], conversation, record, resumed=None) -> None:
@@ -223,6 +255,9 @@ class AndromedaApp(App):
         # ends — the alternative is dropping what someone typed, and a terminal
         # that discards keystrokes is a terminal people stop trusting.
         self.queued: list[str] = []
+        # The dimmed placeholder rows standing in for `queued`, one per entry
+        # and in the same order, so each is removed as its message is sent.
+        self._queued_rows: list = []
         self._open_question: str = ""
         self._answering = False
         # A multi-line paste, held whole until it is sent. The composer is a
@@ -238,6 +273,11 @@ class AndromedaApp(App):
         self._exit_reason = ""
 
     # ---- layout -----------------------------------------------------------
+
+    # Set by `_paint_live`, cleared by the tick that paints it. A class
+    # attribute so a tick that lands before `on_mount` finishes reads False
+    # rather than raising.
+    _live_text_pending = False
 
     def compose(self) -> ComposeResult:
         # Held as attributes rather than looked up with `query_one`. `App.query_one`
@@ -261,7 +301,12 @@ class AndromedaApp(App):
         )
         self.activity = ActivityLane(id="activity")
         self.composer = Composer(placeholder="Ask Andromeda anything…", id="composer")
+        self.palette = CommandPalette(id="command-palette")
+        # Above the field, not below it: the composer sits at the bottom of the
+        # screen and a list under it would open off-screen or shove the whole
+        # conversation up every time somebody typed a slash.
         self.composer_shell = Vertical(
+            self.palette,
             self.composer,
             Static("ENTER TO SEND  ·  SHIFT+ENTER NEW LINE  ·  / COMMANDS", id="composer-help"),
             id="composer-shell",
@@ -274,6 +319,10 @@ class AndromedaApp(App):
         yield self.status
 
     async def on_mount(self) -> None:
+        # The composer takes the navigation keys only while the list is open,
+        # so it needs to be able to ask. Wired here rather than in `compose`,
+        # because both have to exist first.
+        self.composer.palette = self.palette
         transcript = self.transcript
         provider = self.conversation.provider
         self._sync_masthead_layout()
@@ -332,6 +381,17 @@ class AndromedaApp(App):
         # the surface, and the one-shot path and the REPL set their own.
         set_asker(self.driver.ask_questions)
         set_lane_announcer(self._lane_started)
+
+        # The live view of scheduled runs. Bound to the session on screen, so a
+        # job attached to a different conversation does not interrupt this one
+        # — it lands in its own transcript, where somebody looking for it will
+        # be. `since=now` is the horizon: runs that finished before this screen
+        # opened are already in the durable session copy and replaying them
+        # here would show them twice.
+        self.live_tail = live.Tail(
+            config_module.home(), session=self.driver.binding.record.id
+        )
+        live.reap(config_module.home())
 
         self.composer.focus()
         # One clock for everything that moves: draining events, repainting the
@@ -457,8 +517,13 @@ class AndromedaApp(App):
         transcript = self.transcript
         for event in self.driver.drain():
             self._handle(event, transcript)
-        if self.driver.busy:
+        self._drain_live(transcript)
+        # `busy` alone was not enough: an autonomous run arrives precisely when
+        # the driver is idle, so its text accumulated with nothing ever
+        # repainting it — which is why the flush used to be per record.
+        if self.driver.busy or self._live_text_pending:
             transcript.flush_answer()
+            self._live_text_pending = False
         self.activity.tick(self.driver.busy)
         status = self.status
         status.context = self.conversation.context_used
@@ -469,17 +534,17 @@ class AndromedaApp(App):
             transcript.add_prompt(event.prompt)
 
         elif isinstance(event, ev.TextDelta):
-            transcript.open_frame()
+            transcript.ensure_frame(self.ANSWER_FRAME)
             transcript.feed_answer(event.text)
 
         elif isinstance(event, ev.ToolStarted):
             # The answer block is closed here and the next one opens on the
             # next delta, so prose the model wrote before a tool stays above
-            # the tool line and prose it writes after stays below.
-            # Opened here as well as on the first delta: a turn whose first
-            # act is a tool call must not put that call above its own frame.
-            transcript.open_frame()
+            # the tool line and prose it writes after stays below. The *frame*
+            # is not closed — the tool is part of this turn, and closing it
+            # here is what produced a bracket per segment.
             transcript.end_answer()
+            transcript.ensure_frame(self.ANSWER_FRAME)
             transcript.add_tool(event.summary, event.tier)
             self.activity.start_tool(event.summary)
 
@@ -489,7 +554,7 @@ class AndromedaApp(App):
 
         elif isinstance(event, ev.ToolDenied):
             self.activity.stop_tool()
-            transcript.add_note(f"declined  {event.name} — {event.reason}", tone="red")
+            transcript.add_tool_result(f"{event.name} — {event.reason}", ok=False)
 
         elif isinstance(event, ev.LaneStarted):
             transcript.add_note(f"⇢ {event.specialist} lane  {event.label}", tone="magenta")
@@ -504,26 +569,118 @@ class AndromedaApp(App):
             self._question_closed(event.request_id)
 
         elif isinstance(event, ev.TurnFinished):
-            transcript.end_answer()
             self._report_still_running(event, transcript)
             transcript.close_frame()
             self._finish_turn()
 
         elif isinstance(event, ev.TurnFailed):
-            transcript.end_answer()
+            transcript.ensure_frame(self.ANSWER_FRAME)
             transcript.add_error(event.message, event.hint)
-            # Inside the frame: the failure is what this turn produced.
             transcript.close_frame()
             self._finish_turn()
 
         elif isinstance(event, ev.TurnInterrupted):
-            transcript.end_answer()
-            transcript.add_note("interrupted")
+            transcript.ensure_frame(self.ANSWER_FRAME)
+            transcript.add_note("interrupted", tone="warn")
             transcript.close_frame()
             self._finish_turn()
 
         elif isinstance(event, ev.Notice):
             transcript.add_note(event.text, tone=event.tone)
+
+    # ---- scheduled runs, live ---------------------------------------------
+
+    def _drain_live(self, transcript: Transcript) -> None:
+        """Paint whatever a scheduled run has done since the last tick.
+
+        The daemon is a different process with no screen. It writes a journal;
+        this reads it. That is the whole mechanism, and it is deliberately one
+        directional — a surface that could talk back would be a surface a job
+        waits for, and a job that waits for a window to be open is not
+        autonomous.
+
+        Never raises. A journal that cannot be read costs the live rows, not
+        the conversation.
+        """
+        tail = getattr(self, "live_tail", None)
+        if tail is None:
+            return
+        try:
+            records = tail.poll()
+        except Exception:  # noqa: BLE001 - the transcript is worth more than the tail
+            return
+        if not records:
+            return
+
+        # Whether a turn of this person's own was interrupted by the run. The
+        # frame is put back afterwards so the answer they are reading does not
+        # end up with a job's rows inside its box.
+        resume_frame = transcript.frame_tone == "agent" and self.driver.busy
+
+        for record in records:
+            self._paint_live(record, transcript)
+
+        if resume_frame:
+            transcript.ensure_frame(self.ANSWER_FRAME)
+
+    def _paint_live(self, record: dict, transcript: Transcript) -> None:
+        kind = record.get("kind") or ""
+        name = str(record.get("name") or record.get("job") or "job")
+        where = str(record.get("where") or "local")
+        # `⌂` and `☁` are the same two glyphs the sessions rail uses for the
+        # same two facts. One vocabulary, so a person learns it once.
+        badge = "☁" if where == "cloud" else "⌂"
+        # The label is fixed and tracked; the job's name rides beside it as
+        # plain text. `AUTONOMOUS` is what the reader is scanning for, and it
+        # stays the same width whatever the job is called.
+        frame = "autonomous"
+        detail = f"{badge} {name}"
+
+        if kind == "run.started":
+            transcript.ensure_frame(frame, "autonomous", detail)
+            transcript.add_note(
+                f"started · {where} · {record.get('reason') or 'scheduled'}",
+                tone="autonomous",
+            )
+            return
+
+        if kind == "text":
+            transcript.ensure_frame(frame, "autonomous", detail)
+            # Accumulate only. Painting is the tick's job, not the record's —
+            # flushing here put every coalesced chunk on screen as its own
+            # block, so a run that said one paragraph arrived as five pieces.
+            # A live turn has never done that; this is now the same path.
+            transcript.feed_answer(str(record.get("text") or ""))
+            self._live_text_pending = True
+            return
+
+        if kind == "tool":
+            transcript.ensure_frame(frame, "autonomous", detail)
+            transcript.end_answer()
+            transcript.add_tool(
+                str(record.get("summary") or ""), str(record.get("tier") or "")
+            )
+            return
+
+        if kind == "tool.result":
+            transcript.add_tool_result(
+                str(record.get("detail") or ""), bool(record.get("ok"))
+            )
+            return
+
+        if kind == "note":
+            transcript.ensure_frame(frame, "autonomous", detail)
+            transcript.add_note(str(record.get("text") or ""), tone="autonomous")
+            return
+
+        if kind == "run.finished":
+            transcript.ensure_frame(frame, "autonomous", detail)
+            status = str(record.get("status") or "")
+            error = str(record.get("error") or "")
+            if error:
+                transcript.add_error(error)
+            transcript.add_note(f"finished · {status}", tone="autonomous")
+            transcript.close_frame()
 
     def _report_still_running(self, event: ev.TurnFinished, transcript: Transcript) -> None:
         if event.processes_running:
@@ -540,10 +697,28 @@ class AndromedaApp(App):
 
     def _finish_turn(self) -> None:
         self.activity.stop_tool()
+        # A turn can have created a job, and a job now creates a session of its
+        # own. Without this the rail keeps showing what was on disk when the
+        # app launched, so the conversation the agent just told you about is
+        # not there when you look for it. Cheap: one directory listing.
+        try:
+            self.recent_updates.reload()
+            self.recent_updates._refresh()
+        except Exception:  # noqa: BLE001 - the rail is furniture, never a crash
+            pass
         # One at a time, and only when the agent is actually free. Draining the
         # whole queue would submit the second item into a turn that has not
         # started yet, and `submit` would refuse it silently.
         if self.queued and not self.driver.busy:
+            # The placeholder row goes as the real turn begins — `submit`
+            # paints the prompt properly, and leaving both would show the
+            # message twice.
+            if self._queued_rows:
+                row = self._queued_rows.pop(0)
+                try:
+                    row.remove()
+                except Exception:  # noqa: BLE001 - an unmounted row is fine
+                    pass
             self.driver.submit(self.queued.pop(0))
         self._refresh_queue_hint()
 
@@ -626,15 +801,26 @@ class AndromedaApp(App):
             return
 
         if self.driver.busy:
+            # Shown where it was typed, not just counted in the status bar. A
+            # message that clears the composer and leaves no trace reads as
+            # swallowed, and people retype it.
             self.queued.append(raw)
+            self._queued_rows.append(self.transcript.add_queued_prompt(raw))
             self._refresh_queue_hint()
+            self.palette.close()
             return
 
+        self.palette.close()
         self.driver.submit(raw)
 
     def on_text_area_changed(self, event) -> None:
         """Grow the composer with the text, and time the first keystroke."""
         self.composer.resize_to_content()
+        # Every keystroke, so the list opens the instant `/` is typed and
+        # narrows as the word is finished. Waiting for a Tab is what a shell
+        # does, and it works there because you already know the command exists.
+        # Here the list is the only way anybody finds out that it does.
+        self.palette.sync(self.composer.text)
         if self.composer.text and self._typed_at is None:
             self._typed_at = time.monotonic()
         elif not self.composer.text:
@@ -714,6 +900,12 @@ class AndromedaApp(App):
             return
         if self.queued:
             self.queued.clear()
+            for row in self._queued_rows:
+                try:
+                    row.remove()
+                except Exception:  # noqa: BLE001 - an unmounted row is fine
+                    pass
+            self._queued_rows.clear()
             self._refresh_queue_hint()
             self.transcript.add_note("queue cleared")
             return
@@ -799,7 +991,7 @@ class AndromedaApp(App):
         if verb in {"/exit", "/quit"}:
             self.exit(_reason="slash /exit")
         elif verb == "/help":
-            transcript.add_note(SLASH_HELP + "\n\n  " + KEY_HINT)
+            transcript.add_note(slash_help() + "\n  " + KEY_HINT)
         elif verb == "/new":
             self.action_new_conversation()
         elif verb == "/cwd":
@@ -826,6 +1018,8 @@ class AndromedaApp(App):
                 transcript.add_note("No balance on this lane — you are using your own key.")
             else:
                 transcript.add_note("No balance yet. It is read from the next reply.")
+        elif verb == "/upgrade":
+            self._upgrade(transcript)
         elif verb == "/usage":
             transcript.add_note(self._usage_lines())
         elif verb == "/tools":
@@ -848,8 +1042,47 @@ class AndromedaApp(App):
             self._search_sessions(parts, transcript)
         elif verb == "/resume":
             self._resume(parts, transcript)
+        elif verb == "/jobs":
+            self._list_jobs(transcript)
+        elif verb == "/approve":
+            self._approve_job(parts, transcript)
+        elif vocabulary.is_verb(verb):
+            self._verb(verb, command[len(parts[0]):].strip(), transcript)
         else:
-            transcript.add_note(f"unknown command {verb} — /help lists them", tone="yellow")
+            near = vocabulary.matching(verb)[:4]
+            hint = "  ".join(row.display for row in near)
+            transcript.add_note(
+                f"unknown command {verb} — type / to see them all"
+                + (f"\n  did you mean: {hint}" if hint else ""),
+                tone="yellow",
+            )
+
+    def _verb(self, verb: str, arguments: str, transcript) -> None:
+        """Run an `andromeda` command and put its output in the transcript.
+
+        The command writes to a console, and this screen owns the terminal — so
+        it is captured and added as a note rather than printed underneath the
+        interface, which is where it would otherwise land and stay invisible.
+        """
+        import io
+        from contextlib import redirect_stdout
+
+        from andromeda_cli import output as output_module
+
+        buffer = io.StringIO()
+        previous = output_module.console.file
+        try:
+            output_module.console.file = buffer
+            with redirect_stdout(buffer):
+                vocabulary.run_verb(verb, arguments)
+        except Exception as exc:  # noqa: BLE001 - a verb must not kill the screen
+            transcript.add_note(f"{verb} failed: {exc}", tone="yellow")
+            return
+        finally:
+            output_module.console.file = previous
+
+        text = buffer.getvalue().rstrip()
+        transcript.add_note(text or f"{verb} had nothing to say.")
 
     def _recap(self, transcript: Transcript) -> None:
         from andromeda_cli import state
@@ -927,6 +1160,17 @@ class AndromedaApp(App):
             transcript.add_note("already in that session")
             return
 
+        self._switch_to(target, transcript)
+
+    def _switch_to(self, target, transcript: Transcript) -> None:
+        """Make `target` the live conversation.
+
+        Extracted so `/resume` and the sessions rail cannot drift apart. They
+        are the same act reached two ways, and the checkpoint-stack handover in
+        the middle is the part that would be forgotten by whichever of the two
+        was written second.
+        """
+        binding = self.driver.binding
         binding.switch(target, self.conversation.messages)
         self.conversation.messages = list(target.messages)
         # The checkpoint stack belongs to the transcript, not to the screen.
@@ -940,6 +1184,156 @@ class AndromedaApp(App):
             f"now in {target.id} · {target.turns} turns · {target.title}",
             tone="green",
         )
+        # The live tail follows the conversation on screen. Without this, a
+        # switch leaves it pointed at the session that was open when the app
+        # launched, and scheduled runs paint into the wrong transcript — which
+        # is worse than not painting at all.
+        tail = getattr(self, "live_tail", None)
+        if tail is not None:
+            tail.session = target.id
+        self.recent_updates.reload()
+        self.recent_updates._refresh()
+
+    # -- the sessions rail --------------------------------------------------
+
+    def action_rail_tab(self, delta: int) -> None:
+        self.recent_updates.switch_tab(delta)
+
+    def action_rail_move(self, delta: int) -> None:
+        self.recent_updates.move(delta)
+
+    def action_rail_delete(self) -> None:
+        self.recent_updates.delete_selected()
+
+    def on_sessions_rail_deleted(self, message) -> None:
+        """Remove a transcript, having been asked twice.
+
+        The live session is refused rather than handled. Deleting the file the
+        conversation on screen is still writing to would not stop the writing:
+        the next save recreates it, half of it, under the same id. "Start a new
+        one first" is a one-key answer and leaves nothing ambiguous.
+        """
+        transcript = self.transcript
+        session_id = message.session_id
+        if session_id == self.driver.binding.record.id:
+            transcript.add_note(
+                "that is the session you are in — press CTRL+L for a new one first",
+                tone="warn",
+            )
+            return
+
+        from andromeda_cli import sessions as store
+
+        if store.delete(session_id):
+            self.recent_updates.forget(session_id)
+            transcript.add_note(f"deleted session {session_id}", tone="muted")
+        else:
+            transcript.add_note(
+                f"could not delete {session_id}", tone="bad"
+            )
+
+    def on_sessions_rail_opened(self, message) -> None:
+        """Someone picked a session in the rail.
+
+        Refused mid-turn for the same reason `/resume` is: the worker thread is
+        appending to the message list this would replace, and the two orders
+        the race can finish in produce different transcripts. Refused with a
+        note rather than silently, or a click that does nothing reads as a
+        broken rail.
+        """
+        transcript = self.transcript
+        if self.driver.busy:
+            transcript.add_note("finish or interrupt the turn first")
+            return
+        if message.session_id == self.driver.binding.record.id:
+            transcript.add_note("already in that session")
+            return
+
+        from andromeda_cli import sessions as store
+
+        target = store.load(message.session_id)
+        if target is None:
+            transcript.add_note("that session could not be read", tone="yellow")
+            return
+        self._switch_to(target, transcript)
+
+    def _capture(self, call) -> list[str]:
+        """Run a CLI command function and collect what it printed.
+
+        The commands under `andromeda_cli.commands` write through the shared
+        rich console, which targets the real stdout. Textual owns that, so
+        calling one directly paints over the interface. Capturing the output
+        and re-emitting it as transcript notes is what lets the full-screen
+        surface offer the same verbs as the terminal instead of telling people
+        to leave in order to use them.
+        """
+        import contextlib
+        import io
+
+        from andromeda_cli import output as output_module
+
+        sink = io.StringIO()
+        console = output_module.console
+        # Save and restore the PRIVATE `_file`, never the `file` property.
+        # Reading `console.file` when nothing is pinned returns `sys.stdout`
+        # *as it is right now*, so writing that value back pins the shared
+        # console to one stream forever — it stops following stdout, and every
+        # later caller writes into whatever object happened to be current when
+        # the first slash command ran. Caught by unrelated suites going quiet
+        # when they ran after this one.
+        original = console._file
+        console._file = sink
+        try:
+            with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+                call()
+        except Exception as exc:  # noqa: BLE001 - a slash command never kills the app
+            return [f"{type(exc).__name__}: {exc}"]
+        finally:
+            console._file = original
+        return [line.rstrip() for line in sink.getvalue().splitlines()]
+
+    def _list_jobs(self, transcript: Transcript) -> None:
+        """What is scheduled, without leaving to find out."""
+        from andromeda_cli.commands import cron as cron_cmd
+
+        lines = self._capture(lambda: cron_cmd.show_list())
+        self._rows(
+            transcript,
+            [Text(line) for line in lines if line.strip()],
+            "no scheduled jobs",
+        )
+
+    def _approve_job(self, parts: list[str], transcript: Transcript) -> None:
+        """Widen a job from looking to acting.
+
+        This stays a decision a person makes — an agent may propose autonomy
+        and only a person grants the unattended kind — but the deciding now
+        happens where the proposal was read. Sending somebody to a shell to
+        type the grant was never a safety property; it was a missing surface,
+        and it made the safe path the inconvenient one.
+        """
+        from andromeda_cli.commands import cron as cron_cmd
+
+        if len(parts) < 2:
+            transcript.add_note(
+                "/approve <job id> — lets that job change files and run "
+                "commands. /jobs lists them."
+            )
+            return
+
+        identifier = parts[1].strip()
+        # `--run-on cloud` is deliberately not reachable here. Moving a job
+        # onto hardware the person does not hold is a larger grant than this
+        # one and deserves reading a refusal matrix, not a slash command typed
+        # in the middle of a conversation.
+        lines = self._capture(
+            lambda: cron_cmd.approve(identifier, approval="auto")
+        )
+        self._rows(
+            transcript,
+            [Text(line) for line in lines if line.strip()],
+            f"could not approve {identifier}",
+        )
 
     def _replay(self, session) -> None:
         """Redraw a switched-to session's conversation on the screen.
@@ -948,7 +1342,13 @@ class AndromedaApp(App):
         they are a record of work, and re-rendering hundreds of them to
         reconstruct a scrollback nobody scrolled is how a switch takes four
         seconds instead of none.
+
+        A run the clock asked for keeps its amber frame across the replay. The
+        marker `cron._append_to_session` writes is the only thing on disk that
+        distinguishes one, so reading it back here is what stops a resumed
+        transcript flattening a distinction the live one drew.
         """
+        frame = (self.ANSWER_FRAME, "agent")
         for message in session.messages:
             if not isinstance(message, dict):
                 continue
@@ -956,11 +1356,32 @@ class AndromedaApp(App):
             content = message.get("content")
             if not isinstance(content, str) or not content.strip():
                 continue
+            body = content.strip()
             if role == "user":
-                self.transcript.add_prompt(content.strip())
+                marker = self._job_marker(body)
+                if marker:
+                    # The marker is furniture, not something anyone said. It
+                    # becomes the frame's label and is not printed as a turn.
+                    frame = (f"autonomous · {marker}", "autonomous")
+                    continue
+                frame = (self.ANSWER_FRAME, "agent")
+                self.transcript.close_frame()
+                self.transcript.add_prompt(body)
             elif role == "assistant":
-                self.transcript.feed_answer(content.strip())
+                self.transcript.ensure_frame(*frame)
+                self.transcript.feed_answer(body)
                 self.transcript.end_answer()
+                frame = (self.ANSWER_FRAME, "agent")
+        self.transcript.close_frame()
+
+    @staticmethod
+    def _job_marker(body: str) -> str:
+        """The job name out of a `[scheduled job NAME ran …]` marker, or ""."""
+        if not body.startswith("[scheduled job ") or not body.endswith("]"):
+            return ""
+        inner = body[len("[scheduled job ") : -1]
+        name = inner.split(" ran", 1)[0].strip()
+        return name or "job"
 
     def _rows(self, transcript: Transcript, rows: list[Text], empty: str) -> None:
         if not rows:
@@ -969,6 +1390,29 @@ class AndromedaApp(App):
         block = Text("\n").join(rows)
         transcript.mount(Static(block, classes="row note"))
         transcript.scroll_end(animate=False)
+
+    def _upgrade(self, transcript: Transcript) -> None:
+        """Hand them to the browser. The one thing the terminal cannot do.
+
+        The url is printed whether or not the browser opened: over SSH, on a
+        headless box, or with no handler registered, `webbrowser.open` returns
+        False and a message that only said "opened your browser" would be a
+        dead end.
+        """
+        from andromeda_cli.commands import auth as auth_module
+
+        url, opened = auth_module.open_upgrade()
+        transcript.add_note(
+            ("Opened your browser to change your plan." if opened
+             else "Open this to change your plan:"),
+            tone="autonomous",
+        )
+        transcript.add_note(url)
+        # Said because the number on the status bar will look unchanged until
+        # then: the balance is read off the next reply's headers, not polled.
+        transcript.add_note(
+            "your new balance appears on the next reply", tone="muted"
+        )
 
     def _usage_lines(self) -> str:
         """`/usage` — tokens this session, and tokens this week.
@@ -1167,4 +1611,4 @@ def build(config: dict[str, Any], conversation, record, resumed=None) -> Androme
     return AndromedaApp(config, conversation, record, resumed=resumed)
 
 
-__all__ = ["AndromedaApp", "SLASH_HELP", "build"]
+__all__ = ["AndromedaApp", "build", "slash_help"]

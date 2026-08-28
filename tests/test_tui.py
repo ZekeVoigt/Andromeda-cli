@@ -17,6 +17,7 @@ a real widget tree without a terminal.
 from __future__ import annotations
 
 import dataclasses
+import os
 import re
 import threading
 from pathlib import Path
@@ -31,7 +32,7 @@ from andromeda_tools.clarify import Question as ClarifyQuestion
 
 import andromeda_tui
 from andromeda_tui import events as ev
-from andromeda_tui.app import SLASH_HELP, AndromedaApp
+from andromeda_tui.app import AndromedaApp, slash_help
 from andromeda_tui.driver import AgentDriver, Pending, TurnInterrupted
 from andromeda_tui.prompts import APPROVAL_CHOICES, ApprovalScreen, ClarifyScreen
 from andromeda_tui.widgets import ActivityLane, RecentUpdates, StudyPanel, Transcript
@@ -325,9 +326,21 @@ class TestSurfaceChoice:
 
     def test_the_slash_vocabulary_matches_the_repl(self):
         """Two surfaces of one product must not disagree about the commands."""
-        verbs = set(re.findall(r"^\s*(/\w+)", repl.SLASH_HELP, re.MULTILINE))
-        mine = set(re.findall(r"^\s*(/\w+)", SLASH_HELP, re.MULTILINE))
-        assert verbs == mine
+        assert slash_help() == repl.slash_help()
+
+    def test_every_conversation_command_is_handled_here(self):
+        """The list is generated now, so the way it can be wrong has changed:
+        not "somebody forgot to add a line" but "somebody added a line for a
+        command this screen does not implement"."""
+        import inspect
+
+        from andromeda_cli import vocabulary
+
+        source = inspect.getsource(AndromedaApp._slash)
+        for row in vocabulary.commands():
+            if row.kind != "conversation":
+                continue
+            assert f'"/{row.name}"' in source, row.name
 
 
 # ---------------------------------------------------------------------------
@@ -391,21 +404,33 @@ def _app(tmp_path, script=None):
 
 
 class TestTheScreen:
-    def test_the_surface_uses_the_marketing_palette_not_terminal_colours(self):
+    def test_the_stylesheet_names_no_terminal_colours(self):
+        """Hue is allowed now; *terminal* colour names still are not.
+
+        The palette was monochrome and is not any more — see
+        `render.YOU` and its three siblings. What that decision changed is
+        which colours exist, not where they may be written: a stylesheet that
+        says `cyan` inherits whatever sixteen colours the person's terminal
+        happens to be configured with, and the surface stops being a thing
+        anyone designed.
+
+        Checked as CSS declarations rather than as substrings of the whole
+        sheet. The version of this test that searched the raw text failed on
+        the word "rendered", which contains "red" — a check that fires on prose
+        teaches people to phrase comments around it.
+        """
         css = AndromedaApp.CSS.lower()
-        for retired in (
-            "#8f9bff",
-            "#18181b",
-            "#202027",
-            "#52525b",
-            "cyan",
-            "magenta",
-            "yellow",
-            "red",
-            "green",
-            "border-left: thick",
-            "border: round",
-        ):
+        declarations = " ".join(
+            line.split("/*")[0] for line in css.splitlines()
+        )
+        values = re.findall(r":\s*([^;{}]+)", declarations)
+        words = {word for value in values for word in re.findall(r"[a-z#0-9]+", value)}
+
+        for retired in ("cyan", "magenta", "yellow", "red", "green", "blue"):
+            assert retired not in words, f"{retired} is a terminal colour"
+        for retired in ("#8f9bff", "#18181b", "#202027", "#52525b"):
+            assert retired not in css
+        for retired in ("border-left: thick", "border: round"):
             assert retired not in css
 
         assert render.ZINC_50 == "#fafafa"
@@ -413,33 +438,304 @@ class TestTheScreen:
         assert render.ZINC_200 == "#e4e4e7"
         assert not hasattr(render, "PERIWINKLE")
 
+    def test_the_hues_are_one_per_meaning(self):
+        """Four hues, each naming a distinction and none naming two.
+
+        The budget is the point. A palette grows one well-argued colour at a
+        time until nothing on screen means anything, so the test is not "these
+        four exist" but "these four are all there are, and they differ".
+        """
+        hues = {
+            "you": render.YOU,
+            "agent": render.AGENT,
+            "autonomous": render.AUTONOMOUS,
+            "good": render.GOOD,
+            "bad": render.BAD,
+        }
+        assert len(set(hues.values())) == len(hues)
+        assert all(value.startswith("#") for value in hues.values())
+
+        from andromeda_tui.widgets import SCREEN_TONES
+
+        # The surface and the REPL resolve the same names to the same colours.
+        for name in ("you", "agent", "autonomous", "good", "bad"):
+            assert name in SCREEN_TONES
+            assert name in render.THEME.styles
+
     @pytest.mark.asyncio
-    async def test_user_prompts_are_unlabelled_and_answers_are_bracketed(self, tmp_path):
+    async def test_a_turn_is_framed_once_not_labelled_per_segment(self, tmp_path):
+        """One frame per turn. This is the whole complaint it fixes.
+
+        The banner this replaces was painted by `feed_answer`, which opens a
+        new block after every tool call — so a turn that called three tools
+        produced four labels interleaved with the tool lines, and there was no
+        mark anywhere saying where the answer began or ended. A frame is opened
+        once by whatever speaks first and closed once when the turn ends.
+        """
         app = _app(tmp_path, script=["Hello back"])
-        async with app.run_test() as pilot:
+        async with app.run_test(size=(160, 60)) as pilot:
             app.driver.submit("Hello there")
-            # Settle on the closing rule rather than on `busy`: the flag drops
-            # when the worker finishes, which is before the tick that drains
-            # `TurnFinished` and draws the end of the frame.
-            await _settle(pilot, app, lambda: len(_frames(app)) == 2)
+            transcript_of = lambda: app.query_one(Transcript)
+            # Settle on the closing edge itself, not on `driver.busy`. The flag
+            # drops when the agent thread finishes, which is one tick *before*
+            # `TurnFinished` is drained and the frame is closed — so waiting on
+            # it asserts against a half-drawn turn. Under a loaded full-suite
+            # run that gap is wide enough to fail; alone it never was.
+            await _settle(
+                pilot,
+                app,
+                lambda: len(transcript_of().query(".frame-bottom")) == 1,
+            )
+            await pilot.pause()
+
+            transcript = transcript_of()
+            tops = transcript.query(".frame-top")
+            bottoms = transcript.query(".frame-bottom")
+
+            assert len(tops) == 1
+            assert len(bottoms) == 1
+            assert "[ A N D R O M E D A ]" not in _painted(app)
+            # The label rides on the frame's top edge, once.
+            assert "A N D R O M E D A" in str(tops[0].visual)
+
+    @pytest.mark.asyncio
+    async def test_the_frame_closes_after_the_answer_not_before_a_tool(self, tmp_path):
+        """A tool belongs inside the turn that called it."""
+        from andromeda_tui.widgets import Transcript as T
+
+        transcript = T()
+        transcript._append = lambda widget: None  # no app to mount into
+        transcript.call_after_refresh = lambda call: None
+
+        transcript.ensure_frame("andromeda")
+        transcript.add_tool("read_file data.txt", "safe_local")
+        transcript.add_tool_result("4 lines", ok=True)
+        assert transcript._frame == ("andromeda", "agent", "")
+
+        transcript.close_frame()
+        assert transcript._frame is None
+
+    @pytest.mark.asyncio
+    async def test_only_the_persons_turn_is_unframed(self, tmp_path):
+        """The asymmetry is still the signal, and now it is a hue too.
+
+        A matching `[ Y O U ]` was tried and removed: two labels facing each
+        other is twice the furniture for one bit. What separates them is that
+        the agent's turn is framed and the person's is not — plus
+        `render.YOU`, which does in one glance what a 16-point brightness
+        difference between two near-identical greys could not do at all.
+        """
+        app = _app(tmp_path, script=["Hello back"])
+        async with app.run_test(size=(160, 60)) as pilot:
+            app.driver.submit("Hello there")
+            await _settle(pilot, app, lambda: not app.driver.busy)
             prompt = app.query_one(Transcript).query_one(".prompt")
 
-            assert str(prompt.visual) == "Hello there"
-
-            # The label lives on the frame that opens the turn, not on the
-            # prose — a reply is its text and the tools it called, and the
-            # bracket has to be able to contain both.
-            frames = _frames(app)
-            assert len(frames) == 2, "one rule opens the turn, one closes it"
-            assert "A N D R O M E D A" in frames[0]
-            assert "A N D R O M E D A" not in frames[1]
-            for rule in frames:
-                assert rule.startswith("[") and rule.endswith("]")
-
-            assert "A N D R O M E D A" not in _painted(app)
+            assert "Hello there" in str(prompt.visual)
+            assert "[ Y O U ]" not in str(prompt.visual)
             assert "INPUT" not in str(prompt.visual)
             assert "OUTPUT" not in _painted(app)
             assert "YOUR MESSAGE" not in AndromedaApp.CSS.upper()
+
+            # Textual parses the hex into a `Color` before it reaches the
+            # widget, so the assertion is on the resolved triple. Matching the
+            # literal `#67e8f9` passes only until Textual normalises it, which
+            # it already does.
+            wanted = tuple(int(render.YOU[index : index + 2], 16) for index in (1, 3, 5))
+            spans = prompt.visual.spans if hasattr(prompt.visual, "spans") else []
+            found = {
+                (
+                    span.style.foreground.rgb
+                    if getattr(span.style, "foreground", None) is not None
+                    else None
+                )
+                for span in spans
+            }
+            assert wanted in found
+
+    @pytest.mark.asyncio
+    async def test_a_scheduled_run_paints_into_the_session_that_created_it(
+        self, tmp_path, monkeypatch
+    ):
+        """The complaint this closes: "it just sends me a notification".
+
+        A scheduled run is a full agent turn happening in a daemon with no
+        screen. It now writes a journal and the surface tails it, so the run
+        appears in the conversation that asked for it — live, with its tool
+        calls, inside its own amber frame.
+        """
+        from andromeda_agent import live
+        from andromeda_cli import config as config_module
+
+        home = tmp_path / "home"
+        monkeypatch.setattr(config_module, "home", lambda: home)
+
+        app = _app(tmp_path)
+        async with app.run_test(size=(160, 60)) as pilot:
+            await pilot.pause()
+            session_id = app.driver.binding.record.id
+
+            writer = live.Writer(
+                home, job_id="job_x", job_name="PR watch", session=session_id
+            )
+            writer.started(reason="scheduled")
+            writer.text("Two PRs changed.")
+            writer.tool("bash gh pr list", "safe_local")
+            writer.tool_result("exit 0 · 4 lines", ok=True)
+            writer.finished("ok", summary="Two PRs changed.")
+
+            await _settle(pilot, app, lambda: app.transcript.query(".frame-top"))
+            await pilot.pause()
+
+            # Read off the widgets rather than `_painted`, which only returns
+            # the answer block — the frame edge, the tool line and the status
+            # note are separate rows by design.
+            rows = " ".join(str(widget.visual) for widget in app.transcript.children)
+            assert "A U T O N O M O U S" in rows
+            # The job's name is beside the label, in plain casing — tracking it
+            # would render "PR watch" as "P R   W A T C H".
+            assert "⌂ PR watch" in rows
+            assert "Two PRs changed." in _painted(app)
+            assert "gh pr list" in rows
+            assert "finished · ok" in rows
+            # It is closed, not left hanging.
+            assert len(app.transcript.query(".frame-bottom")) == 1
+
+            # And it is not confused with an answer this person asked for.
+            top = app.transcript.query(".frame-top")[0]
+            wanted = tuple(
+                int(render.AUTONOMOUS[index : index + 2], 16) for index in (1, 3, 5)
+            )
+            found = {
+                (
+                    span.style.foreground.rgb
+                    if getattr(span.style, "foreground", None) is not None
+                    else None
+                )
+                for span in top.visual.spans
+            }
+            assert wanted in found
+
+    @pytest.mark.asyncio
+    async def test_a_run_for_another_conversation_stays_out_of_this_one(
+        self, tmp_path, monkeypatch
+    ):
+        """A job attached elsewhere must not interrupt the session on screen.
+
+        Without the filter every surface paints every run, and the feature
+        becomes a reason to close the app.
+        """
+        from andromeda_agent import live
+        from andromeda_cli import config as config_module
+
+        home = tmp_path / "home"
+        monkeypatch.setattr(config_module, "home", lambda: home)
+
+        app = _app(tmp_path)
+        async with app.run_test(size=(160, 60)) as pilot:
+            await pilot.pause()
+
+            live.Writer(
+                home, job_id="job_y", job_name="Elsewhere", session="not-this-one"
+            ).finished("ok", summary="should not appear")
+
+            for _ in range(4):
+                await pilot.pause()
+
+            assert "should not appear" not in _painted(app)
+            assert not app.transcript.query(".frame-top")
+
+    def test_a_session_is_deleted_from_the_rail_after_two_clicks(
+        self, tmp_path, monkeypatch
+    ):
+        """One click arms, the second deletes.
+
+        A modal is the right answer when the thing being destroyed is expensive
+        to rebuild. A transcript is not, and a dialog per row turns tidying up
+        forty sessions into eighty keystrokes. The row says `sure?` between the
+        clicks, so the second is never a surprise.
+        """
+        from andromeda_cli import sessions as store
+        from andromeda_tui.widgets import SessionsRail
+
+        directory = tmp_path / "sessions"
+        monkeypatch.setattr(store, "sessions_dir", lambda: directory)
+
+        keeper = store.Session(id="aaaaaaaaaaaa", messages=[{"role": "user", "content": "keep"}])
+        doomed = store.Session(id="bbbbbbbbbbbb", messages=[{"role": "user", "content": "drop"}])
+        keeper.save()
+        doomed.save()
+        assert doomed.path.exists()
+
+        rail = SessionsRail()
+        # No running app, so painting is stubbed. What is under test is the
+        # arming state machine and the file, neither of which needs a screen.
+        rail._refresh = lambda: None
+        rail.reload()
+        assert {row[0] for row in rail.rows} >= {keeper.id, doomed.id}
+
+        target = next(index for index, row in enumerate(rail.rows) if row[0] == doomed.id)
+        rail.cursor = target
+
+        posted = []
+        rail.post_message = posted.append
+
+        rail.delete_selected()
+        assert rail._confirming == doomed.id
+        assert posted == []  # armed, not fired
+
+        rail.delete_selected()
+        assert len(posted) == 1
+        assert posted[0].session_id == doomed.id
+        assert rail._confirming == ""
+
+        assert store.delete(doomed.id) is True
+        assert not doomed.path.exists()
+        assert keeper.path.exists()
+
+        rail.forget(doomed.id)
+        assert doomed.id not in {row[0] for row in rail.rows}
+
+    def test_moving_off_a_row_disarms_its_delete(self, tmp_path, monkeypatch):
+        """A confirmation that outlives the cursor fires on a click you forgot."""
+        from andromeda_cli import sessions as store
+        from andromeda_tui.widgets import SessionsRail
+
+        directory = tmp_path / "sessions"
+        monkeypatch.setattr(store, "sessions_dir", lambda: directory)
+        for index in range(3):
+            store.Session(
+                id=f"{index}" * 12, messages=[{"role": "user", "content": str(index)}]
+            ).save()
+
+        rail = SessionsRail()
+        rail.reload()
+        rail._refresh = lambda: None
+        rail.post_message = lambda message: None
+
+        rail.delete_selected()
+        assert rail._confirming
+        rail.move(1)
+        assert rail._confirming == ""
+
+    @pytest.mark.asyncio
+    async def test_the_live_session_refuses_to_be_deleted(self, tmp_path):
+        """Unlinking the file being written to does not stop the writing.
+
+        The next save recreates it, half of it, under the same id. Refusing
+        with a one-key instruction leaves nothing ambiguous.
+        """
+        app = _app(tmp_path)
+        async with app.run_test(size=(160, 60)) as pilot:
+            await pilot.pause()
+            live_id = app.driver.binding.record.id
+
+            app.on_sessions_rail_deleted(
+                app.recent_updates.Deleted(live_id)
+            )
+            await pilot.pause()
+
+            assert "CTRL+L" in _notes(app)
 
     @pytest.mark.asyncio
     async def test_the_landing_page_chrome_frames_the_surface(self, tmp_path):
@@ -469,12 +765,15 @@ class TestTheScreen:
             await pilot.pause()
             positions = []
 
+            # Painted the way `_handle` paints a turn — prompt, frame, answer,
+            # close. The version of this loop that skipped the frame was
+            # measuring a turn the app never produces, and it drifted the
+            # moment the per-segment banner it was silently relying on for
+            # height went away.
             for index in range(12):
-                # The frame is part of a turn's height, so a test about how
-                # fast turns push the hero out has to build turns the way
-                # `_handle` does rather than prose alone.
+                app.transcript.close_frame()
                 app.transcript.add_prompt(f"Question {index}")
-                app.transcript.open_frame()
+                app.transcript.ensure_frame(AndromedaApp.ANSWER_FRAME)
                 app.transcript.feed_answer(f"Answer {index}\nwith one more line")
                 app.transcript.end_answer()
                 app.transcript.close_frame()
@@ -682,6 +981,37 @@ class TestTheScreen:
             await pilot.press("escape")
 
     @pytest.mark.asyncio
+    async def test_a_long_command_does_not_push_the_refusals_off_the_box(
+        self, tmp_path
+    ):
+        """Every answer stays on screen, the two refusals most of all.
+
+        The box grew to fit the command it was asking about and Textual clipped
+        the overflow, which took `n` and `never` with it. What scrolls now is
+        the command; the answers are pinned.
+        """
+        long_command = (
+            "rsync -av --delete /Users/someone/a/very/long/source/path/that/wraps "
+            "/Volumes/backup/destination && echo done && ls -la /Volumes/backup"
+        )
+        app = _app(
+            tmp_path,
+            script=[turn_with(call("terminal", {"command": long_command})), "ok"],
+        )
+        async with app.run_test(size=(70, 16)) as pilot:
+            app.driver.submit("back it up")
+            await _settle(pilot, app, lambda: isinstance(app.screen, ApprovalScreen))
+            await pilot.pause()
+            screen = app.screen
+            choices = screen.query_one("#approval-choices")
+            assert choices.region.height >= len(APPROVAL_CHOICES)
+            assert app.screen.region.contains_region(choices.region)
+            assert app.screen.region.contains_region(
+                screen.query_one("#approval-header").region
+            )
+            await pilot.press("n")
+
+    @pytest.mark.asyncio
     async def test_the_activity_lane_says_who_is_waiting(self, tmp_path):
         """A spinner while a prompt is open blames the machine for the pause."""
         app = _app(tmp_path, script=[turn_with(call("terminal", {"command": "ls"})), "ok"])
@@ -712,6 +1042,50 @@ class TestTheScreen:
             await _settle(pilot, app, lambda: bool(answers))
             thread.join(timeout=5)
             assert answers == [["prod"]]
+
+    @pytest.mark.asyncio
+    async def test_a_long_list_on_a_short_terminal_keeps_the_prompt_answerable(
+        self, tmp_path
+    ):
+        """The two rows that must survive are the question and the input.
+
+        The box grew to fit its options and Textual clipped what would not fit,
+        which took the question off the top and the input off the bottom: a
+        numbered list with nothing saying what it was for and no way to answer
+        it. The list scrolls instead.
+        """
+        from textual.containers import VerticalScroll
+        from textual.widgets import Input
+
+        app = _app(tmp_path, script=["thanks"])
+        async with app.run_test(size=(80, 11)) as pilot:
+            answers: list[list[str]] = []
+            questions = [
+                ClarifyQuestion(
+                    "Which of these did you mean? The catalogue is fixed and the "
+                    "name you gave is not on it.",
+                    ["webflow", "linear", "notion", "supabase"],
+                )
+            ]
+            thread = threading.Thread(
+                target=lambda: answers.append(app.driver.ask_questions(questions))
+            )
+            thread.start()
+            await _settle(pilot, app, lambda: isinstance(app.screen, ClarifyScreen))
+            await pilot.pause()
+            screen = app.screen
+            visible = app.screen.region
+            for widget_id in ("#clarify-question", "#clarify-input"):
+                region = screen.query_one(widget_id).region
+                assert region.height > 0, f"{widget_id} was laid out with no height"
+                assert visible.contains_region(region), f"{widget_id} is off screen"
+            # And the squeeze landed where it was aimed.
+            assert screen.query_one("#clarify-choices", VerticalScroll).styles.max_height
+            screen.query_one("#clarify-input", Input).value = "2"
+            await pilot.press("enter")
+            await _settle(pilot, app, lambda: bool(answers))
+            thread.join(timeout=5)
+            assert answers == [["linear"]]
 
     @pytest.mark.asyncio
     async def test_an_empty_clarify_answer_takes_the_recommendation(self, tmp_path):
@@ -982,16 +1356,6 @@ def _classes(app) -> list[str]:
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
-def _frames(app) -> list[str]:
-    """The rules that open and close a turn, escape codes stripped."""
-    transcript = app.query_one(Transcript)
-    return [
-        ANSI.sub("", str(w.visual))
-        for w in transcript.children
-        if w.has_class("frame")
-    ]
-
-
 def _painted(app) -> str:
     """What the answer block actually shows, escape codes stripped."""
     transcript = app.query_one(Transcript)
@@ -1066,7 +1430,15 @@ class TestBothSurfacesOpenTheSame:
             assert app.study.region.x < app.recent_updates.region.x
 
     @pytest.mark.asyncio
-    async def test_updates_rail_contains_cli_changes_not_chat_activity(self, tmp_path):
+    async def test_updates_rail_lists_sessions_not_live_chat_activity(self, tmp_path):
+        """The rail browses saved sessions; it is not a feed of this turn.
+
+        The rail used to hold the changelog, and this test used to assert that.
+        The half of its intent that outlived the change is the half kept: what
+        is being said *right now* must not leak into the rail. A live turn is
+        not history, and the rail showing it would be the "conversation event
+        masquerading as something durable" the old version guarded against.
+        """
         app = _app(tmp_path, script=["A user-facing answer"])
         async with app.run_test(size=(160, 60)) as pilot:
             app.driver.submit("A private user message")
@@ -1075,75 +1447,681 @@ class TestBothSurfacesOpenTheSame:
             updates = str(app.query_one(RecentUpdates).visual)
 
         assert "SYS. 001" in updates
-        assert "RECENT CLI CHANGES" in updates
-        # The rail's newest entry is labelled with the release it came from and
-        # the section it sat under. Asserted as a shape rather than as the
-        # literal heading that happens to be top of the changelog today — a
-        # test that pins "UNRELEASED" fails on the release that names it.
-        assert re.search(r"01 / \S+ / (ADDED|CHANGED|FIXED|REMOVED)", updates)
-        assert "RECENT CONVERSATIONS" not in updates
+        assert "SESSIONS" in updates
+        # Both groups are always offered, including the empty one. A tab that
+        # appears only once it has content is a feature nobody discovers.
+        assert "ALL" in updates and "AGENT" in updates
+        assert "RECENT CLI CHANGES" not in updates
         assert "A private user message" not in updates
         assert "A user-facing answer" not in updates
         assert str(tmp_path) not in updates
 
+    @pytest.mark.asyncio
+    async def test_rail_gathers_every_agent_session_under_one_tab(self, tmp_path):
+        """Local and cloud stopped being two things the moment placement became
+        a per-fire decision. Splitting the rail by it made a conversation move
+        between tabs for reasons nobody could see."""
+        from andromeda_tui.widgets import SessionsRail
 
-def test_the_frame_encloses_the_tools_a_reply_used():
-    """A reply is its prose AND the tools it called, inside one bracket.
+        rail = SessionsRail()
+        rail.rows = [
+            ("aaa", "Watch my PRs", "2h ago", "local"),
+            ("bbb", "Refactor auth", "1d ago", ""),
+            ("ccc", "Inbox digest", "3d ago", "cloud"),
+        ]
+        rail._clamp()
+        painted: dict = {}
+        rail.update = lambda text: painted.update(text=text)
 
-    `ToolStarted` closes the open answer block, so a turn is a stack of prose
-    fragments with tool rows between them. Marking a fragment leaves the tools
-    outside the mark; the boundary has to be the turn.
+        rail._refresh()
+        # ALL is what *you* said. A five-minute job would otherwise push every
+        # real conversation off the rail with its own output.
+        assert [row[0] for row in rail._visible_rows()] == ["bbb"]
+
+        rail.switch_tab(1)
+        # Both job sessions, neither plain conversation.
+        assert [row[0] for row in rail._visible_rows()] == ["aaa", "ccc"]
+
+    @pytest.mark.asyncio
+    async def test_each_agent_row_still_says_where_it_is(self, tmp_path):
+        """One tab, and the badge on each row carries what the tabs used to."""
+        from andromeda_tui.widgets import SessionsRail
+
+        rail = SessionsRail()
+        rail.rows = [
+            ("aaa", "Watch my PRs", "2h ago", "local"),
+            ("ccc", "Inbox digest", "3d ago", "cloud"),
+        ]
+        rail._clamp()
+        painted: dict = {}
+        rail.update = lambda text: painted.update(text=text)
+        rail.switch_tab(1)
+
+        plain = painted["text"].plain
+        assert "⌂" in plain
+        assert "☁" in plain
+        assert "☁" in painted["text"].plain
+
+        # Wraps rather than stopping, so ←→ never dead-ends on an end tab.
+        rail.switch_tab(1)
+        assert rail.TABS[rail.tab][0] == "all"
+
+    @pytest.mark.asyncio
+    async def test_rail_says_what_an_empty_group_means(self, tmp_path):
+        """An empty AGENT tab is the ordinary state, not a broken feature."""
+        from andromeda_tui.widgets import SessionsRail
+
+        rail = SessionsRail()
+        rail.rows = []
+        painted: dict = {}
+        rail.update = lambda text: painted.update(text=text)
+
+        rail._refresh()
+        assert "NO SAVED SESSIONS" in painted["text"].plain
+        rail.switch_tab(1)
+        assert "NO AGENT JOBS YET" in painted["text"].plain
+        # Two tabs, so one more step is back to the start.
+        rail.switch_tab(1)
+        assert "NO SAVED SESSIONS" in painted["text"].plain
+
+    @pytest.mark.asyncio
+    async def test_the_rail_is_hit_tested_in_real_geometry(self, tmp_path):
+        """Clicks are resolved through the widget's actual padding.
+
+        This is the regression that shipped. A click's offset is relative to
+        the widget's outer box, and the rail carries CSS padding — one line at
+        the top, two columns at the left. Hit-testing the raw offset made the
+        tab strip unreachable and mapped a click on one row onto its
+        neighbour, which is exactly how it behaved in a real terminal while
+        every unit test passed: the tests posted synthetic offsets that already
+        agreed with the broken arithmetic.
+
+        So this test is driven from the live app and reads the padding back off
+        the resolved style rather than restating it.
+        """
+        app = _app(tmp_path)
+        async with app.run_test(size=(160, 60)) as pilot:
+            await pilot.pause()
+            rail = app.recent_updates
+            rail.rows = [
+                (f"id{index}", f"Session {index}", "2h ago", "")
+                for index in range(30)
+            ]
+            rail.tab = 0
+            rail.cursor = 0
+            rail.window_top = 0
+            rail._clamp()
+            rail._refresh()
+            await pilot.pause()
+
+            padding = rail.styles.padding
+            assert padding.top or padding.left, "the bug needs padding to exist"
+
+            opened: list[str] = []
+            real_post = rail.post_message
+
+            def spy(message):
+                if isinstance(message, rail.Opened):
+                    opened.append(message.session_id)
+                else:
+                    real_post(message)
+
+            rail.post_message = spy
+
+            class _Offset:
+                def __init__(self, x, y):
+                    self.x, self.y = x, y
+
+            class _Click:
+                def __init__(self, x, y):
+                    self.offset = _Offset(x, y)
+
+            # The third visible row, addressed the way Textual addresses it.
+            line, index = sorted(rail._row_lines.items())[2]
+            rail.on_click(_Click(6 + padding.left, line + padding.top))
+            assert opened == [f"id{index}"]
+
+            # And the tab strip, which the shipped version could not reach.
+            begins, _ = rail._tab_span(1)
+            rail.on_click(
+                _Click(begins + padding.left + 1, rail._tab_line + padding.top)
+            )
+            assert rail.TABS[rail.tab][0] == "agent"
+
+    @pytest.mark.asyncio
+    async def test_the_rail_shows_as_many_rows_as_it_has_room_for(self, tmp_path):
+        """Capacity is measured, not fixed.
+
+        The constant it replaced showed four rows on a terminal with room for a
+        dozen, which turned browsing forty sessions into forty keystrokes.
+        """
+        app = _app(tmp_path)
+        async with app.run_test(size=(160, 60)) as pilot:
+            await pilot.pause()
+            rail = app.recent_updates
+            rail.rows = [
+                (f"id{index}", f"Session {index}", "2h ago", "")
+                for index in range(40)
+            ]
+            rail._clamp()
+            rail._refresh()
+            await pilot.pause()
+
+            assert rail._capacity() > 4
+            assert len(rail._row_lines) == rail._capacity()
+            # One painted line per row, so the map has no gaps.
+            lines = sorted(rail._row_lines)
+            assert lines == list(range(lines[0], lines[0] + len(lines)))
+
+    @pytest.mark.asyncio
+    async def test_the_wheel_reaches_every_session(self, tmp_path):
+        """Forty sessions, and no chord required to see the fortieth."""
+        app = _app(tmp_path)
+        async with app.run_test(size=(160, 60)) as pilot:
+            await pilot.pause()
+            rail = app.recent_updates
+            rail.rows = [
+                (f"id{index}", f"Session {index}", "2h ago", "")
+                for index in range(40)
+            ]
+            rail._clamp()
+            rail._refresh()
+
+            class _Scroll:
+                def stop(self):
+                    pass
+
+            for _ in range(60):
+                rail.on_mouse_scroll_down(_Scroll())
+            assert rail.cursor == 39
+
+            for _ in range(80):
+                rail.on_mouse_scroll_up(_Scroll())
+            assert rail.cursor == 0
+
+
+class TestJobsAreManagedWithoutLeaving:
+    """The surface offers the verbs the agent points at.
+
+    The complaint these answer: Andromeda replied with `andromeda cron install`
+    and `andromeda cron approve ...`, both of which are shell commands that
+    cannot be typed where they were read. One of them should never have been
+    asked for at all; the other needed a door on this surface rather than an
+    instruction to leave through it.
     """
-    from andromeda_tui.widgets import FrameRule, Transcript
 
-    transcript = Transcript.__new__(Transcript)
-    transcript._framed = False
-    mounted: list = []
-    transcript._append = mounted.append
+    @staticmethod
+    def _notes(app) -> str:
+        """Everything the transcript printed that was not a model answer."""
+        transcript = app.query_one(Transcript)
+        return ANSI.sub(
+            "",
+            "\n".join(
+                str(child.visual)
+                for child in transcript.children
+                if not child.has_class("answer")
+            ),
+        )
 
-    # Either a delta or a tool call may come first; whichever does opens it.
-    transcript.open_frame()
-    transcript.open_frame()
-    transcript.open_frame()
-    assert len(mounted) == 1, "the frame opens once, however many times asked"
-    assert isinstance(mounted[0], FrameRule)
+    @pytest.mark.asyncio
+    async def test_jobs_answers_on_this_surface(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("ANDROMEDA_HOME", str(tmp_path))
+        app = _app(tmp_path)
+        async with app.run_test() as pilot:
+            app._slash("/jobs")
+            await pilot.pause()
+            notes = self._notes(app)
 
-    transcript.close_frame()
-    transcript.close_frame()
-    assert len(mounted) == 2, "and closes once"
+        assert "unknown command" not in notes
+        # It answered here rather than sending the person to a shell.
+        assert "andromeda cron list" not in notes
 
-    # The opening rule is labelled and the closing one is not.
-    assert mounted[0]._label
-    assert not mounted[1]._label
+    @pytest.mark.asyncio
+    async def test_a_slash_command_never_reaches_the_model(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("ANDROMEDA_HOME", str(tmp_path))
+        app = _app(tmp_path, script=["never asked"])
+        async with app.run_test() as pilot:
+            app._slash("/jobs")
+            await pilot.pause()
+            assert app.conversation.provider.seen == []
 
-    # A new turn opens a fresh frame.
-    transcript.open_frame()
-    assert len(mounted) == 3
+    @pytest.mark.asyncio
+    async def test_approve_without_an_id_explains_itself(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("ANDROMEDA_HOME", str(tmp_path))
+        app = _app(tmp_path)
+        async with app.run_test() as pilot:
+            app._slash("/approve")
+            await pilot.pause()
+            notes = self._notes(app)
+
+        assert "/approve" in notes and "/jobs" in notes
+
+    @pytest.mark.asyncio
+    async def test_approve_widens_a_real_job_in_place(self, tmp_path, monkeypatch):
+        """The grant is still a person's to make — it just happens here now."""
+        monkeypatch.setenv("ANDROMEDA_HOME", str(tmp_path))
+        from andromeda_cli.commands import cron as cron_cmd
+
+        job = cron_cmd._schedule().add(
+            "every 1h", "watch", str(tmp_path), name="W", origin="agent"
+        )
+        assert job.approval_mode == "ask"
+
+        app = _app(tmp_path)
+        async with app.run_test() as pilot:
+            app._slash(f"/approve {job.id}")
+            await pilot.pause()
+
+        assert cron_cmd._schedule().resolve(job.id).approval_mode == "auto"
+
+    @pytest.mark.asyncio
+    async def test_approve_cannot_move_a_job_into_the_cloud(self, tmp_path):
+        """A larger grant than this one, and not a slash-command decision.
+
+        Moving a job onto hardware the person does not hold deserves the
+        refusal matrix and a command they had to read, not a shortcut typed
+        mid-conversation.
+        """
+        import inspect
+
+        from andromeda_tui import app as app_module
+
+        source = inspect.getsource(app_module.AndromedaApp._approve_job)
+        assert "run_on" not in source or "cloud" not in source.split("approval=")[-1]
+
+    @pytest.mark.asyncio
+    async def test_a_failing_slash_command_does_not_kill_the_app(
+        self, tmp_path, monkeypatch
+    ):
+        """`_capture` folds the failure into a line.
+
+        A slash command reaching into the CLI's command layer is reaching into
+        code that expects a terminal. It must not take the surface down with it.
+        """
+        monkeypatch.setenv("ANDROMEDA_HOME", str(tmp_path))
+        app = _app(tmp_path)
+        async with app.run_test() as pilot:
+            lines = app._capture(lambda: 1 / 0)
+            assert lines and "ZeroDivisionError" in lines[0]
+            app._slash("/help")
+            await pilot.pause()
+            assert "/jobs" in self._notes(app)
 
 
-def test_the_frame_rule_spans_the_full_width():
-    """A bracket that stops halfway is a dash, not a frame."""
-    from rich.console import Console
-    from andromeda_tui.widgets import FrameRule
+class TestTheSchedulerArmsItself:
+    """A job created is a job that runs. No second command.
 
-    rule = FrameRule.__new__(FrameRule)
-    rule._label = "A N D R O M E D A"
-    rule._painted_at = 0
-    painted: list = []
-    rule.update = painted.append
+    The failure this closes: `cron add` produced a job that looked scheduled,
+    listed healthy, and never fired, because nothing had installed a
+    supervisor — and the only signal was a printed suggestion nobody had to act
+    on.
+    """
 
-    class _Size:
-        width = 60
+    def test_a_test_run_never_writes_a_login_service(self, monkeypatch):
+        """The guard that matters most in that module.
 
-    type(rule).content_size = property(lambda self: _Size())
-    rule._repaint()
+        The supervisor's path is fixed by the OS and reached through
+        `Path.home()`, which `ANDROMEDA_HOME` does not redirect — so without
+        this, a green test run would leave a real launch agent on the
+        developer's machine pointing at a deleted temp directory.
+        """
+        from andromeda_cli.commands import service
 
-    console = Console(width=80, force_terminal=False, highlight=False)
-    with console.capture() as captured:
-        console.print(painted[0])
-    line = captured.get().rstrip("\n")
+        assert "PYTEST_CURRENT_TEST" in os.environ
+        assert service.auto_install_allowed() is False
+        assert service.ensure_installed() is False
 
-    assert line.startswith("[")
-    assert line.endswith("]")
-    assert len(line) == 60
-    assert "A N D R O M E D A" in line
+    def test_a_person_can_turn_the_automatic_install_off(self, monkeypatch):
+        from andromeda_cli.commands import service
+
+        monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+        monkeypatch.setenv(service.NO_AUTO_ENV, "1")
+        assert service.auto_install_allowed() is False
+
+    def test_the_tool_never_hands_out_a_shell_command(self, tmp_path):
+        """What the model is told after creating a job.
+
+        The old text instructed it to relay two commands. One is now automatic
+        and the other has a slash command, so neither belongs in an answer.
+        """
+        from andromeda_agent.schedule import Schedule
+        from andromeda_tools import scheduling
+
+        schedule = Schedule(tmp_path / "cron.json")
+        spec = scheduling.cron_spec(schedule, str(tmp_path), session_id="s1")
+        result = spec.run(
+            action="create", schedule="every 60m", prompt="watch", name="W"
+        )
+
+        assert "cron install" not in result.content
+        assert "andromeda cron approve" not in result.content
+        assert "/approve" in result.content
+
+    def test_it_does_not_claim_a_job_will_fire_when_nothing_will_fire_it(
+        self, tmp_path, monkeypatch
+    ):
+        """The honest branch.
+
+        With no scheduler installed the result must say so. A confident
+        sentence promising a job is live is worse than the silence it replaced.
+
+        `is_installed` is stubbed rather than left to the machine. The
+        auto-install guard already refuses under a test runner, but
+        `is_installed` reads real launchd or systemd state — so on a developer
+        who happens to have the scheduler installed this branch is never
+        reached and the test passes or fails depending on whose laptop it runs
+        on. Which branch is under test has to be stated, not inherited.
+        """
+        from andromeda_agent.schedule import Schedule
+        from andromeda_cli.commands import service as service_module
+        from andromeda_tools import scheduling
+
+        monkeypatch.setattr(service_module, "is_installed", lambda: False)
+
+        schedule = Schedule(tmp_path / "cron.json")
+        spec = scheduling.cron_spec(schedule, str(tmp_path), session_id="s1")
+        result = spec.run(
+            action="create", schedule="every 60m", prompt="watch", name="W"
+        )
+
+        assert "will not fire" in result.content
+
+    def test_it_says_a_job_is_live_when_a_scheduler_is_installed(
+        self, tmp_path, monkeypatch
+    ):
+        """The other branch, stated for the same reason.
+
+        Two tests pinned to two stubs, so both sentences are covered wherever
+        the suite runs — rather than one of them being whatever this machine
+        happens to be.
+        """
+        from andromeda_agent.schedule import Schedule
+        from andromeda_cli.commands import service as service_module
+        from andromeda_tools import scheduling
+
+        monkeypatch.setattr(service_module, "is_installed", lambda: True)
+
+        schedule = Schedule(tmp_path / "cron.json")
+        spec = scheduling.cron_spec(schedule, str(tmp_path), session_id="s1")
+        result = spec.run(
+            action="create", schedule="every 60m", prompt="watch", name="W"
+        )
+
+        assert "will fire on its own" in result.content
+        assert "will not fire" not in result.content
+
+    @pytest.mark.asyncio
+    async def test_capturing_output_does_not_pin_the_shared_console(
+        self, tmp_path, monkeypatch
+    ):
+        """`_capture` must leave the console following stdout.
+
+        Rich resolves `Console.file` to `sys.stdout` at read time when nothing
+        is pinned. Saving that value and writing it back pins the console to
+        one stream permanently — after a single slash command every later
+        caller writes into a stale object. In the app that means output going
+        somewhere nobody is looking; in the suite it made unrelated tests go
+        silent, which is how it was found.
+        """
+        monkeypatch.setenv("ANDROMEDA_HOME", str(tmp_path))
+        from andromeda_cli import output as output_module
+
+        before = output_module.console._file
+        app = _app(tmp_path)
+        async with app.run_test() as pilot:
+            app._capture(lambda: print("something"))
+            app._capture(lambda: 1 / 0)
+            await pilot.pause()
+
+        assert output_module.console._file is before
+
+
+# ---------------------------------------------------------------------------
+# The command palette
+# ---------------------------------------------------------------------------
+
+
+class TestCommandPalette:
+    """Typing `/` in the full-screen surface did nothing at all, while the help
+    line under the composer promised `/ COMMANDS` the whole time."""
+
+    @pytest.mark.asyncio
+    async def test_a_slash_opens_the_list(self, tmp_path):
+        app = _app(tmp_path)
+        async with app.run_test(size=(160, 60)) as pilot:
+            app.composer.focus()
+            await pilot.press("/")
+            await pilot.pause()
+
+            assert app.palette.open
+            assert app.palette.display
+
+    @pytest.mark.asyncio
+    async def test_typing_narrows_it(self, tmp_path):
+        app = _app(tmp_path)
+        async with app.run_test(size=(160, 60)) as pilot:
+            app.composer.focus()
+            await pilot.press("/", "m", "c")
+            await pilot.pause()
+
+            assert [row.name for row in app.palette.rows] == ["mcp"]
+
+    @pytest.mark.asyncio
+    async def test_enter_completes_rather_than_sends(self, tmp_path):
+        """A highlighted row is a choice in progress. Sending `/mc` because
+        somebody was looking at `/mcp` would ignore what was on screen."""
+        app = _app(tmp_path)
+        async with app.run_test(size=(160, 60)) as pilot:
+            app.composer.focus()
+            await pilot.press("/", "m", "c")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+
+            assert app.composer.text == "/mcp "
+            assert not app.palette.open
+
+    @pytest.mark.asyncio
+    async def test_arrows_move_the_highlight_not_the_cursor(self, tmp_path):
+        app = _app(tmp_path)
+        async with app.run_test(size=(160, 60)) as pilot:
+            app.composer.focus()
+            await pilot.press("/")
+            await pilot.pause()
+            first = app.palette.chosen.name
+            await pilot.press("down")
+            await pilot.pause()
+
+            assert app.palette.chosen.name != first
+            assert app.composer.text == "/"
+
+    @pytest.mark.asyncio
+    async def test_escape_closes_it_and_gives_the_keys_back(self, tmp_path):
+        app = _app(tmp_path)
+        async with app.run_test(size=(160, 60)) as pilot:
+            app.composer.focus()
+            await pilot.press("/")
+            await pilot.pause()
+            await pilot.press("escape")
+            await pilot.pause()
+
+            assert not app.palette.open
+            # And Enter sends again, rather than completing nothing.
+            assert app.composer.text == "/"
+
+    @pytest.mark.asyncio
+    async def test_a_space_closes_it(self, tmp_path):
+        """Once there is a space the command is chosen and the rest is its
+        arguments, which the palette knows nothing about."""
+        app = _app(tmp_path)
+        async with app.run_test(size=(160, 60)) as pilot:
+            app.composer.focus()
+            await pilot.press("/", "m", "c", "p", "space")
+            await pilot.pause()
+
+            assert not app.palette.open
+
+    @pytest.mark.asyncio
+    async def test_a_message_containing_a_slash_is_left_alone(self, tmp_path):
+        """Popping a list over somebody writing `and/or` makes it feel broken."""
+        app = _app(tmp_path)
+        async with app.run_test(size=(160, 60)) as pilot:
+            app.composer.focus()
+            for key in "what about and/or":
+                await pilot.press("space" if key == " " else key)
+            await pilot.pause()
+
+            assert not app.palette.open
+
+    @pytest.mark.asyncio
+    async def test_nothing_matching_closes_rather_than_showing_an_empty_box(
+        self, tmp_path
+    ):
+        """An empty box reads as the surface having frozen."""
+        app = _app(tmp_path)
+        async with app.run_test(size=(160, 60)) as pilot:
+            app.composer.focus()
+            await pilot.press("/", "z", "z", "q", "q")
+            await pilot.pause()
+
+            assert not app.palette.open
+
+    @pytest.mark.asyncio
+    async def test_the_list_scrolls_past_what_fits(self, tmp_path):
+        """More commands than rows, so the window has to follow the highlight
+        rather than showing the first screenful forever."""
+        app = _app(tmp_path)
+        async with app.run_test(size=(160, 60)) as pilot:
+            app.composer.focus()
+            await pilot.press("/")
+            await pilot.pause()
+            palette = app.palette
+            assert len(palette.rows) > palette.VISIBLE
+
+            for _ in range(palette.VISIBLE + 2):
+                await pilot.press("down")
+            await pilot.pause()
+
+            window, highlight = palette._window()
+            assert palette.rows[palette.index] is window[highlight]
+
+    @pytest.mark.asyncio
+    async def test_page_keys_move_a_screenful_and_clamp(self, tmp_path):
+        """Wrapping a page jump is disorienting in a way wrapping one row is
+        not: page-down near the end should land on the end."""
+        app = _app(tmp_path)
+        async with app.run_test(size=(160, 60)) as pilot:
+            app.composer.focus()
+            await pilot.press("/")
+            await pilot.pause()
+            palette = app.palette
+
+            await pilot.press("pagedown")
+            await pilot.pause()
+            assert palette.index == palette.PAGE
+
+            for _ in range(20):
+                await pilot.press("pagedown")
+            await pilot.pause()
+            assert palette.index == len(palette.rows) - 1
+
+    @pytest.mark.asyncio
+    async def test_home_and_end_jump(self, tmp_path):
+        app = _app(tmp_path)
+        async with app.run_test(size=(160, 60)) as pilot:
+            app.composer.focus()
+            await pilot.press("/")
+            await pilot.pause()
+
+            await pilot.press("end")
+            await pilot.pause()
+            assert app.palette.index == len(app.palette.rows) - 1
+
+            await pilot.press("home")
+            await pilot.pause()
+            assert app.palette.index == 0
+
+    @pytest.mark.asyncio
+    async def test_it_says_which_way_there_is_more(self, tmp_path):
+        """A bare "… 21 more" under a half-scrolled list is wrong in both
+        directions and reads as though the top is all there is."""
+        app = _app(tmp_path)
+        async with app.run_test(size=(160, 60)) as pilot:
+            app.composer.focus()
+            await pilot.press("/")
+            await pilot.pause()
+            await pilot.press("end")
+            await pilot.pause()
+
+            painted = app.palette.render().plain
+            assert "↑" in painted
+            assert f"{len(app.palette.rows)}/{len(app.palette.rows)}" in painted
+
+
+class TestSessionLinks:
+    """Printing `andromeda --resume 78d4aa057c95` and expecting somebody to
+    select it, copy it, leave the app and paste it into a shell is asking a
+    person to be a terminal."""
+
+    @pytest.mark.asyncio
+    async def test_a_written_resume_command_becomes_a_clickable_row(self, tmp_path):
+        from andromeda_tui.widgets import SessionLink
+
+        app = _app(tmp_path)
+        async with app.run_test(size=(160, 60)) as pilot:
+            transcript = app.transcript
+            transcript.feed_answer(
+                "Made you a job.\n\n  andromeda --resume 78d4aa057c95\n"
+            )
+            transcript.end_answer()
+            await pilot.pause()
+
+            links = list(transcript.query(SessionLink))
+            assert [link.session_id for link in links] == ["78d4aa057c95"]
+
+    @pytest.mark.asyncio
+    async def test_one_row_per_session_however_often_it_is_written(self, tmp_path):
+        from andromeda_tui.widgets import SessionLink
+
+        app = _app(tmp_path)
+        async with app.run_test(size=(160, 60)) as pilot:
+            transcript = app.transcript
+            transcript.feed_answer(
+                "andromeda --resume aaaaaaaaaaaa and again "
+                "andromeda --resume aaaaaaaaaaaa"
+            )
+            transcript.end_answer()
+            await pilot.pause()
+
+            assert len(list(transcript.query(SessionLink))) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_bare_hex_run_is_not_a_link(self, tmp_path):
+        """A commit hash is also twelve hex characters, and turning one into
+        "open this conversation" would be a link to nothing."""
+        from andromeda_tui.widgets import SessionLink
+
+        app = _app(tmp_path)
+        async with app.run_test(size=(160, 60)) as pilot:
+            transcript = app.transcript
+            transcript.feed_answer("Fixed in 78d4aa057c95, see the diff.")
+            transcript.end_answer()
+            await pilot.pause()
+
+            assert not list(transcript.query(SessionLink))
+
+    @pytest.mark.asyncio
+    async def test_clicking_goes_through_the_same_path_as_the_rail(self, tmp_path):
+        """Refused mid-turn, refused for the current session, and never
+        resuming from inside a widget."""
+        from andromeda_tui.widgets import SessionLink, SessionsRail
+
+        link = SessionLink("78d4aa057c95")
+        posted: list = []
+        link.post_message = lambda message: posted.append(message)
+
+        link.on_click()
+
+        assert len(posted) == 1
+        assert isinstance(posted[0], SessionsRail.Opened)
+        assert posted[0].session_id == "78d4aa057c95"
