@@ -107,13 +107,21 @@ def _arm(job: Job) -> None:
     Called from every path that creates a job — `add`, `suggest accept` and
     `blueprint use` — because a job that arms only when it was made one
     particular way is a job that silently never fires when it was made another.
+
+    **Every job, not only the hosted ones.** It used to upload `runs_on ==
+    "cloud"` and nothing else, on the reasonable-sounding basis that a job
+    running here needs no server. After D15 that is exactly backwards: this
+    machine no longer works out that anything is due, so a job the server has
+    not heard of is a job nothing will ever fire. The arming is the same act for
+    both; only the delivery differs.
     """
-    if job.runs_on != "cloud":
-        return
     base, token, device = _cloud_endpoint()
     try:
         cloud_client.push_job(base, token, device, job)
-        output.ok(f"  armed on the server — next fire {_when(job.next_run_at)}")
+        where = "" if job.placement() == "cloud" else " for this machine"
+        output.ok(
+            f"  armed on the server{where} — next fire {_when(job.next_run_at)}"
+        )
     except cloud_client.CloudUnavailable as exc:
         output.console.print(
             f"  [yellow]not armed yet: {exc}[/yellow]\n"
@@ -594,28 +602,26 @@ def logs(identifier: str, index: int = 0) -> int:
 
 
 def push(identifier: str = "") -> int:
-    """Arm a cloud job on the server, or every cloud job.
+    """Arm a job on the server, or every job.
 
     Exists because arming at creation is allowed to fail, and something has to
-    be the way to finish the job afterwards.
+    be the way to finish the job afterwards. After D15 that matters for every
+    job rather than only the hosted ones: this machine no longer decides
+    anything is due, so an unarmed job does not run late — it does not run.
     """
     schedule = _schedule()
-    jobs = [j for j in schedule.all() if j.runs_on == "cloud"]
+    # Every job. See `_arm` — after D15 the server holds the clock for all of
+    # them, and one that was never pushed is one that never fires.
+    jobs = list(schedule.all())
     if identifier:
         one = schedule.resolve(identifier)
         if one is None:
             output.fail(f"No job matching {identifier!r}.")
             return 2
-        if one.runs_on != "cloud":
-            output.fail(
-                f"{one.id} runs on this machine, so there is nothing to arm.",
-                f"`andromeda cron approve {one.id} --run-on cloud` moves it.",
-            )
-            return 2
         jobs = [one]
 
     if not jobs:
-        output.info("  no cloud jobs to arm.")
+        output.info("  no jobs to arm.")
         return 0
 
     base, token, device = _cloud_endpoint()
@@ -1174,9 +1180,37 @@ def _tick_forever(once: bool) -> int:
                 output.info(
                     f"{datetime.now().strftime('%H:%M:%S')}  running {job.id} — {job.name}"
                 )
-                run = execute(job, config, schedule, source="schedule")
-                provider.after_run(schedule, job, run)
-                _report(job, run)
+                # The server's fire, claimed before the work and settled after.
+                #
+                # The same `cloudFires` lease a hosted runner takes, for the
+                # same reason: two machines signed in to one account both ask
+                # what is due, and a job that writes a file or sends a message
+                # would do it twice. The claim is what makes "ask" safe, and it
+                # is why a fire carries the server's `fireAt` rather than a time
+                # this machine worked out — the two must name the same moment or
+                # they are claiming different rows.
+                fire_at = getattr(job, "pending_fire_at", "")
+                if fire_at and not _claim_local_fire(job.id, fire_at):
+                    provider.taken(job.id, fire_at)
+                    continue
+
+                ok = False
+                try:
+                    run = execute(job, config, schedule, source="schedule")
+                    ok = run.status != "failed"
+                    provider.after_run(schedule, job, run)
+                    _report(job, run)
+                finally:
+                    if fire_at:
+                        _settle_local_fire(job.id, fire_at, ok)
+                        provider.taken(job.id, fire_at)
+                        # Say when this job next wants firing. The server owns
+                        # the clock and cannot advance it — only the machine
+                        # that ran the job knows about catch-up, retirement and
+                        # the failure auto-pause. Without this the job stays on
+                        # the moment it just consumed and is handed back on the
+                        # next poll, for ever.
+                        _rearm_after_local_run(job)
 
             if once:
                 return 0
@@ -1185,6 +1219,75 @@ def _tick_forever(once: bool) -> int:
             output.console.print()
             output.info("Scheduler stopped.")
             return 0
+
+
+def _claim_local_fire(job_id: str, fire_at: str) -> bool:
+    """Take this fire, or leave it to whoever already has it.
+
+    **Fails closed.** A claim the server could not answer is not a claim, and
+    assuming a win when it could not be checked is how two machines run one job
+    — the single failure this whole path exists to prevent. The cost of failing
+    closed is a delayed run; the cost of failing open is a duplicated side
+    effect, and those are not the same size.
+    """
+    from andromeda_agent.fires import Outcome, RemoteFires
+
+    try:
+        base, token, device = _cloud_endpoint()
+        credentials = config_module.load_credentials()
+        claims = cloud_client.FireClaims(base, token, device)
+        fires = RemoteFires(claims, credentials.user_id, holder=device)
+        outcome = fires.claim(job_id, fire_at)
+    except Exception as exc:  # noqa: BLE001 - unanswerable is not "won"
+        output.console.print(
+            f"  [yellow]{job_id}: could not claim this fire ({exc}) — "
+            f"leaving it[/yellow]"
+        )
+        return False
+    if outcome is Outcome.WON:
+        return True
+    if outcome is Outcome.UNKNOWN:
+        # A previous attempt died mid-run. Deliberately not retried: its side
+        # effects may or may not have happened and nobody can know which.
+        output.console.print(
+            f"  [yellow]{job_id}: a previous attempt at this fire never "
+            f"reported — not retried. `andromeda cron fires --unresolved`[/yellow]"
+        )
+    return False
+
+
+def _settle_local_fire(job_id: str, fire_at: str, ok: bool) -> None:
+    """Terminal, and best-effort. A run that happened is still a run."""
+    from andromeda_agent.fires import RemoteFires
+
+    try:
+        base, token, device = _cloud_endpoint()
+        credentials = config_module.load_credentials()
+        claims = cloud_client.FireClaims(base, token, device)
+        RemoteFires(claims, credentials.user_id, holder=device).settle(
+            job_id, fire_at, ok
+        )
+    except Exception:  # noqa: BLE001 - an unsettled fire surfaces as `unknown`
+        pass
+
+
+def _rearm_after_local_run(job: Job) -> None:
+    """Tell the server when this job next wants firing.
+
+    Loud on failure, because this is the step whose silence retires a job: one
+    unreported cadence and the server keeps handing back the fire that has
+    already run, which the claim then refuses, for ever.
+    """
+    if not job.next_run_at:
+        return
+    try:
+        base, token, device = _cloud_endpoint()
+        cloud_client.push_job(base, token, device, job)
+    except cloud_client.CloudUnavailable as exc:
+        output.console.print(
+            f"  [red]{job.id} ran but could not re-arm: {exc}[/red]\n"
+            f"  [dim]`andromeda cron push {job.id}` restores it.[/dim]"
+        )
 
 
 def _report(job: Job, run: Run) -> None:

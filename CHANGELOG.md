@@ -6,6 +6,60 @@ Until 1.0, a minor bump may change a command's shape. Anything that changes a
 tool's name, arguments or risk tier is called out explicitly, because a model
 that learned the old contract will keep using it.
 
+## [0.10.0] — 2026-08-27
+
+One scheduler, not two. The cloud now holds the clock for every job and this
+machine executes what it is handed — the last piece of the change that started
+when every cloud job turned out to be running twice.
+
+### Changed
+- **The tick loop no longer works out that anything is due.** It asks. The
+  server owns `next_run_at` for every job, hands over the fires it has decided
+  on, and this machine runs them at the times it was given. `I-TRIGGER-7` —
+  exactly one component may reach that conclusion — is now true by construction
+  rather than by two filters staying exact complements.
+- **Every job is armed on the server, not only hosted ones.** `cron add` and
+  `cron push` upload all of them. A job the server has not heard of no longer
+  runs late; it does not run.
+- **A device job is pinned to the machine that created it** (D38) and taken
+  from the authenticated caller, never from a request. A job touching
+  `~/projects` must run where `~/projects` is.
+- **`Schedule.due` excludes by placement, not by `runs_on`.** An `auto` job with
+  a detached workspace resolves to `cloud`, is uploaded as `cloud`, and is fired
+  by the runner — so keying on the raw field listed it as this machine's to run,
+  which is the double-fire wearing the one disguise the previous version of that
+  line did not see through.
+- Each local run now **claims the server's fire before the work and settles
+  after**, through the same `cloudFires` lease a hosted runner uses. Two
+  machines signed in to one account both ask what is due; the claim is what
+  makes asking safe.
+
+### Fixed
+- **A machine that was never signed in still runs its own jobs.** Routing every
+  decision through a server is right for a machine that has one; a standalone
+  CLI has none, so the poll would fail, be swallowed, and the scheduler would
+  silently run nothing at all, for ever, with no error anywhere — the exact
+  failure shape this area keeps designing against, introduced by the change
+  meant to end it. Not signed in falls back to the local clock; **signed in but
+  unreachable does not**, because there the server may be firing those jobs
+  right now and guessing costs a duplicated side effect rather than a late run.
+- **An absent query parameter read as zero.** `Number(params.get("x"))` on a
+  missing parameter is `Number(null)`, which is `0` and not `NaN`, so every
+  "parse it, fall back if it isn't finite" spelling did the opposite of what it
+  read as. An omitted `limit` became `limit: 0` — clamped server-side to 1, so a
+  poll returned exactly one job however many were due, which presented as a
+  broken time horizon. An omitted horizon became a zero-length one, quietly
+  disabling the near-future cache that lets a laptop keep working offline.
+  Extracted to `lib/http/query-params` with the trap written down, because it
+  shipped twice in one file in one afternoon.
+
+### Known
+- Arming now needs the network. A laptop with no connection runs the fires it
+  has already been handed — that is what the horizon is for — but cannot
+  schedule something new. The trade is deliberate: two schedulers producing one
+  duplicated outbound message is a worse failure than one scheduler being
+  briefly unreachable.
+
 ## [0.9.0] — 2026-08-27
 
 The unattended half, made to actually work. A scheduled fire had never been

@@ -51,6 +51,9 @@ _RESERVED_HEADERS = {"authorization", "x-device-id", "content-type"}
 
 JOBS_PATH = "/api/cloud/jobs"
 RUNS_PATH = "/api/cloud/runs"
+# Where this machine asks what it should be running. The only route through
+# which the local scheduler learns anything is due (D15).
+DUE_PATH = "/api/cloud/due"
 
 
 def _extra_headers() -> dict[str, str]:
@@ -132,13 +135,38 @@ def _request(
         raise CloudUnavailable(f"could not reach {base_url}: {exc}") from None
 
 
+def _placement_of(job: Any) -> str:
+    """Where this job's fires go. `device` or `cloud`, never `auto`.
+
+    `Job.placement()` resolves it properly and is the answer wherever it exists.
+    The fallback is for anything job-shaped that is not a `Job` — the server has
+    to be told something, and reading a raw `auto` as `device` is the safe way
+    to be wrong: a job that runs here when it could have run hosted is late and
+    correct, where the reverse is a job with no filesystem looking for one.
+    """
+    resolve = getattr(job, "placement", None)
+    if callable(resolve):
+        try:
+            return str(resolve())
+        except Exception:  # noqa: BLE001 - fall through to the raw field
+            pass
+    return "cloud" if str(getattr(job, "runs_on", "")) == "cloud" else "device"
+
+
 def push_job(base_url: str, token: str, device_id: str, job: Any) -> None:
     """Tell the server this job exists and when it next wants firing.
 
-    Only the timing travels, plus enough to name the job in a list. The prompt,
-    the belt, the approval mode and the workspace all stay on the machine that
-    will run them — the server decides *when*, and a trigger that held a job's
-    prompt would be a trigger that could change what it does.
+    **Every job, not only the hosted ones.** That is D15: the server holds the
+    clock for everything, and this machine executes. A job it has not heard of
+    is a job nothing will ever decide is due, because the tick loop no longer
+    reaches that conclusion on its own.
+
+    What travels is the timing, the placement, and the definition. The
+    placement, because the server has to know which of two very different
+    deliveries a job wants — a POST to a runner, or a row a laptop comes and
+    asks for. The definition, because a hosted runner has never met this
+    machine; a device job's copy is redundant there and sent anyway, so one
+    shape covers both and there is no second path to keep correct.
     """
     _request(
         base_url,
@@ -150,6 +178,13 @@ def push_job(base_url: str, token: str, device_id: str, job: Any) -> None:
             "jobId": job.id,
             "name": job.name,
             "schedule": job.schedule,
+            # Resolved, not raw. `auto` is a question — "wherever makes sense" —
+            # and the server needs the answer, because it cannot re-run
+            # `resolve_placement` without the workspace this machine has.
+            "runsOn": _placement_of(job),
+            # The pin (D38). A job touching this machine's files must run on
+            # this machine, so it is claimed by this device and no other.
+            "deviceId": device_id if _placement_of(job) == "device" else None,
             # Milliseconds: the server's scheduler works in them, and a unit
             # mismatch here arms a fire fifty years out with no error anywhere.
             "nextRunAt": int(job.next_run_at * 1000),
@@ -160,6 +195,38 @@ def push_job(base_url: str, token: str, device_id: str, job: Any) -> None:
             "spec": {k: v for k, v in job.to_json().items() if k != "runs"},
         },
     )
+
+
+def due_jobs(
+    base_url: str,
+    token: str,
+    device_id: str,
+    horizon_seconds: int = 900,
+) -> list[dict[str, Any]]:
+    """What the server says this machine should run, now and shortly.
+
+    The one place the local scheduler learns that anything is due. It used to
+    work this out itself from `next_run_at`, which made two components capable
+    of reaching the same conclusion — and `I-TRIGGER-7` exists because that is
+    how one job runs twice.
+
+    The horizon is what keeps a laptop useful offline: it asks for a little of
+    the near future as well as the present and holds those fires locally, so a
+    dropped connection costs new *arming*, not the runs already handed over.
+
+    **Raises on failure, and the caller must not treat that as "nothing is
+    due".** An empty list is a real answer that means run nothing; an outage
+    that could return one would be indistinguishable from a quiet afternoon.
+    """
+    answer = _request(
+        base_url,
+        token,
+        device_id,
+        "GET",
+        f"{DUE_PATH}?horizonMs={int(max(horizon_seconds, 0)) * 1000}",
+    )
+    due = answer.get("due")
+    return due if isinstance(due, list) else []
 
 
 def fetch_job(

@@ -440,16 +440,144 @@ def test_the_relay_provider_never_decides_a_job_is_due():
     assert provider.due(_EverythingIsDue()) == []
 
 
-def test_the_built_in_provider_still_decides(monkeypatch):
-    """The other direction, so the test above cannot pass by the registry being
-    broken."""
+def test_the_built_in_provider_no_longer_decides_anything(monkeypatch):
+    """D15, and the sharp end of `I-TRIGGER-7`.
+
+    This provider used to answer `schedule.due(now)` — it worked out on this
+    machine that a job was overdue. That made two components capable of the same
+    conclusion, and the consequence was not theoretical: every cloud job ran
+    twice, once in a container and once on the laptop, disagreeing.
+
+    Now it asks. A job's own clock saying "overdue" is not enough and must never
+    be enough again; only a fire the server handed over runs.
+    """
     from andromeda_agent import providers_cron
 
     class _Schedule:
         def due(self, now=None):
-            return ["a job"]
+            raise AssertionError(
+                "the tick loop asked the local clock what was due — that is the "
+                "second decider I-TRIGGER-7 forbids"
+            )
 
-    assert providers_cron.get("built-in").due(_Schedule()) == ["a job"]
+        def resolve(self, job_id):
+            return _job(job_id)
+
+    # This machine has a server holding its clock. Stated rather than
+    # inherited: otherwise the test reads whatever credentials the
+    # machine running it happens to have, and passes or fails by
+    # accident of environment.
+    monkeypatch.setattr(providers_cron, "signed_in", lambda: True)
+    monkeypatch.setattr(providers_cron, "fetch_due", lambda schedule: [])
+    assert providers_cron.BuiltIn().due(_Schedule()) == []
+
+
+def test_only_a_fire_the_server_handed_over_runs(monkeypatch):
+    """And it runs at the moment the server named, not one this machine chose."""
+    import time
+
+    from andromeda_agent import providers_cron
+
+    class _Schedule:
+        def resolve(self, job_id):
+            return _job(job_id)
+
+    now = time.time()
+    handed = [
+        ("job_ready", "2026-08-27T10:00:00+00:00", now - 5),
+        ("job_later", "2026-08-27T11:00:00+00:00", now + 3600),
+    ]
+    # This machine has a server holding its clock. Stated rather than
+    # inherited: otherwise the test reads whatever credentials the
+    # machine running it happens to have, and passes or fails by
+    # accident of environment.
+    monkeypatch.setattr(providers_cron, "signed_in", lambda: True)
+    monkeypatch.setattr(providers_cron, "fetch_due", lambda schedule: handed)
+
+    provider = providers_cron.BuiltIn()
+    ready = provider.due(_Schedule(), now=now)
+    assert [job.id for job in ready] == ["job_ready"]
+    # The server's own name for the moment, carried through so the claim, the
+    # settle and the outcome report all address the same row.
+    assert ready[0].pending_fire_at == "2026-08-27T10:00:00+00:00"
+
+    provider.taken("job_ready", "2026-08-27T10:00:00+00:00")
+
+    # The one that was not yet due is held, not dropped — that is what lets a
+    # laptop keep working with the network gone. Nothing new is fetched here.
+    monkeypatch.setattr(providers_cron, "fetch_due", lambda schedule: [])
+    later = provider.due(_Schedule(), now=now + 3601)
+    assert [job.id for job in later] == ["job_later"]
+
+
+def test_a_fire_is_offered_once_and_then_forgotten(monkeypatch):
+    """`taken` is what stops a fire being re-offered on every tick while it is
+    still running, or after it has been lost to another machine's claim."""
+    import time
+
+    from andromeda_agent import providers_cron
+
+    class _Schedule:
+        def resolve(self, job_id):
+            return _job(job_id)
+
+    now = time.time()
+    # This machine has a server holding its clock. Stated rather than inherited:
+    # otherwise the test reads whatever credentials the machine running it
+    # happens to have, and passes or fails by accident of environment.
+    monkeypatch.setattr(providers_cron, "signed_in", lambda: True)
+    monkeypatch.setattr(
+        providers_cron, "fetch_due",
+        lambda schedule: [("job_a", "2026-08-27T10:00:00+00:00", now - 5)],
+    )
+    provider = providers_cron.BuiltIn()
+    assert [j.id for j in provider.due(_Schedule(), now=now)] == ["job_a"]
+    provider.taken("job_a", "2026-08-27T10:00:00+00:00")
+
+    # Re-polled and re-offered by the server is fine — the claim is what makes
+    # that safe. What must not happen is the *local* queue serving it twice
+    # without the server saying so.
+    monkeypatch.setattr(providers_cron, "fetch_due", lambda schedule: [])
+    assert provider.due(_Schedule(), now=now) == []
+
+
+def test_an_unreachable_server_yields_nothing_rather_than_falling_back(monkeypatch):
+    """The cost of yielding nothing is a late run. The cost of falling back to
+    the local clock is the double-fire this was rewritten to end, and those are
+    not the same size."""
+    from andromeda_agent import providers_cron
+
+    class _Schedule:
+        def due(self, now=None):
+            raise AssertionError("fell back to the local clock")
+
+        def resolve(self, job_id):
+            return _job(job_id)
+
+    def explode(schedule):
+        raise RuntimeError("no network")
+
+    # `fetch_due` swallows its own failures, so the provider sees an empty list
+    # rather than an exception — a raising tick would also stop the heartbeat,
+    # which reads as a crashed scheduler.
+    # This machine has a server holding its clock. Stated rather than
+    # inherited: otherwise the test reads whatever credentials the
+    # machine running it happens to have, and passes or fails by
+    # accident of environment.
+    monkeypatch.setattr(providers_cron, "signed_in", lambda: True)
+    monkeypatch.setattr(providers_cron, "fetch_due", lambda schedule: [])
+    assert providers_cron.BuiltIn().due(_Schedule()) == []
+
+
+def _job(job_id: str):
+    """The smallest thing `BuiltIn.due` needs back from a store."""
+
+    class _J:
+        def __init__(self, ident: str) -> None:
+            self.id = ident
+            self.pending_fire_at = ""
+
+    return _J(job_id)
 
 
 def test_an_unrecognised_provider_falls_back_rather_than_stopping():
@@ -461,7 +589,7 @@ def test_an_unrecognised_provider_falls_back_rather_than_stopping():
     assert providers_cron.get("").name == "built-in"
 
 
-def test_the_local_tick_loop_never_claims_a_cloud_job():
+def test_the_local_store_still_knows_which_jobs_believe_they_are_overdue(monkeypatch):
     """The double-fire, closed without depending on a config setting.
 
     A cloud job is fired by the server, and the `flock` that stops two daemons
@@ -490,10 +618,22 @@ def test_the_local_tick_loop_never_claims_a_cloud_job():
         for job in (hosted, mine):
             job.next_run_at = time.time() - 1
 
+        # `Schedule.due` is still the honest answer to "which jobs believe they
+        # are overdue" — `cron list` wants it — and it still excludes hosted
+        # jobs, which belong to the server's clock entirely.
         assert schedule.due() == [mine]
-        # And through the provider the daemon actually uses when nobody has
-        # selected one — the fallback is what shipped, so it is what is tested.
-        assert providers_cron.get("").due(schedule) == [mine]
+
+        # But it is **no longer what runs.** Neither provider consults it: after
+        # D15 the only thing that starts a job is a fire the server handed over.
+        # This is the assertion that would fail if somebody reconnected the
+        # local clock to the scheduler.
+        # This machine has a server holding its clock. Stated rather than
+        # inherited: otherwise the test reads whatever credentials the
+        # machine running it happens to have, and passes or fails by
+        # accident of environment.
+        monkeypatch.setattr(providers_cron, "signed_in", lambda: True)
+        monkeypatch.setattr(providers_cron, "fetch_due", lambda schedule: [])
+        assert providers_cron.get("").due(schedule) == []
         assert providers_cron.get("relay").due(schedule) == []
 
 
@@ -652,29 +792,28 @@ class TestHybridPlacement:
         assert Job.from_json(job.to_json()).last_placement == "device"
 
 
-def test_exactly_one_thing_can_decide_any_job_is_due():
+def test_exactly_one_thing_can_decide_any_job_is_due(monkeypatch):
     """`I-TRIGGER-7`, as a property of the whole matrix rather than one case.
 
     "Exactly one component decides that anything is due. Any code path where a
     second component can reach the same conclusion is a bug, whatever locking it
-    has." There are two possible deciders — the server's scheduler and this
-    machine's tick loop — and the rule is that no job may be reachable by both.
+    has."
 
-    The two filters have to stay exact complements:
+    After D15 the answer is uniform: **the server decides, for every job.** Every
+    job is uploaded, the server holds its clock, and this machine runs only what
+    it has been handed. So the table below has one column that must be true
+    everywhere and one that must be false everywhere — which is a much stronger
+    claim than the complement-of-two-filters it replaces.
 
-      * the server knows a job only if `_arm` / `cron push` uploaded it, and
-        both upload exactly `runs_on == "cloud"`
-      * `Schedule.due` hands the tick loop everything *except* `runs_on ==
-        "cloud"`
-
-    Written as a table because the bug this replaces was invisible in any single
-    case: every cloud job was running twice — once in a container and once on
-    the laptop, disagreeing — and it looked fine from either side alone.
+    Written as a table because the bug this guards was invisible in any single
+    case: every cloud job was running twice, once in a container and once on the
+    laptop, disagreeing, and it looked fine from either side alone.
     """
     import tempfile
     import time
     from pathlib import Path
 
+    from andromeda_agent import cloud_client, providers_cron
     from andromeda_agent.schedule import Schedule
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -691,42 +830,45 @@ def test_exactly_one_thing_can_decide_any_job_is_due():
         # Everything overdue, so nothing is excluded merely by timing.
         for job in jobs:
             job.next_run_at = time.time() - 1
-        locally_due = {job.id for job in schedule.due()}
+
+        # Nothing is fetched, so the tick loop has been handed nothing.
+        # This machine has a server holding its clock. Stated rather than
+        # inherited: otherwise the test reads whatever credentials the
+        # machine running it happens to have, and passes or fails by
+        # accident of environment.
+        monkeypatch.setattr(providers_cron, "signed_in", lambda: True)
+        monkeypatch.setattr(providers_cron, "fetch_due", lambda schedule: [])
+        started_locally = providers_cron.get("").due(schedule)
 
         for job in jobs:
-            # What `_arm` and `cron push` both filter on. Kept as a literal
-            # rather than imported so that widening the upload filter without
-            # widening `due`'s exclusion fails here.
-            armed_remotely = job.runs_on == "cloud"
-            assert armed_remotely != (job.id in locally_due), (
-                f"a {job.runs_on}/{job.workspace_kind} job is decidable by "
-                f"{'both' if armed_remotely else 'neither'} — armed_remotely="
-                f"{armed_remotely}, locally_due={job.id in locally_due}"
+            # Every job reaches the server. One it has not heard of is one that
+            # never fires at all now, not one that fires late.
+            assert cloud_client._placement_of(job) in {"device", "cloud"}
+            # And nothing starts here on this machine's own say-so.
+            assert job not in started_locally, (
+                f"a {job.runs_on}/{job.workspace_kind} job was started by the "
+                f"local tick loop without the server handing it over"
             )
 
 
-def test_an_auto_job_that_prefers_the_cloud_still_runs_on_this_machine():
-    """A gap, pinned so it is a decision rather than a surprise.
+def test_an_auto_job_that_prefers_the_cloud_is_now_actually_sent_there():
+    """The gap D15 closed, kept as a test so it cannot quietly reopen.
 
     `placement()` resolves `auto` + a detached workspace to `"cloud"` — that is
-    what the user asked for, and the ceiling and the badge both read it. But
-    nothing uploads an `auto` job, because `_arm` and `cron push` upload only an
-    explicit `runs_on == "cloud"`. So the server never hears about it and this
-    machine runs it.
+    what the user asked for, and the ceiling and the badge both read it. But the
+    upload filter used to be `runs_on == "cloud"`, a *different* question, so the
+    server never heard about the job and this machine ran it. It said one place
+    and ran in another: safe, because exactly one thing decided it, and wrong.
 
-    That is *safe* — exactly one thing decides it is due, which is the invariant
-    that matters — and it is *wrong*, because the job says one place and runs in
-    another. Closing it is D15: the cloud arms everything and the laptop becomes
-    a pure executor. That change makes arming require the network, so it is its
-    own piece of work rather than a line added here.
-
-    This test exists so that whoever does it deletes an assertion on purpose
-    instead of discovering the behaviour by accident.
+    Both halves are asserted, because fixing one without the other is how it
+    comes back: the job is uploaded as `cloud`, **and** the local store no longer
+    counts it among the jobs this machine believes are its to run.
     """
     import tempfile
     import time
     from pathlib import Path
 
+    from andromeda_agent import cloud_client
     from andromeda_agent.schedule import Schedule
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -736,5 +878,92 @@ def test_an_auto_job_that_prefers_the_cloud_still_runs_on_this_machine():
         job.next_run_at = time.time() - 1
 
         assert job.placement() == "cloud"
-        assert job.runs_on != "cloud"          # so nothing uploads it
-        assert job in schedule.due()            # so this machine runs it
+        assert job.runs_on != "cloud"                    # the raw field still differs
+        assert cloud_client._placement_of(job) == "cloud"  # and the wire agrees
+        assert job not in schedule.due()                 # so this machine leaves it
+
+
+def test_a_device_job_is_pinned_to_the_machine_that_created_it():
+    """D38 — a job touching `~/projects` must run where `~/projects` is.
+
+    The pin travels as the device id, and only a device job carries one: a
+    hosted job has no machine of its own, and pinning it to a laptop would be
+    the one mistake that stops it running when the laptop is shut, which is the
+    entire feature.
+    """
+    import tempfile
+    from pathlib import Path
+
+    from andromeda_agent import cloud_client
+    from andromeda_agent.schedule import Schedule
+
+    seen: list = []
+    with tempfile.TemporaryDirectory() as tmp:
+        schedule = Schedule(Path(tmp) / "cron.json")
+        local = schedule.add("every 1m", "x", "/tmp", runs_on="device")
+        hosted = schedule.add("every 1m", "x", "/tmp", runs_on="cloud",
+                              workspace_kind="detached")
+
+        def capture(base, token, device, job):
+            seen.append((job.id, cloud_client._placement_of(job)))
+
+        assert cloud_client._placement_of(local) == "device"
+        assert cloud_client._placement_of(hosted) == "cloud"
+
+
+def test_a_machine_with_no_account_still_runs_its_own_jobs(monkeypatch, tmp_path):
+    """The regression D15 would have shipped, caught before it did.
+
+    Routing every decision through the server is right for a machine that has a
+    server. A CLI that was never signed in has none — so `fetch_due` would fail,
+    be swallowed into an empty list, and the scheduler would silently run
+    nothing at all, for ever, with no error anywhere. That is the exact failure
+    shape this area keeps having to design against, introduced by the change
+    meant to end it.
+
+    `I-TRIGGER-7` is satisfied either way. It forbids *two* components reaching
+    the same conclusion; it does not require the conclusion to be reached in a
+    datacenter. With no server, the local clock is the only decider there is.
+    """
+    import time
+
+    from andromeda_agent import providers_cron
+    from andromeda_agent.schedule import Schedule
+
+    schedule = Schedule(tmp_path / "cron.json")
+    job = schedule.add("every 1m", "x", "/tmp", runs_on="device")
+    job.next_run_at = time.time() - 1
+
+    monkeypatch.setattr(providers_cron, "signed_in", lambda: False)
+    monkeypatch.setattr(
+        providers_cron, "fetch_due",
+        lambda s: (_ for _ in ()).throw(AssertionError("asked a server it has not got")),
+    )
+    assert providers_cron.BuiltIn().due(schedule) == [job]
+
+
+def test_being_signed_in_but_offline_does_not_fall_back_to_the_local_clock(
+    monkeypatch, tmp_path
+):
+    """The other half, and the one that matters for correctness.
+
+    Signed in and unreachable is **not** the same as having no account. The
+    server may be firing these jobs right now, so guessing costs a duplicated
+    side effect — a message sent twice, a file written twice — where holding off
+    costs a late run. Those are not the same size, and the fallback that looks
+    harmless here is the one that already shipped a bug.
+    """
+    import time
+
+    from andromeda_agent import providers_cron
+    from andromeda_agent.schedule import Schedule
+
+    schedule = Schedule(tmp_path / "cron.json")
+    job = schedule.add("every 1m", "x", "/tmp", runs_on="device")
+    job.next_run_at = time.time() - 1
+
+    monkeypatch.setattr(providers_cron, "signed_in", lambda: True)
+    # `fetch_due` swallows its own network failures into an empty list, because
+    # a raising tick would also stop the heartbeat and read as a crash.
+    monkeypatch.setattr(providers_cron, "fetch_due", lambda s: [])
+    assert providers_cron.BuiltIn().due(schedule) == []

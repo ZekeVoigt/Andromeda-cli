@@ -358,6 +358,16 @@ class Job:
     # unattended kind — see `Schedule.add`.
     origin: str = "user"
 
+    # The fire this job is currently executing, as the SERVER named it.
+    #
+    # Not persisted and not part of `to_json`: it belongs to one run, not to the
+    # job. It is here because the claim, the settle and the outcome report all
+    # need to agree on which moment they are talking about, and after D15 that
+    # moment is chosen by the server rather than derived from `next_run_at` — a
+    # machine that re-derived it could disagree with the row it is claiming
+    # against and settle somebody else's fire.
+    pending_fire_at: str = field(default="", compare=False, repr=False)
+
     # Where the loop runs, and what it may touch. Two fields rather than one
     # flag because the useful combinations are not the diagonal — `cloud.py`
     # has the table. Both default to `device`, so every job that existed before
@@ -1000,7 +1010,19 @@ class Schedule:
         return sorted(self._jobs.values(), key=lambda job: job.created_at)
 
     def due(self, now: float | None = None) -> list[Job]:
-        """What *this machine* should run now.
+        """Jobs whose own clock has passed. **Not what to run.**
+
+        After D15 nothing schedules from this. The server owns `next_run_at` for
+        every job and hands this machine the fires it has decided on; the tick
+        loop asks (`providers_cron.BuiltIn.due`) and never concludes anything is
+        due on its own. `I-TRIGGER-7` — exactly one component may reach that
+        conclusion — is what makes the difference load-bearing rather than
+        stylistic.
+
+        Kept because it is still the honest answer to a different question:
+        "which jobs believe they are overdue", which `cron list` and the tests
+        below both want. Reintroducing it as a scheduling source is the bug this
+        docstring exists to prevent.
 
         **A cloud job is never due here.** It is fired by the server, and the
         `flock` that stops two daemons doing this on one machine does not cross
@@ -1022,7 +1044,14 @@ class Schedule:
         nothing else is firing it, and skipping it here would mean it never runs
         at all.
         """
-        return [job for job in self.all() if job.runs_on != "cloud" and job.due(now)]
+        # Excluded by **placement**, not by `runs_on`. An `auto` job with a
+        # detached workspace resolves to `cloud`, is uploaded as `cloud` and is
+        # fired by the runner — so keying on the raw field would list it here as
+        # this machine's to run, which is the double-fire wearing the one
+        # disguise the earlier version of this line did not see through.
+        return [
+            job for job in self.all() if job.placement() != "cloud" and job.due(now)
+        ]
 
     def session_kinds(self) -> dict[str, str]:
         """Which sessions spawned a job, and where that job runs.

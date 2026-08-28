@@ -128,7 +128,17 @@ def test_arming_sends_the_definition_and_strips_the_run_history():
 
     assert len(seen) == 1
     body = seen[0]["body"]
-    assert set(body) == {"jobId", "name", "schedule", "nextRunAt", "spec"}
+    assert set(body) == {
+        "jobId", "name", "schedule", "nextRunAt", "spec",
+        # Where the fires go, and — for a device job — which machine may take
+        # them. The server holds the clock for every job after D15, so it has
+        # to know which of two deliveries each one wants: a POST to a runner,
+        # or a row the owning laptop comes and asks for.
+        "runsOn", "deviceId",
+    }
+    # Resolved here, never sent raw. `auto` is a question and the server cannot
+    # answer it — it has no view of the workspace this machine has.
+    assert body["runsOn"] in {"device", "cloud"}
 
     spec = body["spec"]
     assert spec["prompt"] == "watch the tide"
